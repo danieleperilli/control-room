@@ -1,0 +1,13 @@
+{
+    "name": "control-room-skill",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Deterministic state engine for the ControlRoom Codex skill",
+    "type": "commonjs",
+    "engines": {
+        "node": ">=22.18"
+    },
+    "scripts": {
+        "test": "node --test tests/*.test.ts"
+    }
+}

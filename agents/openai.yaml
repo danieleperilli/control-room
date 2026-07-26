@@ -1,0 +1,4 @@
+interface:
+  display_name: "ControlRoom"
+  short_description: "Coordinate project queues and approvals"
+  default_prompt: "Use $control-room to coordinate this project task safely."

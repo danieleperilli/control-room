@@ -82,17 +82,16 @@ function printHelp(): void {
 Commands:
   init --project-root ROOT --coordinator-thread ID --base-branch BRANCH [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--state-root PATH]
-  request-enqueue --project-root ROOT --task T0001 --event-key KEY --base-commit SHA --branch BRANCH [--after T0002] [--state-root PATH]
-  request-review --project-root ROOT --task T0001 --event-key KEY --reviewed-commit SHA [--summary TEXT] [--state-root PATH]
+  request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
+  request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
   process --project-root ROOT [--state-root PATH]
   activate-next --project-root ROOT [--state-root PATH]
-  refresh-base --project-root ROOT --task T0001 --base-commit SHA --branch BRANCH [--state-root PATH]
-  recover-integration --project-root ROOT --task T0001 [--state-root PATH]
+  recover-commit --project-root ROOT --task T0001 [--state-root PATH]
   resume --project-root ROOT --task T0001 [--state-root PATH]
-  integrate --project-root ROOT --task T0001 [--state-root PATH]
+  commit-approved --project-root ROOT --task T0001 [--state-root PATH]
   status --project-root ROOT [--task T0001] [--state-root PATH]
   queue --project-root ROOT [--state-root PATH]
 `);
@@ -117,17 +116,14 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         return core.registerTask(buildOptions(values), requireOption(values, "thread-id"), requireOption(values, "name"));
     }
     if (parsed.command === "request-enqueue") {
-        validateOptions(values, ["project-root", "task", "event-key", "base-commit", "branch", "after", "state-root"]);
+        validateOptions(values, ["project-root", "task", "event-key", "after", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "ENQUEUE_REQUESTED", {
-            afterTaskId: values.after,
-            baseCommit: requireOption(values, "base-commit"),
-            branchName: requireOption(values, "branch")
+            afterTaskId: values.after
         });
     }
     if (parsed.command === "request-review") {
-        validateOptions(values, ["project-root", "task", "event-key", "reviewed-commit", "summary", "state-root"]);
+        validateOptions(values, ["project-root", "task", "event-key", "summary", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "REVIEW_REQUESTED", {
-            reviewedCommit: requireOption(values, "reviewed-commit"),
             summary: values.summary
         });
     }
@@ -157,21 +153,17 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         validateOptions(values, ["project-root", "state-root"]);
         return core.activateNextTask(buildOptions(values));
     }
-    if (parsed.command === "refresh-base") {
-        validateOptions(values, ["project-root", "task", "base-commit", "branch", "state-root"]);
-        return core.refreshTaskBase(buildOptions(values), requireOption(values, "task"), requireOption(values, "base-commit"), requireOption(values, "branch"));
-    }
-    if (parsed.command === "recover-integration") {
+    if (parsed.command === "recover-commit") {
         validateOptions(values, ["project-root", "task", "state-root"]);
-        return core.recoverIntegration(buildOptions(values), requireOption(values, "task"));
+        return core.recoverCommit(buildOptions(values), requireOption(values, "task"));
     }
     if (parsed.command === "resume") {
         validateOptions(values, ["project-root", "task", "state-root"]);
         return core.resumeTask(buildOptions(values), requireOption(values, "task"));
     }
-    if (parsed.command === "integrate") {
+    if (parsed.command === "commit-approved") {
         validateOptions(values, ["project-root", "task", "state-root"]);
-        return core.integrateTask(buildOptions(values), requireOption(values, "task"));
+        return core.commitApprovedTask(buildOptions(values), requireOption(values, "task"));
     }
     if (parsed.command === "status") {
         validateOptions(values, ["project-root", "task", "state-root"]);

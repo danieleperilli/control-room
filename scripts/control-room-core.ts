@@ -15,10 +15,7 @@ interface IControlRoomOptions {
 
 interface IEventPayload {
     afterTaskId?: string;
-    baseCommit?: string;
-    branchName?: string;
     reason?: string;
-    reviewedCommit?: string;
     summary?: string;
     userRequestId?: string;
 }
@@ -75,6 +72,7 @@ const TASK_ID_PATTERN = /^T\d{4}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const ACTIVE_STATES: TaskState[] = ["QUEUED", "RUNNING", "REVIEW", "APPROVED", "BLOCKED"];
 const COORDINATOR_WAKE_NOTIFICATION = "CONTROL_ROOM_WAKE";
+const GIT_MODE = "local-approval-commit";
 
 /**
  * Reject an invalid condition with a stable error message.
@@ -136,7 +134,7 @@ function validateThreadId(threadId: string): string {
  */
 function validateSemanticName(semanticName: string): string {
     assertCondition(typeof semanticName === "string", "A semantic task name is required.");
-    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🟢|✅|👉)\s*/u, "");
+    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🟢|✅|❌|👉)\s*/u, "");
     assertCondition(normalizedName.length > 0 && normalizedName.length <= 80, "Semantic task name must contain 1 to 80 characters.");
     assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedName), "Semantic task name contains control characters.");
     return normalizedName;
@@ -174,6 +172,14 @@ function validateBranchName(branchName: string): string {
     assertCondition(!normalizedBranch.includes("..") && !normalizedBranch.includes("@{") && !normalizedBranch.includes("//"), "Git branch name contains a forbidden sequence.");
     assertCondition(!normalizedBranch.endsWith(".") && !normalizedBranch.endsWith("/") && !normalizedBranch.endsWith(".lock"), "Git branch name has a forbidden suffix.");
     return normalizedBranch;
+}
+
+/**
+ * Build the deterministic worker branch name created when a task starts.
+ * @param taskId Control Room task identifier.
+ */
+function workerBranchForTask(taskId: string): string {
+    return validateBranchName(`control-room/${validateTaskId(taskId)}`);
 }
 
 /**
@@ -216,14 +222,11 @@ function validateCompactText(value: string | undefined, fieldName: string, maxim
 function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPayload {
     if (kind === "ENQUEUE_REQUESTED") {
         return {
-            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined,
-            baseCommit: validateCommitId(payload.baseCommit || ""),
-            branchName: validateBranchName(payload.branchName || "")
+            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined
         };
     }
     if (kind === "REVIEW_REQUESTED") {
         return {
-            reviewedCommit: validateCommitId(payload.reviewedCommit || ""),
             summary: validateCompactText(payload.summary, "Review summary", 2000, false)
         };
     }
@@ -289,7 +292,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 2, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 3, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -298,7 +301,7 @@ function initializeSchema(database: any): void {
                 project_root TEXT NOT NULL UNIQUE,
                 coordinator_thread_id TEXT NOT NULL,
                 base_branch TEXT NOT NULL,
-                git_mode TEXT NOT NULL CHECK (git_mode = 'local-ff-only'),
+                git_mode TEXT NOT NULL CHECK (git_mode = 'local-approval-commit'),
                 next_task_number INTEGER NOT NULL CHECK (next_task_number BETWEEN 1 AND 10000),
                 integration_task_id TEXT,
                 integration_started_at TEXT,
@@ -347,10 +350,37 @@ function initializeSchema(database: any): void {
         if (!databaseHasColumn(database, "tasks", "reviewed_commit")) {
             database.exec("ALTER TABLE tasks ADD COLUMN reviewed_commit TEXT");
         }
+        const projectTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'").get() as { sql: string } | undefined;
+        if (projectTable && projectTable.sql.includes("local-ff-only")) {
+            database.exec(`
+                ALTER TABLE projects RENAME TO projects_legacy;
+                CREATE TABLE projects (
+                    project_key TEXT PRIMARY KEY,
+                    project_root TEXT NOT NULL UNIQUE,
+                    coordinator_thread_id TEXT NOT NULL,
+                    base_branch TEXT NOT NULL,
+                    git_mode TEXT NOT NULL CHECK (git_mode = 'local-approval-commit'),
+                    next_task_number INTEGER NOT NULL CHECK (next_task_number BETWEEN 1 AND 10000),
+                    integration_task_id TEXT,
+                    integration_started_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO projects (
+                    project_key, project_root, coordinator_thread_id, base_branch, git_mode,
+                    next_task_number, integration_task_id, integration_started_at, created_at, updated_at
+                )
+                SELECT
+                    project_key, project_root, coordinator_thread_id, base_branch, 'local-approval-commit',
+                    next_task_number, integration_task_id, integration_started_at, created_at, updated_at
+                FROM projects_legacy;
+                DROP TABLE projects_legacy;
+            `);
+        }
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -456,7 +486,9 @@ function titleForTask(task: ITaskRow): string {
     } else if (task.state === "APPROVED") {
         prefix = "🟢 ";
     } else if (task.state === "DONE") {
-        prefix = "✅ ";
+        prefix = "🟢 ";
+    } else if (task.state === "BLOCKED" || task.state === "CANCELED") {
+        prefix = "❌ ";
     }
     return `${prefix}${task.task_id} - ${task.semantic_name}`;
 }
@@ -483,8 +515,7 @@ function serializeTask(task: ITaskRow): Record<string, unknown> {
         queuePosition: task.queue_position,
         baseCommit: task.base_commit,
         branchName: task.branch_name,
-        reviewedCommit: task.reviewed_commit,
-        integratedCommit: task.integrated_commit
+        committedCommit: task.integrated_commit
     };
 }
 
@@ -522,7 +553,7 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
         const timestamp = currentTimestamp();
         store.database.prepare(`
             INSERT INTO projects (project_key, project_root, coordinator_thread_id, base_branch, git_mode, next_task_number, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'local-ff-only', 1, ?, ?)
+            VALUES (?, ?, ?, ?, 'local-approval-commit', 1, ?, ?)
         `).run(store.projectKey, store.projectRoot, validCoordinatorThreadId, validBaseBranch, timestamp, timestamp);
         const coordinatorTitle = titleForCoordinator();
         commitTransaction(store.database);
@@ -533,7 +564,7 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
             projectRoot: store.projectRoot,
             coordinatorThreadId: validCoordinatorThreadId,
             baseBranch: validBaseBranch,
-            gitMode: "local-ff-only",
+            gitMode: GIT_MODE,
             databasePath: store.databasePath
         };
     } catch (error) {
@@ -607,23 +638,12 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
         const task = requireTask(store, validTaskId);
         if (kind === "ENQUEUE_REQUESTED") {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
-            assertCondition(validPayload.baseCommit && validPayload.branchName, "Enqueue request is missing Git anchors.");
-            assertCondition(validPayload.branchName !== project.base_branch, "Worker branch must differ from the base branch.");
             if (validPayload.afterTaskId) {
                 assertCondition(validPayload.afterTaskId !== task.task_id, "A task cannot be queued after itself.");
                 requireTask(store, validPayload.afterTaskId);
             }
-            requireGit(store.projectRoot, ["cat-file", "-e", `${validPayload.baseCommit}^{commit}`], "Validate base commit");
-            const workerHead = resolveLocalBranchHead(store.projectRoot, validPayload.branchName);
-            const ancestorCheck = runGit(store.projectRoot, ["merge-base", "--is-ancestor", validPayload.baseCommit, workerHead]);
-            assertCondition(ancestorCheck.status === 0, `${validPayload.baseCommit} is not an ancestor of ${validPayload.branchName}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
-            assertCondition(task.base_commit && task.branch_name && validPayload.reviewedCommit, `${task.task_id} is missing review Git anchors.`);
-            const currentBaseHead = resolveLocalBranchHead(store.projectRoot, project.base_branch);
-            assertCondition(task.base_commit === currentBaseHead, `${task.task_id} must run refresh-base before requesting review.`);
-            const workerHead = resolveLocalBranchHead(store.projectRoot, task.branch_name);
-            assertCondition(workerHead === validPayload.reviewedCommit, `Reviewed commit ${validPayload.reviewedCommit} does not match ${task.branch_name} at ${workerHead}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
             assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
         } else if (kind === "CANCEL_REQUESTED") {
@@ -705,16 +725,6 @@ function assertDependencyIsAcyclic(store: IStore, taskId: string, dependsOnId: s
  */
 function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
     assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot enqueue ${task.task_id} from ${task.state}.`);
-    assertCondition(payload.baseCommit, "Enqueue request is missing baseCommit.");
-    assertCondition(payload.branchName, "Enqueue request is missing branchName.");
-    const baseCommit = validateCommitId(payload.baseCommit);
-    const branchName = validateBranchName(payload.branchName);
-    const project = requireProject(store);
-    assertCondition(branchName !== project.base_branch, "Worker branch must differ from the base branch.");
-    requireGit(store.projectRoot, ["cat-file", "-e", `${baseCommit}^{commit}`], "Validate base commit");
-    const workerHead = resolveLocalBranchHead(store.projectRoot, branchName);
-    const ancestorCheck = runGit(store.projectRoot, ["merge-base", "--is-ancestor", baseCommit, workerHead]);
-    assertCondition(ancestorCheck.status === 0, `${baseCommit} is not an ancestor of ${branchName}.`);
     let afterTaskId: string | undefined;
     if (payload.afterTaskId) {
         afterTaskId = validateTaskId(payload.afterTaskId);
@@ -747,9 +757,10 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
     }
     store.database.prepare(`
         UPDATE tasks
-        SET state = 'QUEUED', blocked_from_state = NULL, base_commit = ?, branch_name = ?, updated_at = ?
+        SET state = 'QUEUED', blocked_from_state = NULL, base_commit = NULL,
+            branch_name = NULL, reviewed_commit = NULL, updated_at = ?
         WHERE task_id = ?
-    `).run(baseCommit, branchName, currentTimestamp(), task.task_id);
+    `).run(currentTimestamp(), task.task_id);
     writeQueueOrder(store, orderedTaskIds);
     const refreshedTask = requireTask(store, task.task_id);
     return {
@@ -760,10 +771,8 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
             taskId: refreshedTask.task_id,
             title: titleForTask(refreshedTask),
             projectRoot: store.projectRoot,
-            baseCommit,
-            branchName,
             dependencies: afterTaskId ? [afterTaskId] : [],
-            instruction: "Wait for Control Room activation. Continue the approved plan in this dedicated task and do not expand scope."
+            instruction: "Wait for Control Room activation. Do not create a branch, modify files, stage changes, or commit."
         }
     };
 }
@@ -780,22 +789,14 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return applyEnqueueEvent(store, task, payload);
     }
     if (event.kind === "REVIEW_REQUESTED") {
-        assertCondition(payload.reviewedCommit, "Review request is missing reviewedCommit.");
         if (task.state === "APPROVED" || task.state === "DONE") {
-            assertCondition(task.reviewed_commit === payload.reviewedCommit, `A different commit is already recorded for ${task.task_id}.`);
             return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null };
         }
-        if (task.state === "REVIEW" && task.reviewed_commit === payload.reviewedCommit) {
+        if (task.state === "REVIEW") {
             return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null };
         }
-        assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
-        assertCondition(task.base_commit && task.branch_name, `${task.task_id} is missing its review Git anchors.`);
-        const project = requireProject(store);
-        const currentBaseHead = resolveLocalBranchHead(store.projectRoot, project.base_branch);
-        assertCondition(task.base_commit === currentBaseHead, `${task.task_id} must run refresh-base before requesting review.`);
-        const workerHead = resolveLocalBranchHead(store.projectRoot, task.branch_name);
-        assertCondition(workerHead === payload.reviewedCommit, `Reviewed commit ${payload.reviewedCommit} does not match ${task.branch_name} at ${workerHead}.`);
-        store.database.prepare("UPDATE tasks SET state = 'REVIEW', reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(payload.reviewedCommit, currentTimestamp(), task.task_id);
+        assertCondition(task.state === "RUNNING", `Cannot request review for ${task.task_id} from ${task.state}.`);
+        store.database.prepare("UPDATE tasks SET state = 'REVIEW', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "REVIEW_READY", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
@@ -805,9 +806,6 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         }
         assertCondition(task.state === "REVIEW", `Cannot approve ${task.task_id} from ${task.state}.`);
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Approval requires a direct user request ID.");
-        assertCondition(task.reviewed_commit && task.branch_name, `${task.task_id} has no reviewed Git anchors.`);
-        const workerHead = resolveLocalBranchHead(store.projectRoot, task.branch_name);
-        assertCondition(workerHead === task.reviewed_commit, `${task.branch_name} moved from reviewed commit ${task.reviewed_commit} to ${workerHead}.`);
         store.database.prepare("UPDATE tasks SET state = 'APPROVED', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId };
@@ -930,18 +928,35 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             commitTransaction(store.database);
             return { activated: false, coordinatorTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
         }
-        store.database.prepare("UPDATE tasks SET state = 'RUNNING', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), selectedTask.task_id);
+        const workerBranch = workerBranchForTask(selectedTask.task_id);
+        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating a task.");
+        const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+        let currentBaseCommit: string;
+        if (currentBranch === project.base_branch) {
+            currentBaseCommit = requireBaseCheckout(store.projectRoot, project.base_branch);
+            const existingWorkerBranch = runGit(store.projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${workerBranch}`]);
+            assertCondition(
+                existingWorkerBranch.status === 1,
+                existingWorkerBranch.status === 0 ?
+                    `Worker branch already exists for ${selectedTask.task_id}: ${workerBranch}` :
+                    `Inspect worker branch failed: ${existingWorkerBranch.stderr || existingWorkerBranch.stdout}`
+            );
+            requireGit(store.projectRoot, ["checkout", "-b", workerBranch, project.base_branch], `Create worker branch ${workerBranch}`);
+        } else {
+            assertCondition(currentBranch === workerBranch, `ControlRoom requires branch ${project.base_branch}; found ${currentBranch || "detached HEAD"}.`);
+            currentBaseCommit = resolveLocalBranchHead(store.projectRoot, project.base_branch);
+            assertCondition(requireBranchCheckout(store.projectRoot, workerBranch) === currentBaseCommit, `Interrupted activation branch ${workerBranch} moved before state persistence.`);
+        }
+        store.database.prepare(`
+            UPDATE tasks
+            SET state = 'RUNNING', base_commit = ?, branch_name = ?, reviewed_commit = NULL, updated_at = ?
+            WHERE task_id = ?
+        `).run(currentBaseCommit, workerBranch, currentTimestamp(), selectedTask.task_id);
         const runningTask = requireTask(store, selectedTask.task_id);
         const dependencyRows = store.database.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = ? ORDER BY depends_on_id").all(runningTask.task_id) as Array<{ depends_on_id: string }>;
         const dependencies: string[] = [];
         for (const dependencyRow of dependencyRows) {
             dependencies.push(dependencyRow.depends_on_id);
-        }
-        const currentBaseCommit = resolveLocalBranchHead(store.projectRoot, project.base_branch);
-        const requiresBaseRefresh = runningTask.base_commit !== currentBaseCommit;
-        let activationInstruction = "Begin implementation now in this dedicated task. Preserve the approved scope, verify the work, and report REVIEW readiness to Control Room.";
-        if (requiresBaseRefresh) {
-            activationInstruction = `Before implementation, fast-forward ${runningTask.branch_name} to ${project.base_branch} at ${currentBaseCommit}, then run refresh-base. Preserve the approved scope and report REVIEW readiness when verified.`;
         }
         const coordinatorTitle = titleForCoordinator();
         commitTransaction(store.database);
@@ -956,11 +971,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
                 projectRoot: store.projectRoot,
                 baseCommit: runningTask.base_commit,
                 baseBranch: project.base_branch,
-                currentBaseCommit,
-                branchName: runningTask.branch_name,
+                workerBranch: runningTask.branch_name,
                 dependencies,
-                requiresBaseRefresh,
-                instruction: activationInstruction
+                instruction: "Implement on the active worker branch without staging or committing. Leave all changes uncommitted for review."
             }
         };
     } catch (error) {
@@ -1031,6 +1044,37 @@ function requireGit(projectRoot: string, argumentsList: string[], operation: str
 }
 
 /**
+ * Require a named branch to be the current checkout and return HEAD.
+ * @param projectRoot Canonical repository root used as working directory.
+ * @param branchName Expected current branch.
+ */
+function requireBranchCheckout(projectRoot: string, branchName: string): string {
+    const validBranchName = validateBranchName(branchName);
+    const repositoryRoot = requireGit(projectRoot, ["rev-parse", "--show-toplevel"], "Resolve Git repository");
+    assertCondition(fs.realpathSync(repositoryRoot) === projectRoot, "Git repository root does not match the Control Room project root.");
+    const currentBranch = requireGit(projectRoot, ["branch", "--show-current"], "Resolve current branch");
+    assertCondition(currentBranch === validBranchName, `ControlRoom requires branch ${validBranchName}; found ${currentBranch || "detached HEAD"}.`);
+    return validateCommitId(requireGit(projectRoot, ["rev-parse", "HEAD"], "Resolve current head"));
+}
+
+/**
+ * Require the configured base branch to be the current checkout and return HEAD.
+ * @param projectRoot Canonical repository root used as working directory.
+ * @param baseBranch Configured shared base branch.
+ */
+function requireBaseCheckout(projectRoot: string, baseBranch: string): string {
+    return requireBranchCheckout(projectRoot, baseBranch);
+}
+
+/**
+ * Read staged, unstaged, and untracked working-tree changes.
+ * @param projectRoot Canonical repository root used as working directory.
+ */
+function readWorkingTreeStatus(projectRoot: string): string {
+    return requireGit(projectRoot, ["status", "--porcelain", "--untracked-files=all"], "Inspect working tree");
+}
+
+/**
  * Resolve an unambiguous local branch head commit.
  * @param projectRoot Canonical repository root used as working directory.
  * @param branchName Local branch name without a refs prefix.
@@ -1039,6 +1083,25 @@ function resolveLocalBranchHead(projectRoot: string, branchName: string): string
     const validBranchName = validateBranchName(branchName);
     const branchReference = `refs/heads/${validBranchName}^{commit}`;
     return validateCommitId(requireGit(projectRoot, ["rev-parse", "--verify", branchReference], `Resolve local branch ${validBranchName}`));
+}
+
+/**
+ * Determine whether a commit is the single approval commit expected after a recorded parent.
+ * @param projectRoot Canonical repository root used as working directory.
+ * @param commitId Candidate approval commit.
+ * @param parentCommitId Recorded pre-approval parent commit.
+ * @param expectedSubject Expected approval commit subject.
+ */
+function commitMatchesApproval(projectRoot: string, commitId: string, parentCommitId: string, expectedSubject: string): boolean {
+    if (commitId === parentCommitId) {
+        return false;
+    }
+    const parentResult = runGit(projectRoot, ["rev-parse", `${commitId}^`]);
+    if (parentResult.status !== 0 || !COMMIT_PATTERN.test(parentResult.stdout)) {
+        return false;
+    }
+    const subjectResult = runGit(projectRoot, ["log", "-1", "--format=%s", commitId]);
+    return subjectResult.status === 0 && validateCommitId(parentResult.stdout) === parentCommitId && subjectResult.stdout === expectedSubject;
 }
 
 /**
@@ -1059,196 +1122,196 @@ function compactActiveQueue(store: IStore): void {
 }
 
 /**
- * Refresh a running task's Git base after all dependencies have integrated.
- * @param options Project and optional state-root settings.
- * @param taskId Running task identifier.
- * @param baseCommit New base commit after a worker-side fast-forward.
- * @param branchName Worker branch that was fast-forwarded.
- */
-function refreshTaskBase(options: IControlRoomOptions, taskId: string, baseCommit: string, branchName: string): Record<string, unknown> {
-    const validBaseCommit = validateCommitId(baseCommit);
-    const validBranchName = validateBranchName(branchName);
-    const store = openStore(options);
-    try {
-        beginTransaction(store.database);
-        const project = requireProject(store);
-        const task = requireTask(store, taskId);
-        assertCondition(task.state === "RUNNING", `Cannot refresh ${task.task_id} from ${task.state}.`);
-        assertCondition(task.branch_name === validBranchName, `Branch ${validBranchName} does not match the registered branch for ${task.task_id}.`);
-        const currentBaseHead = resolveLocalBranchHead(store.projectRoot, project.base_branch);
-        const workerHead = resolveLocalBranchHead(store.projectRoot, validBranchName);
-        assertCondition(validBaseCommit === currentBaseHead, `Refresh commit ${validBaseCommit} does not match ${project.base_branch} at ${currentBaseHead}.`);
-        assertCondition(task.base_commit, `${task.task_id} has no previous base commit.`);
-        const baseProgressCheck = runGit(store.projectRoot, ["merge-base", "--is-ancestor", task.base_commit, currentBaseHead]);
-        assertCondition(baseProgressCheck.status === 0, `Current base ${currentBaseHead} does not descend from ${task.base_commit}.`);
-        const workerBaseCheck = runGit(store.projectRoot, ["merge-base", "--is-ancestor", currentBaseHead, workerHead]);
-        assertCondition(workerBaseCheck.status === 0, `${validBranchName} does not contain current base ${currentBaseHead}.`);
-        store.database.prepare("UPDATE tasks SET base_commit = ?, reviewed_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentBaseHead, currentTimestamp(), task.task_id);
-        const refreshedTask = requireTask(store, task.task_id);
-        commitTransaction(store.database);
-        return { refreshed: true, task: serializeTask(refreshedTask) };
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
-    } finally {
-        store.database.close();
-    }
-}
-
-/**
- * Release a failed integration lease when Git did not reach the reviewed commit.
+ * Finalize a successful approved commit in persistent state.
  * @param store Open project store.
- * @param taskId Task whose integration attempt failed.
- * @param reviewedCommit Commit that the failed attempt intended to integrate.
+ * @param taskId Approved task identifier.
+ * @param committedCommit Commit created by approval.
+ * @param merged Whether approval fast-forwarded the base branch.
+ * @param branchDeleted Whether approval deleted the worker branch.
  */
-function recoverFailedIntegration(store: IStore, taskId: string, reviewedCommit: string): boolean {
-    const project = requireProject(store);
-    const currentBaseHead = resolveLocalBranchHead(store.projectRoot, project.base_branch);
-    if (currentBaseHead === reviewedCommit) {
-        return false;
-    }
+function finalizeApprovedCommit(store: IStore, taskId: string, committedCommit: string, merged: boolean, branchDeleted: boolean): Record<string, unknown> {
     beginTransaction(store.database);
     try {
-        const lockedProject = requireProject(store);
-        const lockedTask = requireTask(store, taskId);
-        if (lockedProject.integration_task_id === taskId && lockedTask.state === "APPROVED") {
-            store.database.prepare("UPDATE tasks SET state = 'RUNNING', reviewed_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), taskId);
-            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-        }
-        commitTransaction(store.database);
-        return true;
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
-    }
-}
-
-/**
- * Recover a persistent integration lease after confirming the prior process ended.
- * @param options Project and optional state-root settings.
- * @param taskId Task holding the stale integration lease.
- */
-function recoverIntegration(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
-    const store = openStore(options);
-    try {
         const project = requireProject(store);
         const task = requireTask(store, taskId);
-        if (task.state === "DONE" && task.integrated_commit) {
-            return { recovered: false, alreadyIntegrated: true, coordinatorTitle: titleForCoordinator(), task: serializeTask(task) };
-        }
-        assertCondition(project.integration_task_id === task.task_id, `${task.task_id} does not hold the integration lease.`);
-        assertCondition(task.state === "APPROVED" && task.reviewed_commit, `${task.task_id} does not have a recoverable approved commit.`);
-        const currentBaseHead = resolveLocalBranchHead(store.projectRoot, project.base_branch);
-        beginTransaction(store.database);
-        const lockedProject = requireProject(store);
-        const lockedTask = requireTask(store, task.task_id);
-        assertCondition(lockedProject.integration_task_id === lockedTask.task_id, `Integration lease for ${lockedTask.task_id} changed during recovery.`);
-        if (currentBaseHead === lockedTask.reviewed_commit) {
-            store.database.prepare("UPDATE tasks SET state = 'DONE', integrated_commit = ?, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentBaseHead, currentTimestamp(), lockedTask.task_id);
-            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-            compactActiveQueue(store);
-            const completedTask = requireTask(store, lockedTask.task_id);
-            const coordinatorTitle = titleForCoordinator();
-            commitTransaction(store.database);
-            return { recovered: true, finalized: true, coordinatorTitle, task: serializeTask(completedTask) };
-        }
-        store.database.prepare("UPDATE tasks SET state = 'RUNNING', reviewed_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), lockedTask.task_id);
-        store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-        const reopenedTask = requireTask(store, lockedTask.task_id);
-        const coordinatorTitle = titleForCoordinator();
-        commitTransaction(store.database);
-        return { recovered: true, finalized: false, coordinatorTitle, task: serializeTask(reopenedTask) };
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
-    } finally {
-        store.database.close();
-    }
-}
-
-/**
- * Integrate an approved worker branch into the local base branch by fast-forward.
- * @param options Project and optional state-root settings.
- * @param taskId Approved task identifier.
- */
-function integrateTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
-    const store = openStore(options);
-    let leasedTaskId: string | undefined;
-    let leasedReviewedCommit: string | undefined;
-    try {
-        beginTransaction(store.database);
-        let project = requireProject(store);
-        let task = requireTask(store, taskId);
-        if (task.state === "DONE" && task.integrated_commit) {
-            const coordinatorTitle = titleForCoordinator();
-            commitTransaction(store.database);
-            return { integrated: false, alreadyIntegrated: true, coordinatorTitle, gitMode: "local-ff-only", task: serializeTask(task) };
-        }
-        assertCondition(task.state === "APPROVED", `Cannot integrate ${task.task_id} from ${task.state}.`);
-        assertCondition(task.base_commit && task.branch_name && task.reviewed_commit, `${task.task_id} is missing Git anchors.`);
-        assertCondition(!project.integration_task_id, `Integration lease is already held by ${project.integration_task_id}; use recover-integration only after confirming the prior process ended.`);
-        store.database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?, updated_at = ? WHERE project_key = ?").run(task.task_id, currentTimestamp(), currentTimestamp(), store.projectKey);
-        commitTransaction(store.database);
-        leasedTaskId = task.task_id;
-        const baseCommit = validateCommitId(task.base_commit);
-        const reviewedCommit = validateCommitId(task.reviewed_commit);
-        leasedReviewedCommit = reviewedCommit;
-        const baseBranch = validateBranchName(project.base_branch);
-        const workerBranch = validateBranchName(task.branch_name);
-        assertCondition(workerBranch !== baseBranch, "Worker branch must differ from the base branch.");
-        const repositoryRoot = requireGit(store.projectRoot, ["rev-parse", "--show-toplevel"], "Resolve Git repository");
-        assertCondition(fs.realpathSync(repositoryRoot) === store.projectRoot, "Git repository root does not match the Control Room project root.");
-        const workingTreeStatus = requireGit(store.projectRoot, ["status", "--porcelain"], "Inspect working tree");
-        assertCondition(workingTreeStatus.length === 0, "The shared Local working tree must be clean before integration.");
-        const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
-        assertCondition(currentBranch === baseBranch, `Coordinator checkout must be on ${baseBranch}; found ${currentBranch || "detached HEAD"}.`);
-        const currentHead = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve base head"));
-        const workerHead = resolveLocalBranchHead(store.projectRoot, workerBranch);
-        assertCondition(workerHead === reviewedCommit, `${workerBranch} moved from reviewed commit ${reviewedCommit} to ${workerHead}.`);
-        if (currentHead !== reviewedCommit) {
-            assertCondition(currentHead === baseCommit, `Base branch moved from ${baseCommit} to ${currentHead}; refresh or rebase the worker task before approval.`);
-            const ancestorCheck = runGit(store.projectRoot, ["merge-base", "--is-ancestor", baseCommit, reviewedCommit]);
-            assertCondition(ancestorCheck.status === 0, `${baseCommit} is not an ancestor of reviewed commit ${reviewedCommit}.`);
-            requireGit(store.projectRoot, ["merge", "--ff-only", "--no-edit", reviewedCommit], "Fast-forward integration");
-        }
-        const integratedCommit = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve integrated head"));
-        assertCondition(integratedCommit === reviewedCommit, "Integrated head does not match the reviewed commit.");
-        beginTransaction(store.database);
-        project = requireProject(store);
-        task = requireTask(store, task.task_id);
-        if (task.state === "DONE" && task.integrated_commit === integratedCommit) {
-            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-            const coordinatorTitle = titleForCoordinator();
-            commitTransaction(store.database);
-            return { integrated: false, alreadyIntegrated: true, coordinatorTitle, gitMode: "local-ff-only", task: serializeTask(task) };
-        }
-        assertCondition(project.integration_task_id === task.task_id, `Integration lease for ${task.task_id} was lost.`);
+        assertCondition(project.integration_task_id === task.task_id, `Commit lease for ${task.task_id} was lost.`);
         assertCondition(task.state === "APPROVED", `Cannot finalize ${task.task_id} from ${task.state}.`);
-        store.database.prepare(`
-            UPDATE tasks
-            SET state = 'DONE', integrated_commit = ?, queue_position = NULL, updated_at = ?
-            WHERE task_id = ?
-        `).run(integratedCommit, currentTimestamp(), task.task_id);
+        if (branchDeleted) {
+            store.database.prepare(`
+                UPDATE tasks
+                SET state = 'DONE', branch_name = NULL, integrated_commit = ?, queue_position = NULL, updated_at = ?
+                WHERE task_id = ?
+            `).run(committedCommit, currentTimestamp(), task.task_id);
+        } else {
+            store.database.prepare(`
+                UPDATE tasks
+                SET state = 'DONE', integrated_commit = ?, queue_position = NULL, updated_at = ?
+                WHERE task_id = ?
+            `).run(committedCommit, currentTimestamp(), task.task_id);
+        }
         store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
         compactActiveQueue(store);
         const completedTask = requireTask(store, task.task_id);
-        const coordinatorTitle = titleForCoordinator();
         commitTransaction(store.database);
-        return { integrated: true, coordinatorTitle, gitMode: "local-ff-only", task: serializeTask(completedTask) };
+        return { committed: true, merged, branchDeleted, coordinatorTitle: titleForCoordinator(), gitMode: GIT_MODE, task: serializeTask(completedTask) };
     } catch (error) {
         rollbackTransaction(store.database);
-        if (leasedTaskId && leasedReviewedCommit) {
-            let recovered = false;
-            try {
-                recovered = recoverFailedIntegration(store, leasedTaskId, leasedReviewedCommit);
-            } catch {
-                recovered = false;
-            }
-            if (recovered) {
-                const message = error instanceof Error ? error.message : String(error);
-                throw new Error(`${message} Integration lease was released and ${leasedTaskId} returned to RUNNING.`);
-            }
+        throw error;
+    }
+}
+
+/**
+ * Complete an approved task, committing dirty changes on the current task or base branch when needed.
+ * @param options Project and optional state-root settings.
+ * @param taskId Approved task identifier.
+ */
+function commitApprovedTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
+    const store = openStore(options);
+    let leaseAcquired = false;
+    try {
+        beginTransaction(store.database);
+        const project = requireProject(store);
+        const task = requireTask(store, taskId);
+        if (task.state === "DONE") {
+            commitTransaction(store.database);
+            return {
+                committed: false,
+                alreadyCompleted: true,
+                alreadyCommitted: Boolean(task.integrated_commit),
+                coordinatorTitle: titleForCoordinator(),
+                gitMode: GIT_MODE,
+                task: serializeTask(task)
+            };
         }
+        assertCondition(task.state === "APPROVED", `Cannot commit ${task.task_id} from ${task.state}.`);
+        assertCondition(!project.integration_task_id, `Commit lease is already held by ${project.integration_task_id}; use recover-commit only after confirming the prior process ended.`);
+        const workingTreeStatus = readWorkingTreeStatus(store.projectRoot);
+        if (workingTreeStatus.length === 0) {
+            store.database.prepare("UPDATE tasks SET state = 'DONE', queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+            compactActiveQueue(store);
+            const completedTask = requireTask(store, task.task_id);
+            commitTransaction(store.database);
+            return {
+                committed: false,
+                dequeued: true,
+                noUncommittedChanges: true,
+                coordinatorTitle: titleForCoordinator(),
+                gitMode: GIT_MODE,
+                task: serializeTask(completedTask)
+            };
+        }
+        const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+        const commitsOnBase = currentBranch === project.base_branch;
+        assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
+        const currentHead = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve pre-approval head"));
+        const timestamp = currentTimestamp();
+        store.database.prepare("UPDATE tasks SET reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(currentHead, timestamp, task.task_id);
+        store.database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?, updated_at = ? WHERE project_key = ?").run(task.task_id, timestamp, timestamp, store.projectKey);
+        commitTransaction(store.database);
+        leaseAcquired = true;
+
+        requireGit(store.projectRoot, ["add", "-A", "--", "."], "Stage approved changes");
+        const stagedDifference = runGit(store.projectRoot, ["diff", "--cached", "--quiet", "HEAD", "--"]);
+        assertCondition(stagedDifference.status === 1, stagedDifference.status === 0 ? "Approval produced no staged changes." : `Inspect staged changes failed: ${stagedDifference.stderr || stagedDifference.stdout}`);
+        const commitMessage = `${task.task_id} - ${task.semantic_name}`;
+        requireGit(store.projectRoot, ["commit", "--message", commitMessage], "Commit approved changes");
+        const committedCommit = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve approved commit"));
+        const parentCommit = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD^"], "Resolve approved commit parent"));
+        assertCondition(parentCommit === currentHead, `Approved commit parent ${parentCommit} does not match pre-approval HEAD ${currentHead}.`);
+        if (commitsOnBase) {
+            return finalizeApprovedCommit(store, task.task_id, committedCommit, false, false);
+        }
+        assertCondition(task.branch_name, `${task.task_id} has no worker branch.`);
+        requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
+        requireBaseCheckout(store.projectRoot, project.base_branch);
+        requireGit(store.projectRoot, ["merge", "--ff-only", committedCommit], `Fast-forward ${project.base_branch} to ${task.task_id}`);
+        assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === committedCommit, `${project.base_branch} did not reach approved commit ${committedCommit}.`);
+        requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete worker branch ${task.branch_name}`);
+        return finalizeApprovedCommit(store, task.task_id, committedCommit, true, true);
+    } catch (error) {
+        rollbackTransaction(store.database);
+        const message = error instanceof Error ? error.message : String(error);
+        if (leaseAcquired) {
+            throw new Error(`${message} The commit lease remains active; run recover-commit only after confirming this process ended.`);
+        }
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Recover a commit lease after confirming the previous commit process ended.
+ * @param options Project and optional state-root settings.
+ * @param taskId Task holding the stale commit lease.
+ */
+function recoverCommit(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
+    const store = openStore(options);
+    try {
+        const project = requireProject(store);
+        const task = requireTask(store, taskId);
+        if (task.state === "DONE") {
+            return {
+                recovered: false,
+                alreadyCompleted: true,
+                alreadyCommitted: Boolean(task.integrated_commit),
+                coordinatorTitle: titleForCoordinator(),
+                task: serializeTask(task)
+            };
+        }
+        assertCondition(project.integration_task_id === task.task_id, `${task.task_id} does not hold the commit lease.`);
+        assertCondition(task.state === "APPROVED" && task.base_commit && task.reviewed_commit, `${task.task_id} does not have a recoverable approval.`);
+        const workerBranchResult = task.branch_name ?
+            runGit(store.projectRoot, ["rev-parse", "--verify", `refs/heads/${task.branch_name}^{commit}`]) :
+            { status: 128, stdout: "", stderr: "" };
+        assertCondition(workerBranchResult.status === 0 || workerBranchResult.status === 128, `Resolve worker branch ${String(task.branch_name)} failed: ${workerBranchResult.stderr || workerBranchResult.stdout}`);
+        const workerCommit = workerBranchResult.status === 0 ? validateCommitId(workerBranchResult.stdout) : null;
+        const currentBaseCommit = resolveLocalBranchHead(store.projectRoot, project.base_branch);
+        const expectedSubject = `${task.task_id} - ${task.semantic_name}`;
+        const workerCommitIsApproval = Boolean(workerCommit && commitMatchesApproval(store.projectRoot, workerCommit, task.reviewed_commit, expectedSubject));
+        const baseCommitIsApproval = commitMatchesApproval(store.projectRoot, currentBaseCommit, task.reviewed_commit, expectedSubject);
+        if (!workerCommitIsApproval && !baseCommitIsApproval && (workerCommit === task.reviewed_commit || currentBaseCommit === task.reviewed_commit)) {
+            const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+            assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
+            beginTransaction(store.database);
+            const lockedProject = requireProject(store);
+            assertCondition(lockedProject.integration_task_id === task.task_id, `Commit lease for ${task.task_id} changed during recovery.`);
+            store.database.prepare("UPDATE tasks SET reviewed_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
+            const retryTask = requireTask(store, task.task_id);
+            commitTransaction(store.database);
+            return { recovered: true, finalized: false, retryCommit: true, coordinatorTitle: titleForCoordinator(), task: serializeTask(retryTask) };
+        }
+        assertCondition(workerCommitIsApproval || baseCommitIsApproval, `Git history does not contain the approved commit expected for ${task.task_id}.`);
+        if (baseCommitIsApproval && workerCommit !== currentBaseCommit) {
+            const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+            if (currentBranch !== project.base_branch) {
+                assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot restore ${project.base_branch} with a dirty working tree.`);
+                requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
+            }
+            const workerBranchWasDeleted = Boolean(task.branch_name && !workerCommit);
+            const result = finalizeApprovedCommit(store, task.task_id, currentBaseCommit, workerBranchWasDeleted, workerBranchWasDeleted);
+            return { ...result, recovered: true, finalized: true };
+        }
+        assertCondition(workerCommit && task.branch_name, `${task.task_id} has no recoverable worker commit.`);
+        const approvedCommit = workerCommit;
+        const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+        if (currentBranch !== project.base_branch) {
+            assertCondition(currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
+            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
+        }
+        const baseCommit = requireBaseCheckout(store.projectRoot, project.base_branch);
+        if (baseCommit !== approvedCommit) {
+            requireGit(store.projectRoot, ["merge", "--ff-only", approvedCommit], `Recover fast-forward of ${project.base_branch}`);
+        }
+        assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === approvedCommit, `${project.base_branch} did not reach recovered commit ${approvedCommit}.`);
+        if (workerCommit) {
+            requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete recovered worker branch ${task.branch_name}`);
+        }
+        const result = finalizeApprovedCommit(store, task.task_id, approvedCommit, true, true);
+        return { ...result, recovered: true, finalized: true };
+    } catch (error) {
+        rollbackTransaction(store.database);
         throw error;
     } finally {
         store.database.close();
@@ -1278,7 +1341,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string): Record<string
             coordinatorThreadId: project.coordinator_thread_id,
             baseBranch: project.base_branch,
             gitMode: project.git_mode,
-            integrationTaskId: project.integration_task_id,
+            commitTaskId: project.integration_task_id,
             nextTaskId: project.next_task_number <= 9999 ? `T${String(project.next_task_number).padStart(4, "0")}` : null,
             stateCounts
         };
@@ -1317,13 +1380,12 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
 
 module.exports = {
     activateNextTask,
+    commitApprovedTask,
     getQueue,
     getStatus,
     initializeProject,
-    integrateTask,
     processPendingEvents,
-    recoverIntegration,
-    refreshTaskBase,
+    recoverCommit,
     registerTask,
     resumeTask,
     submitEvent,

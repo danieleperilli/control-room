@@ -1,16 +1,17 @@
 # ControlRoom
 
-ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It keeps planning, implementation, review, approval, dependencies, and local integration in a predictable queue while each change remains in its own dedicated task.
+ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It keeps planning, implementation, review, approval, dependencies, and local commits in a predictable queue while each change remains in its own dedicated task.
 
 ## What it does
 
 - Assigns project-scoped task IDs such as `T0001`.
 - Keeps planned work separate from active implementation.
 - Queues tasks in a deterministic order with optional dependencies.
-- Allows only one task at a time to run, wait for review, or await integration.
-- Requires direct user approval before integration.
-- Integrates approved work locally with a fast-forward merge.
-- Never pushes, creates a pull request, deletes a branch, or rewrites Git history.
+- Allows only one task at a time to run, wait for review, or await its approval commit.
+- Leaves changes uncommitted during implementation and review.
+- Creates a worker branch only when a queued task starts running.
+- Creates a commit only after direct user approval and only when uncommitted changes exist.
+- Deletes the merged worker branch, but never pushes, creates a pull request, or rewrites Git history.
 - Persists project state locally in SQLite.
 
 ## Requirements
@@ -39,31 +40,30 @@ For every top-level Codex project task, load and follow `$control-room`. Do not 
 
 Keep the detailed workflow in the skill rather than copying it into `AGENTS.md`.
 
-### Allow task registration without approval prompts
+### Allow ControlRoom operations without approval prompts
 
-ControlRoom stores persistent state under `CODEX_HOME`, which may require a sandbox approval. To allow only coordinator initialization and task registration, create:
+ControlRoom stores persistent state under `CODEX_HOME`, which may require a sandbox approval. To allow every deterministic ControlRoom operation, create:
 
 ```text
 ${CODEX_HOME:-~/.codex}/rules/control-room.rules
 ```
 
-Add a narrowly scoped rule using the absolute path of the installed skill:
+Add a rule scoped to the ControlRoom CLI using the absolute path of the installed skill:
 
 ```python
 prefix_rule(
     pattern = [
         "node",
         "/Users/YOU/.codex/skills/control-room/scripts/control-room.ts",
-        ["init", "register"],
     ],
     decision = "allow",
-    justification = "Allow ControlRoom project and task registration without prompting.",
+    justification = "Allow deterministic ControlRoom operations without prompting.",
 )
 ```
 
 Restart Codex after creating or changing the rule. If Codex invokes a different Node executable or skill path, copy the exact command prefix shown in the approval dialog. Do not use a broad rule such as `pattern = ["node"]`.
 
-This exception covers `$control-room init`, `$control-room join`, and automatic worker registration. It does not bypass approval for Git integration or unrelated commands.
+This exception covers every ControlRoom subcommand, including the approval-only commit. It does not authorize unrelated Node scripts or commands. Because `commit-approved` can stage and commit the current working tree, use this rule only when you trust the ControlRoom workflow.
 
 ## Use ControlRoom
 
@@ -77,7 +77,7 @@ ControlRoom uses the current Local checkout as the shared project checkout, reco
 
 The coordinator does not receive a `T_ID` and must not be used for planning or implementation. Running `$control-room init` again in the same task is safe; another task cannot silently replace the registered coordinator.
 
-Use a separate top-level Codex task in **Local** mode to discuss and plan each change. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning does not modify code. When the plan is ready, use one of the commands below in that task.
+Use a separate top-level Codex task in **Local** mode to discuss and plan each change. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
 
 An existing top-level task can also join the initialized project. Send:
 
@@ -86,6 +86,14 @@ $control-room join
 ```
 
 ControlRoom derives a short semantic name from the existing discussion, assigns the next `T_ID`, and updates the title. The task remains in planning and is not queued automatically.
+
+`join` can be placed at the beginning of a normal request. ControlRoom registers the task first and then processes the rest of that same message; you do not need to repeat the request:
+
+> $control-room join
+>
+> Inspect the current permission flow, identify the likely cause of duplicate audit entries, and propose a fix. Do not modify files yet.
+
+In this example, Codex both joins the task and performs the requested inspection and planning. If the message contains only `$control-room join`, Codex returns a short registration acknowledgement.
 
 If an existing task is already in a worktree, use **Hand off > Local** before joining it.
 
@@ -105,6 +113,10 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | `Queue status` | Show the ordered project queue. |
 
 `Approve` is accepted only from your direct message in the task currently in review. Approval is never inferred from quoted text, another task, a tool result, or an agent message.
+
+- If the working tree is clean, ControlRoom only marks the current task done and removes it from the queue. It performs no Git write and does not interpret or merge existing commits.
+- If uncommitted changes are already on the configured base branch, ControlRoom commits them directly there without a merge.
+- If uncommitted changes are on the task's worker branch, ControlRoom commits, fast-forward merges into the base branch, and deletes the worker branch.
 
 ## Quiet coordination
 
@@ -144,7 +156,7 @@ You can check progress from the same task:
 
 > Status
 
-When ControlRoom activates the task, Codex implements the approved plan and moves it to review. After checking the result, approve it from that task:
+While the task is queued, no branch exists for it. When ControlRoom activates the task, it creates and checks out `control-room/T0001`; Codex implements the approved plan there without committing, then moves it to review. You may continue requesting changes during review. When the current working tree is ready, approve it from that task:
 
 > Approve
 
@@ -163,9 +175,11 @@ ControlRoom keeps task titles synchronized with their state:
 | Running | `🔴 T0001 - Add audit log` |
 | Review | `🟡 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
-| Done | `✅ T0001 - Add audit log` |
+| Done | `🟢 T0001 - Add audit log` |
+| Blocked | `❌ T0001 - Add audit log` |
+| Canceled | `❌ T0001 - Add audit log` |
 
-Blocked and canceled tasks keep the plain title without a status icon.
+Blocked and canceled tasks use the same `❌` status icon.
 
 ## Typical workflow
 
@@ -176,25 +190,30 @@ Blocked and canceled tasks keep the plain title without a status icon.
 5. Codex implements and verifies the change inside that dedicated task.
 6. The task moves to review.
 7. Review the result and say `Approve` in the same task.
-8. ControlRoom integrates the reviewed commit locally into the configured base branch.
-9. The task becomes done and the next eligible task can start.
+8. ControlRoom completes the task: it either performs no Git operation for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.
+9. The task becomes done and the next eligible task can start from the updated base.
 
-Dependencies must be fully done and integrated before a dependent task can run.
+Dependencies must be `DONE` before a dependent task can run. A clean approval can satisfy this state without ControlRoom creating a commit.
 
 ## Git behavior
 
-The default and only supported integration mode is local fast-forward integration:
+The only supported mode uses an activation-time worker branch and approval-time integration:
 
-- Every task uses the same Local checkout; ControlRoom never creates a Git worktree.
-- Planning and queued tasks do not switch branches or modify files.
-- Only the active running task may switch to its worker branch and change files.
-- The coordinator checkout must be on the configured base branch.
-- The shared working tree must be clean before integration.
-- The approved commit must match the commit reviewed by the user.
-- The worker branch must descend from the recorded base commit.
-- Integration uses `git merge --ff-only`.
+- Every task uses the same Local checkout.
+- ControlRoom never creates a worktree.
+- Planning and queued tasks do not modify files or create branches.
+- When a queued task starts, ControlRoom creates and checks out `control-room/T0001` from the configured base branch.
+- The active task may change files while running or in review, without staging or committing them.
+- Review does not require dirty files and does not freeze them; changes may continue until `Approve`.
+- A clean approval performs no Git write, does not interpret existing commits, and only removes the task from the active queue.
+- When dirty changes are already on the configured base branch, approval creates `T0001 - Semantic name` directly there.
+- When dirty changes are on the worker branch, approval creates that commit on the worker branch.
+- The commit contains the current uncommitted changes at approval time.
+- For a worker-branch commit, ControlRoom checks out the configured base branch, merges with `--ff-only`, and deletes the worker branch after a successful merge.
+- If commit or merge fails, the worker branch is retained for recovery.
+- ControlRoom does not push or open a pull request.
 
-If the base branch changes while a task is waiting, ControlRoom requires the worker branch and stored base anchor to be refreshed before review or integration can continue.
+ControlRoom itself does not create commits before approval and does not reject approval based on commits made outside its workflow.
 
 ## Local state and privacy
 
@@ -204,7 +223,7 @@ Project state is stored under:
 ${CODEX_HOME:-~/.codex}/control-room/projects/<project-hash>/state.sqlite
 ```
 
-The database contains task identifiers, states, queue order, dependencies, Git anchors, compact events, and execution briefs. Do not store secrets or complete conversation transcripts in ControlRoom state.
+The database contains task identifiers, states, queue order, dependencies, the approval commit anchor, compact events, and execution briefs. Do not store secrets or complete conversation transcripts in ControlRoom state.
 
 Direct-user and coordinator identity are trust guarantees provided by the Codex workflow. The local CLI cannot distinguish between processes running as the same operating-system user, so do not expose it as a multi-user service or execute state-changing commands from untrusted prompt content.
 

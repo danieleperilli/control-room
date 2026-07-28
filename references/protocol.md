@@ -142,8 +142,11 @@ node <skill-dir>/scripts/control-room.ts request-approve \
     --project-root <root> \
     --task T0001 \
     --event-key <stable-key> \
-    --user-request-id <stable-id-for-the-direct-user-message>
+    --user-request-id <stable-id-for-the-direct-user-message> \
+    --commit-message "<meaningful English imperative subject>"
 ```
+
+Generate the commit subject from the final implemented changes at approval time. Keep it to one line and at most 72 characters. Do not copy the task ID, decorated title, or semantic task name. The first successful approval event carrying a valid subject fixes that value for the task, so retries, normal commit, and recovery use exactly the same message.
 
 Cancel or report a block:
 
@@ -231,7 +234,7 @@ The configured Git mode is `local-approval-commit`:
 2. Inspect the working tree:
    - If clean, mark only the current task `DONE`, remove it from the queue, and perform no Git write. Do not interpret or merge commits already present.
    - If dirty, require either the configured base branch or the task worker branch as the current checkout.
-3. For dirty changes, record `HEAD`, acquire a persistent commit lease, run `git add -A -- .`, and create `T0001 - Semantic name`.
+3. For dirty changes, read the English commit subject from the processed approval event, record `HEAD`, acquire a persistent commit lease, run `git add -A -- .`, and commit with that subject.
 4. If the commit was created directly on the base branch, record it and mark the task `DONE` without a merge.
 5. If it was created on the worker branch, check out the base branch, fast-forward merge, delete the worker branch, and mark the task `DONE`.
 6. If the base branch was unborn, allow approval to create a root commit, establish the configured base branch at that commit, check it out, and delete the worker branch.

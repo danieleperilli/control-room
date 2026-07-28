@@ -110,7 +110,7 @@ Commands:
   request-dependency-add --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
-  request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
+  request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
   process --project-root ROOT [--state-root PATH]
@@ -182,8 +182,9 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         });
     }
     if (parsed.command === "request-approve") {
-        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "state-root"]);
+        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "commit-message", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "APPROVAL_REQUESTED", {
+            commitMessage: requireOption(values, "commit-message"),
             userRequestId: requireOption(values, "user-request-id")
         });
     }

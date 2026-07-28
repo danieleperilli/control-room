@@ -131,7 +131,7 @@ test("initializes and completes the first task in a repository without commits",
     assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "0");
 
     fs.writeFileSync(path.join(fixture.repositoryRoot, "created.txt"), "created while running\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Initialize project files");
     const completed = core.commitApprovedTask(options, "T0001");
     assert.equal(completed.task.state, "DONE");
     assert.equal(completed.committed, true);
@@ -140,7 +140,7 @@ test("initializes and completes the first task in a repository without commits",
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "1");
-    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "T0001 - Create initial project");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Initialize project files");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:existing.txt"]), "present before activation");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:created.txt"]), "created while running");
     assert.equal(fs.existsSync(databasePath), true);
@@ -165,11 +165,12 @@ function activateTask(options: IOptions, threadId: string, semanticName: string,
  * @param options ControlRoom project options.
  * @param taskId Task identifier.
  * @param keyPrefix Stable event-key prefix.
+ * @param commitMessage Meaningful English commit subject.
  */
-function approveTask(options: IOptions, taskId: string, keyPrefix: string): void {
+function approveTask(options: IOptions, taskId: string, keyPrefix: string, commitMessage = "Apply approved project changes"): void {
     core.submitEvent(options, `${keyPrefix}-review`, taskId, "REVIEW_REQUESTED", { summary: "Ready" });
     core.processPendingEvents(options);
-    core.submitEvent(options, `${keyPrefix}-approve`, taskId, "APPROVAL_REQUESTED", { userRequestId: `${keyPrefix}-user-message` });
+    core.submitEvent(options, `${keyPrefix}-approve`, taskId, "APPROVAL_REQUESTED", { commitMessage, userRequestId: `${keyPrefix}-user-message` });
     core.processPendingEvents(options);
 }
 
@@ -529,11 +530,52 @@ test("review and approval do not create a commit", () => {
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
-    core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { userRequestId: "user-message-1" });
+    core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Commit approved changes safely", userRequestId: "user-message-1" });
     core.processPendingEvents(options);
     assert.equal(core.getStatus(options, "T0001").task.state, "APPROVED");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
+});
+
+test("requires a meaningful approval commit subject distinct from the task title", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Improve approval messages", "enqueue-1");
+    core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Ready" });
+    core.processPendingEvents(options);
+
+    assert.throws(
+        () => core.submitEvent(options, "approve-missing", "T0001", "APPROVAL_REQUESTED", { userRequestId: "user-message-1" }),
+        /Commit message is required/
+    );
+    assert.throws(
+        () => core.submitEvent(options, "approve-title", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Improve approval messages", userRequestId: "user-message-2" }),
+        /rather than copy the task name/
+    );
+    assert.throws(
+        () => core.submitEvent(options, "approve-decorated", "T0001", "APPROVAL_REQUESTED", { commitMessage: "T0001 - Improve approval messages", userRequestId: "user-message-3" }),
+        /must not use the task title format/
+    );
+    const approval = runCli([
+        "request-approve",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--task",
+        "T0001",
+        "--event-key",
+        "approve-valid",
+        "--user-request-id",
+        "user-message-4",
+        "--commit-message",
+        "Generate meaningful approval subjects"
+    ]);
+    assert.equal(approval.status, 0, approval.stderr || approval.stdout);
+    assert.equal(JSON.parse(approval.stdout).created, true);
+    const processed = core.processPendingEvents(options);
+    assert.equal(processed.results[0].commitMessage, "Generate meaningful approval subjects");
 });
 
 test("approved commit includes changes made after review", () => {
@@ -546,14 +588,16 @@ test("approved commit includes changes made after review", () => {
     core.processPendingEvents(options);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "after review\n");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "additional.txt"), "added during review\n");
-    core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { userRequestId: "user-message-1" });
+    core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Preserve changes made during review", userRequestId: "user-message-1" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "approve-2", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Replace the original commit subject", userRequestId: "user-message-2" });
     core.processPendingEvents(options);
     const committed = core.commitApprovedTask(options, "T0001");
     assert.equal(committed.task.state, "DONE");
     assert.equal(committed.task.title, "🟢 T0001 - Flexible review");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:change.txt"]), "after review");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:additional.txt"]), "added during review");
-    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "T0001 - Flexible review");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Preserve changes made during review");
     assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
@@ -568,14 +612,14 @@ test("approval commits directly when the task is already on the base branch", ()
     activateTask(options, "thread-one", "Direct base commit", "enqueue-1");
     runGit(fixture.repositoryRoot, ["checkout", "main"]);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "change on main\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Commit changes directly on main");
     const committed = core.commitApprovedTask(options, "T0001");
     assert.equal(committed.task.state, "DONE");
     assert.equal(committed.committed, true);
     assert.equal(committed.merged, false);
     assert.equal(committed.branchDeleted, false);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
-    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "T0001 - Direct base commit");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Commit changes directly on main");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:change.txt"]), "change on main");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "control-room/T0001\nmain");
 });
@@ -590,7 +634,7 @@ test("approval only dequeues a clean task after a user-created commit", () => {
     runGit(fixture.repositoryRoot, ["add", "manual.txt"]);
     runGit(fixture.repositoryRoot, ["commit", "-m", "User-created commit"]);
     const userCommit = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Add approved changes after external commit");
     const completed = core.commitApprovedTask(options, "T0001");
     assert.equal(completed.task.state, "DONE");
     assert.equal(completed.committed, false);
@@ -611,11 +655,11 @@ test("approval does not reject commits made outside ControlRoom", () => {
     runGit(fixture.repositoryRoot, ["add", "external.txt"]);
     runGit(fixture.repositoryRoot, ["commit", "-m", "External commit"]);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "approved.txt"), "approval commit\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Add approved changes after external commit");
     const committed = core.commitApprovedTask(options, "T0001");
     assert.equal(committed.task.state, "DONE");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--count", "HEAD"]), "3");
-    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "T0001 - Allow external history");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Add approved changes after external commit");
 });
 
 test("commit-approved is idempotent after completion", () => {
@@ -686,14 +730,14 @@ test("recovery finalizes a commit created before SQLite completion", () => {
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     activateTask(options, "thread-one", "Recover commit", "enqueue-1");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "change\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Recover approved project change");
     const preCommitHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
     const database = new DatabaseSync(databasePath);
     database.prepare("UPDATE tasks SET reviewed_commit = ? WHERE task_id = ?").run(preCommitHead, "T0001");
     database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?").run("T0001", new Date().toISOString());
     database.close();
     runGit(fixture.repositoryRoot, ["add", "-A"]);
-    runGit(fixture.repositoryRoot, ["commit", "-m", "T0001 - Recover commit"]);
+    runGit(fixture.repositoryRoot, ["commit", "-m", "Recover approved project change"]);
     const recovered = core.recoverCommit(options, "T0001");
     assert.equal(recovered.finalized, true);
     assert.equal(recovered.task.state, "DONE");
@@ -708,13 +752,13 @@ test("recovery integrates an initial root commit from the unborn worker branch",
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     activateTask(options, "thread-one", "Recover initial commit", "enqueue-1");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "initial.txt"), "initial\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Create initial recovered project");
 
     const database = new DatabaseSync(databasePath);
     database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?").run("T0001", new Date().toISOString());
     database.close();
     runGit(fixture.repositoryRoot, ["add", "-A", "--", "."]);
-    runGit(fixture.repositoryRoot, ["commit", "--message", "T0001 - Recover initial commit"]);
+    runGit(fixture.repositoryRoot, ["commit", "--message", "Create initial recovered project"]);
 
     const recovered = core.recoverCommit(options, "T0001");
     assert.equal(recovered.finalized, true);
@@ -731,14 +775,14 @@ test("recovery recognizes a direct approval commit on the base branch", () => {
     activateTask(options, "thread-one", "Recover base commit", "enqueue-1");
     runGit(fixture.repositoryRoot, ["checkout", "main"]);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "change\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Recover direct base branch change");
     const preCommitHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
     const database = new DatabaseSync(databasePath);
     database.prepare("UPDATE tasks SET reviewed_commit = ? WHERE task_id = ?").run(preCommitHead, "T0001");
     database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?").run("T0001", new Date().toISOString());
     database.close();
     runGit(fixture.repositoryRoot, ["add", "-A"]);
-    runGit(fixture.repositoryRoot, ["commit", "-m", "T0001 - Recover base commit"]);
+    runGit(fixture.repositoryRoot, ["commit", "-m", "Recover direct base branch change"]);
     const recovered = core.recoverCommit(options, "T0001");
     assert.equal(recovered.finalized, true);
     assert.equal(recovered.merged, false);
@@ -754,14 +798,14 @@ test("recovery finalizes after the worker branch was already merged and deleted"
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     activateTask(options, "thread-one", "Recover deleted branch", "enqueue-1");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "change\n");
-    approveTask(options, "T0001", "first");
+    approveTask(options, "T0001", "first", "Recover merged worker change");
     const preCommitHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
     const database = new DatabaseSync(databasePath);
     database.prepare("UPDATE tasks SET reviewed_commit = ? WHERE task_id = ?").run(preCommitHead, "T0001");
     database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?").run("T0001", new Date().toISOString());
     database.close();
     runGit(fixture.repositoryRoot, ["add", "-A"]);
-    runGit(fixture.repositoryRoot, ["commit", "-m", "T0001 - Recover deleted branch"]);
+    runGit(fixture.repositoryRoot, ["commit", "-m", "Recover merged worker change"]);
     const approvedCommit = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
     runGit(fixture.repositoryRoot, ["checkout", "main"]);
     runGit(fixture.repositoryRoot, ["merge", "--ff-only", approvedCommit]);

@@ -130,6 +130,8 @@ From a worker, `Move` and dependency commands apply to that task. From `⚫️ C
 
 `Approve` is accepted only from your direct message in the task currently in review. Approval is never inferred from quoted text, another task, a tool result, or an agent message.
 
+At approval time, Codex generates a concise English commit subject that describes the actual final change, such as `Add atomic queue position updates`. It does not reuse `T0001 - Semantic name` or copy the task title. The subject is stored with the approval event so recovery uses the same message.
+
 - If the working tree is clean, ControlRoom only marks the current task done and removes it from the queue. It performs no Git write and does not interpret or merge existing commits.
 - If uncommitted changes are already on the configured base branch, ControlRoom commits them directly there without a merge.
 - If uncommitted changes are on the task's worker branch, ControlRoom commits, fast-forward merges into the base branch, and deletes the worker branch.
@@ -243,7 +245,7 @@ The only supported mode uses an activation-time worker branch and approval-time 
 - The active task may change files while running or in review, without staging or committing them.
 - Review does not require dirty files and does not freeze them; changes may continue until `Approve`.
 - A clean approval performs no Git write, does not interpret existing commits, and only removes the task from the active queue.
-- When dirty changes are already on the configured base branch, approval creates `T0001 - Semantic name` directly there.
+- When dirty changes are already on the configured base branch, approval commits them there using the meaningful English subject captured by the approval event.
 - When dirty changes are on the worker branch, approval creates that commit on the worker branch.
 - The commit contains the current uncommitted changes at approval time.
 - For a worker-branch commit, ControlRoom checks out the configured base branch, merges with `--ff-only`, and deletes the worker branch after a successful merge.

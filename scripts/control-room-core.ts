@@ -16,6 +16,7 @@ interface IControlRoomOptions {
 interface IEventPayload {
     afterTaskId?: string;
     beforeTaskId?: string;
+    commitMessage?: string;
     dependencyTaskId?: string;
     position?: number;
     reason?: string;
@@ -245,6 +246,32 @@ function validateCompactText(value: string | undefined, fieldName: string, maxim
 }
 
 /**
+ * Validate a concise one-line Git commit subject.
+ * @param commitMessage Commit subject supplied with direct approval.
+ */
+function validateCommitMessage(commitMessage: string | undefined): string {
+    const normalizedMessage = validateCompactText(commitMessage, "Commit message", 72, true);
+    assertCondition(normalizedMessage && normalizedMessage.length >= 8, "Commit message must contain at least 8 characters.");
+    assertCondition(!/[\t\r\n]/u.test(normalizedMessage), "Commit message must be a single line.");
+    assertCondition(/[A-Za-z]/u.test(normalizedMessage), "Commit message must contain Latin letters.");
+    return normalizedMessage;
+}
+
+/**
+ * Reject a commit subject copied from the task identifier or semantic title.
+ * @param task Task receiving direct approval.
+ * @param commitMessage Proposed commit subject.
+ */
+function validateApprovalCommitMessage(task: ITaskRow, commitMessage: string | undefined): string {
+    const normalizedMessage = validateCommitMessage(commitMessage);
+    const normalizedComparison = normalizedMessage.toLocaleLowerCase("en-US");
+    const semanticComparison = task.semantic_name.trim().toLocaleLowerCase("en-US");
+    assertCondition(normalizedComparison !== semanticComparison, "Commit message must describe the implemented change rather than copy the task name.");
+    assertCondition(!normalizedComparison.startsWith(`${task.task_id.toLocaleLowerCase("en-US")} -`), "Commit message must not use the task title format.");
+    return normalizedMessage;
+}
+
+/**
  * Validate a one-based position in the waiting queue.
  * @param position Queue position supplied by the caller.
  */
@@ -283,7 +310,13 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
             summary: validateCompactText(payload.summary, "Review summary", 2000, false)
         };
     }
-    if (kind === "APPROVAL_REQUESTED" || kind === "CANCEL_REQUESTED") {
+    if (kind === "APPROVAL_REQUESTED") {
+        return {
+            commitMessage: validateCommitMessage(payload.commitMessage),
+            userRequestId: validateCompactText(payload.userRequestId, "Direct user request ID", 200, true)
+        };
+    }
+    if (kind === "CANCEL_REQUESTED") {
         return {
             userRequestId: validateCompactText(payload.userRequestId, "Direct user request ID", 200, true)
         };
@@ -781,6 +814,7 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
             assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
+            validateApprovalCommitMessage(task, validPayload.commitMessage);
         } else if (kind === "CANCEL_REQUESTED") {
             assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
         } else {
@@ -1068,13 +1102,15 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     }
     if (event.kind === "APPROVAL_REQUESTED") {
         if (task.state === "APPROVED" || task.state === "DONE") {
-            return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId };
+            const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
+            return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId, commitMessage };
         }
         assertCondition(task.state === "REVIEW", `Cannot approve ${task.task_id} from ${task.state}.`);
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Approval requires a direct user request ID.");
+        const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
         store.database.prepare("UPDATE tasks SET state = 'APPROVED', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId };
+        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage };
     }
     if (event.kind === "CANCEL_REQUESTED") {
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Cancellation requires a direct user request ID.");
@@ -1453,6 +1489,34 @@ function createInitialBaseBranch(projectRoot: string, baseBranch: string, commit
 }
 
 /**
+ * Read the first meaningful commit subject accepted for a task.
+ * @param store Open project store.
+ * @param task Approved task whose commit subject is required.
+ */
+function readApprovalCommitMessage(store: IStore, task: ITaskRow): string {
+    const approvalEvents = store.database.prepare(`
+        SELECT payload_json, result_json
+        FROM events
+        WHERE task_id = ? AND kind = 'APPROVAL_REQUESTED' AND processed_at IS NOT NULL
+        ORDER BY sequence
+    `).all(task.task_id) as Array<{ payload_json: string; result_json: string | null }>;
+    for (const approvalEvent of approvalEvents) {
+        if (!approvalEvent.result_json) {
+            continue;
+        }
+        const approvalResult = JSON.parse(approvalEvent.result_json) as { action?: string };
+        if (approvalResult.action !== "APPROVED" && approvalResult.action !== "APPROVAL_ALREADY_RECORDED") {
+            continue;
+        }
+        const approvalPayload = JSON.parse(approvalEvent.payload_json) as IEventPayload;
+        if (approvalPayload.commitMessage !== undefined) {
+            return validateApprovalCommitMessage(task, approvalPayload.commitMessage);
+        }
+    }
+    throw new Error(`${task.task_id} has no successful approval event with a commit message.`);
+}
+
+/**
  * Compact active queue positions after a terminal transition.
  * @param store Open project store.
  */
@@ -1552,6 +1616,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
         const commitsOnBase = currentBranch === project.base_branch;
         assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
+        const commitMessage = readApprovalCommitMessage(store, task);
         const currentHead = resolveCurrentHeadIfExists(store.projectRoot);
         const timestamp = currentTimestamp();
         store.database.prepare("UPDATE tasks SET reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(currentHead, timestamp, task.task_id);
@@ -1564,7 +1629,6 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
             runGit(store.projectRoot, ["diff", "--cached", "--quiet", "HEAD", "--"]) :
             runGit(store.projectRoot, ["diff", "--cached", "--quiet", "--"]);
         assertCondition(stagedDifference.status === 1, stagedDifference.status === 0 ? "Approval produced no staged changes." : `Inspect staged changes failed: ${stagedDifference.stderr || stagedDifference.stdout}`);
-        const commitMessage = `${task.task_id} - ${task.semantic_name}`;
         requireGit(store.projectRoot, ["commit", "--message", commitMessage], "Commit approved changes");
         const committedCommit = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve approved commit"));
         assertCondition(commitHasExpectedParent(store.projectRoot, committedCommit, currentHead), currentHead ?
@@ -1627,7 +1691,7 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
         assertCondition(workerBranchResult.status === 0 || workerBranchResult.status === 128, `Resolve worker branch ${String(task.branch_name)} failed: ${workerBranchResult.stderr || workerBranchResult.stdout}`);
         const workerCommit = workerBranchResult.status === 0 ? validateCommitId(workerBranchResult.stdout) : null;
         const currentBaseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
-        const expectedSubject = `${task.task_id} - ${task.semantic_name}`;
+        const expectedSubject = readApprovalCommitMessage(store, task);
         const workerCommitIsApproval = Boolean(workerCommit && commitMatchesApproval(store.projectRoot, workerCommit, task.reviewed_commit, expectedSubject));
         const baseCommitIsApproval = Boolean(currentBaseCommit && commitMatchesApproval(store.projectRoot, currentBaseCommit, task.reviewed_commit, expectedSubject));
         const noCommitWasCreated = task.reviewed_commit === null ?

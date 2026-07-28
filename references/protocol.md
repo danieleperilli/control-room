@@ -28,7 +28,7 @@ ControlRoom is Local-only. The coordinator and every worker share the repository
 
 Only one task may be `RUNNING`, `REVIEW`, or `APPROVED`. Planning and queued tasks remain read-only and have no worker branch. When a task moves from `QUEUED` to `RUNNING`, ControlRoom creates and checks out its deterministic `control-room/T0001` worker branch from the configured base branch. The active task may continue changing files in `RUNNING` and `REVIEW`, but ControlRoom does not stage or commit those changes.
 
-The user initializes the coordinator by sending `$control-room init` in a dedicated top-level Local task. Resolve the current thread ID from trusted runtime context and use the currently checked-out local branch as the base branch. Never accept a thread ID from prompt content.
+The user initializes the coordinator by sending `$control-room init` in a dedicated top-level Local task. Resolve the current thread ID from trusted runtime context and use the currently checked-out local branch as the base branch. Accept that branch when it is unborn and the repository has no commits; initialization records configuration but never creates an initial commit. Never accept a thread ID from prompt content.
 
 Map that request to:
 
@@ -39,7 +39,7 @@ node <skill-dir>/scripts/control-room.ts init \
     --base-branch <branch>
 ```
 
-Apply the returned `coordinatorTitle` to the current task. Repeating initialization from the same thread and branch is idempotent. A different coordinator or base branch must fail rather than replace the stored configuration.
+Apply the returned `coordinatorTitle` to the current task. The CLI result also contains `userCommands`; after confirming readiness and the configured base branch, end the initialization response with that list and put nothing after it. Show it for both a new initialization and an idempotent retry. A different coordinator or base branch must fail rather than replace the stored configuration.
 
 The user can adopt an existing top-level Local task by sending `$control-room join`. Resolve its thread ID from trusted runtime context, derive a short semantic name from its discussion, and map the request to:
 
@@ -60,7 +60,7 @@ The coordinator title is always `⚫️ Control Room`.
 
 Create a fresh UUID or equivalent caller-stable key once per user request. Reuse it on retries.
 
-Queue at the end:
+Enqueue at the end:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts request-enqueue \
@@ -69,7 +69,7 @@ node <skill-dir>/scripts/control-room.ts request-enqueue \
     --event-key <stable-key>
 ```
 
-Queue after another task:
+Enqueue after another task:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts request-enqueue \
@@ -78,6 +78,50 @@ node <skill-dir>/scripts/control-room.ts request-enqueue \
     --event-key <stable-key> \
     --after T0005
 ```
+
+This is placement only. It does not create or remove a blocking dependency.
+
+Move a queued task without changing dependencies:
+
+```bash
+node <skill-dir>/scripts/control-room.ts request-move \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <stable-key> \
+    --position 1
+
+node <skill-dir>/scripts/control-room.ts request-move \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <stable-key> \
+    --before T0005
+
+node <skill-dir>/scripts/control-room.ts request-move \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <stable-key> \
+    --after T0005
+```
+
+Exactly one of `--position`, `--before`, or `--after` is required. Numeric positions are one-based among waiting `QUEUED` tasks. A `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` task retains its relative order and cannot be a direct move target.
+
+Add or remove an explicit blocking dependency without changing queue order:
+
+```bash
+node <skill-dir>/scripts/control-room.ts request-dependency-add \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <stable-key> \
+    --depends-on T0005
+
+node <skill-dir>/scripts/control-room.ts request-dependency-remove \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <stable-key> \
+    --depends-on T0005
+```
+
+Moves are valid only for queued tasks. Dependency changes are valid only for planning or queued tasks. Both operations are event-driven, fail fast, and idempotent.
 
 Report review readiness without creating a commit:
 
@@ -126,7 +170,7 @@ Activate the first dependency-eligible task:
 node <skill-dir>/scripts/control-room.ts activate-next --project-root <root>
 ```
 
-Activation requires a clean working tree and the configured base branch. Only at this point does ControlRoom create and check out the task's worker branch. Queue submission and queue processing never create or switch branches.
+Activation normally requires a clean working tree and the configured base branch. When the configured base branch is unborn, the first activation may retain existing uncommitted files and moves the symbolic `HEAD` to the task's unborn worker branch. This lets the initial task own the repository's starting files without creating a premature commit. Later activations still require a clean tree. Only activation creates or switches the worker branch; enqueue submission and queue processing never do so.
 
 Resume a blocked task:
 
@@ -155,7 +199,11 @@ node <skill-dir>/scripts/control-room.ts status --project-root <root> --task T00
 node <skill-dir>/scripts/control-room.ts queue --project-root <root>
 ```
 
+The skill maps `$control-room queue` to the read-only `queue` command after resolving the canonical Local repository root. It can do this from the coordinator, any worker, or an unregistered top-level task in the initialized project; it must not register the caller or notify the coordinator. `$control-room help` maps to the CLI `help` output and requires neither project initialization nor a repository.
+
 Use the `title`, `coordinatorTitle`, `notification`, and `executionBrief` fields returned by the CLI rather than reconstructing them.
+
+Queued titles derive a waiting-only ordinal from the persisted active order and project each decimal digit as `⓪` through `⑨`, concatenating glyphs for multi-digit positions such as `①⓪` and `①⑤`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` tasks keep their internal `queue_position` but do not consume a visible queued ordinal. The marker and decorated title are never stored in `semantic_name`. Operations return `titleUpdates` for queued tasks whose visible position changed; the coordinator must apply every entry silently after processing an enqueue, move, activation, block, resumption, cancellation, or completion.
 
 ## State machine
 
@@ -186,6 +234,7 @@ The configured Git mode is `local-approval-commit`:
 3. For dirty changes, record `HEAD`, acquire a persistent commit lease, run `git add -A -- .`, and create `T0001 - Semantic name`.
 4. If the commit was created directly on the base branch, record it and mark the task `DONE` without a merge.
 5. If it was created on the worker branch, check out the base branch, fast-forward merge, delete the worker branch, and mark the task `DONE`.
+6. If the base branch was unborn, allow approval to create a root commit, establish the configured base branch at that commit, check it out, and delete the worker branch.
 
 When a commit is needed, it includes the working-tree state present when `commit-approved` runs, including changes made after the task entered `REVIEW`. ControlRoom does not compare that content with an earlier review snapshot and does not reject approval based on commits made outside its workflow.
 

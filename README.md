@@ -20,7 +20,7 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Git
 - Node.js 22.18 or newer
 
-ControlRoom expects a clean Git repository with a configured base branch.
+ControlRoom expects a Git repository with a configured base branch. The branch may be unborn: `$control-room init` works before the repository has its first commit.
 
 All ControlRoom tasks must use the Codex **Local** environment. Do not select **Worktree** when creating a task.
 
@@ -75,6 +75,8 @@ $control-room init
 
 ControlRoom uses the current Local checkout as the shared project checkout, records its currently checked-out Git branch as the base branch, and keeps the coordinator title fixed as `⚫️ Control Room`.
 
+Initialization does not create a commit. In a new repository, the first activated task may start with files that are still untracked or otherwise uncommitted. They remain uncommitted through implementation and review; `Approve` creates the root commit, establishes the configured base branch, and removes the worker branch.
+
 The coordinator does not receive a `T_ID` and must not be used for planning or implementation. Running `$control-room init` again in the same task is safe; another task cannot silently replace the registered coordinator.
 
 Use a separate top-level Codex task in **Local** mode to discuss and plan each change. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
@@ -105,12 +107,26 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | --- | --- |
 | `$control-room init` | Initialize the current top-level task as the project coordinator. |
 | `$control-room join` | Register an existing top-level task in planning without queueing it. |
-| `Queue` | Add or update the current task at the end of the queue. |
-| `Queue after T0005` | Queue the current task after `T0005` and add an ordering dependency. |
+| `$control-room queue` | Show the current ordered queue from any task in the initialized Local project. |
+| `$control-room help` | Show the available user commands from any task. |
+| `Enqueue` | Add or update the current task at the end of the queue. |
+| `Enqueue after T0005` | Add the current task immediately after `T0005`, without creating a dependency. |
+| `Move first` | Move the current queued task to the first waiting position. |
+| `Move to 3` | Move the current queued task to waiting position 3. |
+| `Move before T0005` | Move the current queued task immediately before `T0005`. |
+| `Move after T0005` | Move the current queued task immediately after `T0005`. |
+| `Depends on T0005` | Require `T0005` to be done before the current task can start. |
+| `Remove dependency T0005` | Remove that requirement from the current task. |
 | `Approve` | Approve the current task when it is in review. |
 | `Cancel` | Cancel the current task. |
 | `Status` | Show the current task state. |
 | `Queue status` | Show the ordered project queue. |
+
+`$control-room queue` is the fast, read-only queue command. It works in the coordinator, in a registered worker, or in an unregistered top-level task whose Local environment points to the initialized repository. It does not register the task, change its title, or notify the coordinator. `$control-room help` is also read-only and does not require an initialized project.
+
+Queue order and dependencies are separate. `Enqueue after` and every `Move` command change only the order. `Depends on` and `Remove dependency` change only start eligibility and never move a task.
+
+From a worker, `Move` and dependency commands apply to that task. From `⚫️ Control Room`, include the target ID, for example `Move T0003 before T0005` or `Make T0003 depend on T0005`.
 
 `Approve` is accepted only from your direct message in the task currently in review. Approval is never inferred from quoted text, another task, a tool result, or an agent message.
 
@@ -138,6 +154,8 @@ First, create a dedicated top-level task for the repository and initialize the c
 
 ControlRoom renames that task `⚫️ Control Room` and keeps that title in every state. Leave it dedicated to coordination.
 
+After initialization, the final response confirms the configured base branch and ends with the same concise command list available through `$control-room help`. The list is shown on both the first initialization and an idempotent retry.
+
 You can start a dedicated top-level task with a normal planning prompt:
 
 > Add an audit log for changes to user permissions. First inspect the current authorization flow, identify the files involved, and propose an implementation plan. Do not modify files yet.
@@ -148,19 +166,35 @@ If this task already existed before ControlRoom was initialized, adopt it:
 
 For example, ControlRoom may rename it `⚪️ T0001 - Add permission audit log`. It remains in planning.
 
-After reviewing the plan, place the task behind an existing dependency:
+After reviewing the plan, queue the task:
 
-> Queue after T0005
+> Enqueue
+
+Suppose two more tasks are waiting and the queue is `T0001`, `T0002`, `T0003`. You can reprioritize `T0003` from its own task:
+
+> Move first
+
+Or do the same from the coordinator:
+
+> Move T0003 before T0001
+
+If `T0003` cannot start until `T0005` is completed, add that constraint separately:
+
+> Depends on T0005
 
 You can check progress from the same task:
 
-> Status
+> $control-room queue
+
+To see the available commands at any time:
+
+> $control-room help
 
 While the task is queued, no branch exists for it. When ControlRoom activates the task, it creates and checks out `control-room/T0001`; Codex implements the approved plan there without committing, then moves it to review. You may continue requesting changes during review. When the current working tree is ready, approve it from that task:
 
 > Approve
 
-From the Control Room coordinator task, inspect the remaining work:
+The older conversational form remains available when you want queue details:
 
 > Queue status
 
@@ -171,7 +205,8 @@ ControlRoom keeps task titles synchronized with their state:
 | State | Example title |
 | --- | --- |
 | Planning | `⚪️ T0001 - Add audit log` |
-| Queued | `⭕️ T0001 - Add audit log` |
+| Queued | `⭕️ ① T0001 - Add audit log` |
+| Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
 | Review | `🟡 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
@@ -181,11 +216,13 @@ ControlRoom keeps task titles synchronized with their state:
 
 Blocked and canceled tasks use the same `❌` status icon.
 
+The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Queue and state changes return title updates for the affected queued tasks, so activation, moving, blocking, resuming, or removing a task renumbers every changed title automatically.
+
 ## Typical workflow
 
 1. Open a dedicated top-level task and discuss the change.
 2. Refine the plan without editing code.
-3. Say `Queue`, or `Queue after T0005` when the task depends on another task.
+3. Say `Enqueue`; use `Move` to reprioritize it and `Depends on T0005` only when it truly depends on another task.
 4. ControlRoom activates the first eligible task after its dependencies are done.
 5. Codex implements and verifies the change inside that dedicated task.
 6. The task moves to review.

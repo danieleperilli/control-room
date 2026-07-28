@@ -1,11 +1,20 @@
 #!/usr/bin/env node
 
-const core = require("./control-room-core.ts");
-
 interface IParsedArguments {
     command: string;
     values: Record<string, string>;
 }
+
+const USER_COMMANDS = [
+    "$control-room init",
+    "$control-room join",
+    "$control-room queue",
+    "$control-room help",
+    "Enqueue [after T0002]",
+    "Move first | Move to 3 | Move before T0002 | Move after T0002",
+    "Depends on T0002 | Remove dependency T0002",
+    "Approve | Cancel | Status | Queue status"
+];
 
 /**
  * Parse one command and `--name value` options without interpreting shell text.
@@ -74,15 +83,32 @@ function validateOptions(values: Record<string, string>, allowedNames: string[])
 }
 
 /**
+ * Parse a one-based queue position without accepting partial numeric text.
+ * @param value CLI position text.
+ */
+function parseQueuePosition(value: string): number {
+    if (!/^[1-9]\d{0,3}$/u.test(value)) {
+        throw new Error("Queue position must be an integer between 1 and 9999.");
+    }
+    return Number(value);
+}
+
+/**
  * Print concise command usage.
  */
 function printHelp(): void {
     process.stdout.write(`ControlRoom CLI
 
+User commands:
+${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
+
 Commands:
   init --project-root ROOT --coordinator-thread ID --base-branch BRANCH [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
+  request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
+  request-dependency-add --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
+  request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
@@ -107,9 +133,13 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         printHelp();
         return null;
     }
+    const core = require("./control-room-core.ts");
     if (parsed.command === "init") {
         validateOptions(values, ["project-root", "coordinator-thread", "base-branch", "state-root"]);
-        return core.initializeProject(buildOptions(values), requireOption(values, "coordinator-thread"), requireOption(values, "base-branch"));
+        return {
+            ...core.initializeProject(buildOptions(values), requireOption(values, "coordinator-thread"), requireOption(values, "base-branch")),
+            userCommands: USER_COMMANDS
+        };
     }
     if (parsed.command === "register") {
         validateOptions(values, ["project-root", "thread-id", "name", "state-root"]);
@@ -119,6 +149,30 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         validateOptions(values, ["project-root", "task", "event-key", "after", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "ENQUEUE_REQUESTED", {
             afterTaskId: values.after
+        });
+    }
+    if (parsed.command === "request-move") {
+        validateOptions(values, ["project-root", "task", "event-key", "position", "before", "after", "state-root"]);
+        const selectorCount = Number(Boolean(values.position)) + Number(Boolean(values.before)) + Number(Boolean(values.after));
+        if (selectorCount !== 1) {
+            throw new Error("request-move requires exactly one of --position, --before, or --after.");
+        }
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "MOVE_REQUESTED", {
+            afterTaskId: values.after,
+            beforeTaskId: values.before,
+            position: values.position ? parseQueuePosition(values.position) : undefined
+        });
+    }
+    if (parsed.command === "request-dependency-add") {
+        validateOptions(values, ["project-root", "task", "event-key", "depends-on", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "DEPENDENCY_ADD_REQUESTED", {
+            dependencyTaskId: requireOption(values, "depends-on")
+        });
+    }
+    if (parsed.command === "request-dependency-remove") {
+        validateOptions(values, ["project-root", "task", "event-key", "depends-on", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "DEPENDENCY_REMOVE_REQUESTED", {
+            dependencyTaskId: requireOption(values, "depends-on")
         });
     }
     if (parsed.command === "request-review") {

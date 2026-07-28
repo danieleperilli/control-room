@@ -6,7 +6,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "ENQUEUE_REQUESTED" | "REVIEW_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type EventKind = "ENQUEUE_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 
 interface IControlRoomOptions {
     projectRoot: string;
@@ -15,6 +15,9 @@ interface IControlRoomOptions {
 
 interface IEventPayload {
     afterTaskId?: string;
+    beforeTaskId?: string;
+    dependencyTaskId?: string;
+    position?: number;
     reason?: string;
     summary?: string;
     userRequestId?: string;
@@ -46,6 +49,7 @@ interface ITaskRow {
     state: TaskState;
     blocked_from_state: TaskState | null;
     queue_position: number | null;
+    queued_display_position?: number | null;
     base_commit: string | null;
     branch_name: string | null;
     reviewed_commit: string | null;
@@ -68,9 +72,35 @@ interface IGitResult {
     stderr: string;
 }
 
+interface ITitleUpdate {
+    taskId: string;
+    threadId: string;
+    title: string;
+}
+
 const TASK_ID_PATTERN = /^T\d{4}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const ACTIVE_STATES: TaskState[] = ["QUEUED", "RUNNING", "REVIEW", "APPROVED", "BLOCKED"];
+const QUEUE_POSITION_DIGITS = ["⓪", "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
+const TASK_WITH_QUEUED_POSITION_SELECT = `
+    SELECT task.*,
+        CASE
+            WHEN task.state = 'QUEUED' AND task.queue_position IS NOT NULL THEN (
+                SELECT COUNT(*)
+                FROM tasks AS queued_task
+                WHERE queued_task.state = 'QUEUED'
+                    AND (
+                        queued_task.queue_position < task.queue_position
+                        OR (
+                            queued_task.queue_position = task.queue_position
+                            AND queued_task.task_number <= task.task_number
+                        )
+                    )
+            )
+            ELSE NULL
+        END AS queued_display_position
+    FROM tasks AS task
+`;
 const COORDINATOR_WAKE_NOTIFICATION = "CONTROL_ROOM_WAKE";
 const GIT_MODE = "local-approval-commit";
 
@@ -134,7 +164,7 @@ function validateThreadId(threadId: string): string {
  */
 function validateSemanticName(semanticName: string): string {
     assertCondition(typeof semanticName === "string", "A semantic task name is required.");
-    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🟢|✅|❌|👉)\s*/u, "");
+    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🟢|✅|❌|👉)\s*(?:(?:[⓪①-⑨]+|[❶-❾]|#\d{1,4})\s+)?/u, "");
     assertCondition(normalizedName.length > 0 && normalizedName.length <= 80, "Semantic task name must contain 1 to 80 characters.");
     assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedName), "Semantic task name contains control characters.");
     return normalizedName;
@@ -215,6 +245,15 @@ function validateCompactText(value: string | undefined, fieldName: string, maxim
 }
 
 /**
+ * Validate a one-based position in the waiting queue.
+ * @param position Queue position supplied by the caller.
+ */
+function validateQueuePosition(position: number | undefined): number {
+    assertCondition(Number.isSafeInteger(position) && Number(position) >= 1 && Number(position) <= 9999, "Queue position must be an integer between 1 and 9999.");
+    return Number(position);
+}
+
+/**
  * Validate and canonicalize an event payload before persistence.
  * @param kind Requested event kind.
  * @param payload Caller-supplied event payload.
@@ -223,6 +262,20 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
     if (kind === "ENQUEUE_REQUESTED") {
         return {
             afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined
+        };
+    }
+    if (kind === "MOVE_REQUESTED") {
+        const selectorCount = Number(Boolean(payload.beforeTaskId)) + Number(Boolean(payload.afterTaskId)) + Number(payload.position !== undefined);
+        assertCondition(selectorCount === 1, "Move requires exactly one destination: before, after, or position.");
+        return {
+            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined,
+            beforeTaskId: payload.beforeTaskId ? validateTaskId(payload.beforeTaskId) : undefined,
+            position: payload.position !== undefined ? validateQueuePosition(payload.position) : undefined
+        };
+    }
+    if (kind === "DEPENDENCY_ADD_REQUESTED" || kind === "DEPENDENCY_REMOVE_REQUESTED") {
+        return {
+            dependencyTaskId: validateTaskId(String(payload.dependencyTaskId || ""))
         };
     }
     if (kind === "REVIEW_REQUESTED") {
@@ -292,7 +345,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 3, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 4, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -326,7 +379,7 @@ function initializeSchema(database: any): void {
             CREATE TABLE IF NOT EXISTS dependencies (
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
                 depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
-                dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'ORDER'),
+                dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
                 PRIMARY KEY (task_id, depends_on_id, dependency_kind),
                 CHECK (task_id <> depends_on_id)
             );
@@ -334,7 +387,7 @@ function initializeSchema(database: any): void {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'REVIEW_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -377,10 +430,46 @@ function initializeSchema(database: any): void {
                 DROP TABLE projects_legacy;
             `);
         }
+        const dependencyTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dependencies'").get() as { sql: string } | undefined;
+        if (dependencyTable && dependencyTable.sql.includes("'ORDER'")) {
+            database.exec(`
+                ALTER TABLE dependencies RENAME TO dependencies_legacy;
+                CREATE TABLE dependencies (
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+                    dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
+                    PRIMARY KEY (task_id, depends_on_id, dependency_kind),
+                    CHECK (task_id <> depends_on_id)
+                );
+                INSERT INTO dependencies (task_id, depends_on_id, dependency_kind)
+                SELECT task_id, depends_on_id, 'BLOCKING' FROM dependencies_legacy;
+                DROP TABLE dependencies_legacy;
+            `);
+        }
+        const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
+        if (eventTable && !eventTable.sql.includes("MOVE_REQUESTED")) {
+            database.exec(`
+                ALTER TABLE events RENAME TO events_legacy;
+                CREATE TABLE events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT,
+                    result_json TEXT
+                );
+                INSERT INTO events (sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
+                SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
+                FROM events_legacy;
+                DROP TABLE events_legacy;
+            `);
+        }
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -464,9 +553,20 @@ function requireProject(store: IStore): IProjectRow {
  */
 function requireTask(store: IStore, taskId: string): ITaskRow {
     const validTaskId = validateTaskId(taskId);
-    const row = store.database.prepare("SELECT * FROM tasks WHERE task_id = ?").get(validTaskId) as ITaskRow | undefined;
+    const row = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.task_id = ?`).get(validTaskId) as ITaskRow | undefined;
     assertCondition(row, `Unknown task: ${validTaskId}`);
     return row;
+}
+
+/**
+ * Format the visual marker for one waiting-queue position.
+ * @param position One-based waiting-queue position.
+ */
+function queuePositionMarker(position: number | null): string {
+    if (!Number.isSafeInteger(position) || Number(position) < 1) {
+        return "";
+    }
+    return String(position).split("").map((digit) => QUEUE_POSITION_DIGITS[Number(digit)]).join("");
 }
 
 /**
@@ -478,7 +578,8 @@ function titleForTask(task: ITaskRow): string {
     if (task.state === "PLANNING") {
         prefix = "⚪️ ";
     } else if (task.state === "QUEUED") {
-        prefix = "⭕️ ";
+        const positionMarker = queuePositionMarker(task.queued_display_position ?? task.queue_position);
+        prefix = positionMarker ? `⭕️ ${positionMarker} ` : "⭕️ ";
     } else if (task.state === "RUNNING") {
         prefix = "🔴 ";
     } else if (task.state === "REVIEW") {
@@ -513,6 +614,7 @@ function serializeTask(task: ITaskRow): Record<string, unknown> {
         state: task.state,
         title: titleForTask(task),
         queuePosition: task.queue_position,
+        queuedPosition: task.queued_display_position ?? null,
         baseCommit: task.base_commit,
         branchName: task.branch_name,
         committedCommit: task.integrated_commit
@@ -530,13 +632,13 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
     const validBaseBranch = validateBranchName(baseBranch);
     const store = openStore(options);
     try {
-        resolveLocalBranchHead(store.projectRoot, validBaseBranch);
         beginTransaction(store.database);
         const existingProject = store.database.prepare("SELECT * FROM projects WHERE project_key = ?").get(store.projectKey) as IProjectRow | undefined;
         if (existingProject) {
             assertCondition(existingProject.project_root === store.projectRoot, "Project hash collision detected.");
             assertCondition(existingProject.coordinator_thread_id === validCoordinatorThreadId, "A different coordinator is already registered for this project.");
             assertCondition(existingProject.base_branch === validBaseBranch, "The configured base branch does not match.");
+            const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, existingProject.base_branch);
             const coordinatorTitle = titleForCoordinator();
             commitTransaction(store.database);
             return {
@@ -546,9 +648,16 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
                 projectRoot: store.projectRoot,
                 coordinatorThreadId: existingProject.coordinator_thread_id,
                 baseBranch: existingProject.base_branch,
+                baseCommit,
                 gitMode: existingProject.git_mode,
                 databasePath: store.databasePath
             };
+        }
+        const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, validBaseBranch);
+        if (!baseCommit) {
+            const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+            assertCondition(currentBranch === validBaseBranch, `Unborn base branch ${validBaseBranch} must be the current branch.`);
+            assertCondition(resolveCurrentHeadIfExists(store.projectRoot) === null, `Base branch ${validBaseBranch} does not exist, but the current branch already has commits.`);
         }
         const timestamp = currentTimestamp();
         store.database.prepare(`
@@ -564,6 +673,7 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
             projectRoot: store.projectRoot,
             coordinatorThreadId: validCoordinatorThreadId,
             baseBranch: validBaseBranch,
+            baseCommit,
             gitMode: GIT_MODE,
             databasePath: store.databasePath
         };
@@ -636,21 +746,6 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
         beginTransaction(store.database);
         const project = requireProject(store);
         const task = requireTask(store, validTaskId);
-        if (kind === "ENQUEUE_REQUESTED") {
-            assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
-            if (validPayload.afterTaskId) {
-                assertCondition(validPayload.afterTaskId !== task.task_id, "A task cannot be queued after itself.");
-                requireTask(store, validPayload.afterTaskId);
-            }
-        } else if (kind === "REVIEW_REQUESTED") {
-            assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
-        } else if (kind === "APPROVAL_REQUESTED") {
-            assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
-        } else if (kind === "CANCEL_REQUESTED") {
-            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
-        } else {
-            assertCondition(["QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot report ${task.task_id} blocked from ${task.state}.`);
-        }
         const payloadJson = JSON.stringify(validPayload);
         const existingEvent = store.database.prepare("SELECT event_key, task_id, kind, payload_json, processed_at FROM events WHERE event_key = ?").get(validEventKey) as Record<string, unknown> | undefined;
         if (existingEvent) {
@@ -663,6 +758,33 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
                 coordinatorThreadId: project.coordinator_thread_id,
                 notification: COORDINATOR_WAKE_NOTIFICATION
             };
+        }
+        if (kind === "ENQUEUE_REQUESTED") {
+            assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
+            if (validPayload.afterTaskId) {
+                assertCondition(validPayload.afterTaskId !== task.task_id, "A task cannot be queued after itself.");
+                requireTask(store, validPayload.afterTaskId);
+            }
+        } else if (kind === "MOVE_REQUESTED") {
+            assertCondition(task.state === "QUEUED", `Cannot move ${task.task_id} from ${task.state}.`);
+            const referenceTaskId = validPayload.beforeTaskId || validPayload.afterTaskId;
+            if (referenceTaskId) {
+                assertCondition(referenceTaskId !== task.task_id, "A task cannot be moved relative to itself.");
+                const referenceTask = requireTask(store, referenceTaskId);
+                assertCondition(referenceTask.state === "QUEUED", `${referenceTask.task_id} is not waiting in the queue.`);
+            }
+        } else if (kind === "DEPENDENCY_ADD_REQUESTED" || kind === "DEPENDENCY_REMOVE_REQUESTED") {
+            assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot change dependencies for ${task.task_id} from ${task.state}.`);
+            assertCondition(validPayload.dependencyTaskId !== task.task_id, "A task cannot depend on itself.");
+            requireTask(store, String(validPayload.dependencyTaskId));
+        } else if (kind === "REVIEW_REQUESTED") {
+            assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
+        } else if (kind === "APPROVAL_REQUESTED") {
+            assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
+        } else if (kind === "CANCEL_REQUESTED") {
+            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
+        } else {
+            assertCondition(["QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot report ${task.task_id} blocked from ${task.state}.`);
         }
         store.database.prepare(`
             INSERT INTO events (event_key, task_id, kind, payload_json, created_at)
@@ -685,20 +807,77 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
 }
 
 /**
- * Normalize active queue positions after a queue mutation.
+ * Normalize active queue positions and return changed queued title projections.
  * @param store Open project store.
  * @param orderedTaskIds Active task IDs in desired order.
  */
-function writeQueueOrder(store: IStore, orderedTaskIds: string[]): void {
+function writeQueueOrder(store: IStore, orderedTaskIds: string[]): ITitleUpdate[] {
+    const readCurrentPosition = store.database.prepare("SELECT state, queue_position FROM tasks WHERE task_id = ?");
     const updatePosition = store.database.prepare("UPDATE tasks SET queue_position = ?, updated_at = ? WHERE task_id = ?");
     const timestamp = currentTimestamp();
+    const changedQueuedTaskIds: string[] = [];
     for (let index = 0; index < orderedTaskIds.length; index += 1) {
-        updatePosition.run(index + 1, timestamp, orderedTaskIds[index]);
+        const taskId = orderedTaskIds[index];
+        const nextPosition = index + 1;
+        const current = readCurrentPosition.get(taskId) as { queue_position: number | null; state: TaskState } | undefined;
+        assertCondition(current, `Cannot order unknown task: ${taskId}`);
+        if (current.queue_position !== nextPosition) {
+            updatePosition.run(nextPosition, timestamp, taskId);
+            if (current.state === "QUEUED") {
+                changedQueuedTaskIds.push(taskId);
+            }
+        }
     }
+    const titleUpdates: ITitleUpdate[] = [];
+    for (const taskId of changedQueuedTaskIds) {
+        const queuedTask = requireTask(store, taskId);
+        titleUpdates.push({
+            taskId: queuedTask.task_id,
+            threadId: queuedTask.thread_id,
+            title: titleForTask(queuedTask)
+        });
+    }
+    return titleUpdates;
 }
 
 /**
- * Reject an ordering dependency that would create a queue cycle.
+ * Project title updates for queued tasks at or after an active queue position.
+ * @param store Open project store.
+ * @param minimumQueuePosition First active queue position whose queued titles may have changed.
+ */
+function readQueuedTitleUpdates(store: IStore, minimumQueuePosition: number): ITitleUpdate[] {
+    const queuedTasks = store.database.prepare(`
+        ${TASK_WITH_QUEUED_POSITION_SELECT}
+        WHERE task.state = 'QUEUED' AND task.queue_position >= ?
+        ORDER BY task.queue_position, task.task_number
+    `).all(minimumQueuePosition) as ITaskRow[];
+    const titleUpdates: ITitleUpdate[] = [];
+    for (const queuedTask of queuedTasks) {
+        titleUpdates.push({
+            taskId: queuedTask.task_id,
+            threadId: queuedTask.thread_id,
+            title: titleForTask(queuedTask)
+        });
+    }
+    return titleUpdates;
+}
+
+/**
+ * Read explicit blocking dependencies for one task.
+ * @param store Open project store.
+ * @param taskId Task whose dependencies should be read.
+ */
+function readTaskDependencies(store: IStore, taskId: string): string[] {
+    const dependencyRows = store.database.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = ? ORDER BY depends_on_id").all(taskId) as Array<{ depends_on_id: string }>;
+    const dependencies: string[] = [];
+    for (const dependencyRow of dependencyRows) {
+        dependencies.push(dependencyRow.depends_on_id);
+    }
+    return dependencies;
+}
+
+/**
+ * Reject a blocking dependency that would create a cycle.
  * @param store Open project store.
  * @param taskId Task receiving the new dependency.
  * @param dependsOnId Proposed prerequisite task.
@@ -714,11 +893,11 @@ function assertDependencyIsAcyclic(store: IStore, taskId: string, dependsOnId: s
         )
         SELECT task_id FROM prerequisite_chain WHERE task_id = ? LIMIT 1
     `).get(dependsOnId, taskId) as { task_id: string } | undefined;
-    assertCondition(!cycle, `Ordering ${taskId} after ${dependsOnId} would create a dependency cycle.`);
+    assertCondition(!cycle, `Making ${taskId} depend on ${dependsOnId} would create a dependency cycle.`);
 }
 
 /**
- * Place a task at the requested queue location and maintain its order dependency.
+ * Place a task at the requested queue location without changing dependencies.
  * @param store Open project store.
  * @param task Current task row.
  * @param payload Enqueue request payload.
@@ -729,7 +908,8 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
     if (payload.afterTaskId) {
         afterTaskId = validateTaskId(payload.afterTaskId);
         assertCondition(afterTaskId !== task.task_id, "A task cannot be queued after itself.");
-        requireTask(store, afterTaskId);
+        const afterTask = requireTask(store, afterTaskId);
+        assertCondition(ACTIVE_STATES.includes(afterTask.state), `${afterTask.task_id} is not in the active queue.`);
     }
     const activeRows = store.database.prepare(`
         SELECT task_id FROM tasks
@@ -750,30 +930,107 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
     } else {
         orderedTaskIds.push(task.task_id);
     }
-    store.database.prepare("DELETE FROM dependencies WHERE task_id = ? AND dependency_kind = 'ORDER'").run(task.task_id);
-    if (afterTaskId) {
-        assertDependencyIsAcyclic(store, task.task_id, afterTaskId);
-        store.database.prepare("INSERT INTO dependencies (task_id, depends_on_id, dependency_kind) VALUES (?, ?, 'ORDER')").run(task.task_id, afterTaskId);
-    }
     store.database.prepare(`
         UPDATE tasks
         SET state = 'QUEUED', blocked_from_state = NULL, base_commit = NULL,
             branch_name = NULL, reviewed_commit = NULL, updated_at = ?
         WHERE task_id = ?
     `).run(currentTimestamp(), task.task_id);
-    writeQueueOrder(store, orderedTaskIds);
+    const titleUpdates = writeQueueOrder(store, orderedTaskIds);
     const refreshedTask = requireTask(store, task.task_id);
     return {
         action: "ENQUEUED",
         task: serializeTask(refreshedTask),
         afterTaskId: afterTaskId || null,
+        titleUpdates,
         executionBrief: {
             taskId: refreshedTask.task_id,
             title: titleForTask(refreshedTask),
             projectRoot: store.projectRoot,
-            dependencies: afterTaskId ? [afterTaskId] : [],
+            dependencies: readTaskDependencies(store, refreshedTask.task_id),
             instruction: "Wait for Control Room activation. Do not create a branch, modify files, stage changes, or commit."
         }
+    };
+}
+
+/**
+ * Reposition a waiting task without changing dependencies.
+ * @param store Open project store.
+ * @param task Current task row.
+ * @param payload Move request payload.
+ */
+function applyMoveEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
+    assertCondition(task.state === "QUEUED", `Cannot move ${task.task_id} from ${task.state}.`);
+    const activeRows = store.database.prepare(`
+        SELECT task_id, state FROM tasks
+        WHERE state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED') AND task_id <> ?
+        ORDER BY queue_position IS NULL, queue_position, task_number
+    `).all(task.task_id) as Array<{ task_id: string; state: TaskState }>;
+    const orderedTaskIds = activeRows.map((row) => row.task_id);
+    const waitingTaskIds = activeRows.filter((row) => row.state === "QUEUED").map((row) => row.task_id);
+    let insertionIndex: number;
+    if (payload.beforeTaskId) {
+        insertionIndex = orderedTaskIds.indexOf(payload.beforeTaskId);
+        assertCondition(insertionIndex >= 0 && waitingTaskIds.includes(payload.beforeTaskId), `${payload.beforeTaskId} is not waiting in the queue.`);
+    } else if (payload.afterTaskId) {
+        insertionIndex = orderedTaskIds.indexOf(payload.afterTaskId);
+        assertCondition(insertionIndex >= 0 && waitingTaskIds.includes(payload.afterTaskId), `${payload.afterTaskId} is not waiting in the queue.`);
+        insertionIndex += 1;
+    } else {
+        const position = validateQueuePosition(payload.position);
+        assertCondition(position <= waitingTaskIds.length + 1, `Queue position ${position} exceeds the waiting queue length ${waitingTaskIds.length + 1}.`);
+        if (position <= waitingTaskIds.length) {
+            insertionIndex = orderedTaskIds.indexOf(waitingTaskIds[position - 1]);
+        } else if (waitingTaskIds.length > 0) {
+            insertionIndex = orderedTaskIds.indexOf(waitingTaskIds[waitingTaskIds.length - 1]) + 1;
+        } else {
+            insertionIndex = orderedTaskIds.length;
+        }
+    }
+    orderedTaskIds.splice(insertionIndex, 0, task.task_id);
+    const titleUpdates = writeQueueOrder(store, orderedTaskIds);
+    const refreshedTask = requireTask(store, task.task_id);
+    const refreshedWaitingRows = store.database.prepare("SELECT task_id FROM tasks WHERE state = 'QUEUED' ORDER BY queue_position, task_number").all() as Array<{ task_id: string }>;
+    return {
+        action: "MOVED",
+        task: serializeTask(refreshedTask),
+        waitingPosition: refreshedWaitingRows.findIndex((row) => row.task_id === task.task_id) + 1,
+        titleUpdates,
+        dependencies: readTaskDependencies(store, task.task_id)
+    };
+}
+
+/**
+ * Add or remove one explicit blocking dependency.
+ * @param store Open project store.
+ * @param task Current task row.
+ * @param payload Dependency request payload.
+ * @param shouldAdd Whether the dependency should be added.
+ */
+function applyDependencyEvent(store: IStore, task: ITaskRow, payload: IEventPayload, shouldAdd: boolean): Record<string, unknown> {
+    assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot change dependencies for ${task.task_id} from ${task.state}.`);
+    const dependencyTaskId = validateTaskId(String(payload.dependencyTaskId || ""));
+    assertCondition(dependencyTaskId !== task.task_id, "A task cannot depend on itself.");
+    const dependencyTask = requireTask(store, dependencyTaskId);
+    if (shouldAdd) {
+        assertCondition(dependencyTask.state !== "CANCELED", `${dependencyTask.task_id} is canceled and cannot be used as a dependency.`);
+        assertDependencyIsAcyclic(store, task.task_id, dependencyTaskId);
+        const change = store.database.prepare("INSERT OR IGNORE INTO dependencies (task_id, depends_on_id, dependency_kind) VALUES (?, ?, 'BLOCKING')").run(task.task_id, dependencyTaskId);
+        store.database.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        return {
+            action: Number(change.changes) > 0 ? "DEPENDENCY_ADDED" : "DEPENDENCY_ALREADY_PRESENT",
+            task: serializeTask(requireTask(store, task.task_id)),
+            dependencyTaskId,
+            dependencies: readTaskDependencies(store, task.task_id)
+        };
+    }
+    const change = store.database.prepare("DELETE FROM dependencies WHERE task_id = ? AND depends_on_id = ? AND dependency_kind = 'BLOCKING'").run(task.task_id, dependencyTaskId);
+    store.database.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+    return {
+        action: Number(change.changes) > 0 ? "DEPENDENCY_REMOVED" : "DEPENDENCY_ALREADY_ABSENT",
+        task: serializeTask(requireTask(store, task.task_id)),
+        dependencyTaskId,
+        dependencies: readTaskDependencies(store, task.task_id)
     };
 }
 
@@ -787,6 +1044,15 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     const payload = JSON.parse(event.payload_json) as IEventPayload;
     if (event.kind === "ENQUEUE_REQUESTED") {
         return applyEnqueueEvent(store, task, payload);
+    }
+    if (event.kind === "MOVE_REQUESTED") {
+        return applyMoveEvent(store, task, payload);
+    }
+    if (event.kind === "DEPENDENCY_ADD_REQUESTED") {
+        return applyDependencyEvent(store, task, payload, true);
+    }
+    if (event.kind === "DEPENDENCY_REMOVE_REQUESTED") {
+        return applyDependencyEvent(store, task, payload, false);
     }
     if (event.kind === "REVIEW_REQUESTED") {
         if (task.state === "APPROVED" || task.state === "DONE") {
@@ -826,9 +1092,9 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         for (const activeRow of activeRows) {
             activeTaskIds.push(activeRow.task_id);
         }
-        writeQueueOrder(store, activeTaskIds);
+        const titleUpdates = writeQueueOrder(store, activeTaskIds);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "CANCELED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId };
+        return { action: "CANCELED", task: serializeTask(refreshedTask), titleUpdates, userRequestId: payload.userRequestId };
     }
     assertCondition(event.kind === "BLOCKED_REPORTED", `Unsupported event kind: ${event.kind}`);
     if (task.state === "BLOCKED") {
@@ -837,8 +1103,9 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     assertCondition(task.state === "QUEUED" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot block ${task.task_id} from ${task.state}.`);
     assertCondition(payload.reason && payload.reason.trim().length > 0, "A blocked event requires a reason.");
     store.database.prepare("UPDATE tasks SET state = 'BLOCKED', blocked_from_state = ?, updated_at = ? WHERE task_id = ?").run(task.state, currentTimestamp(), task.task_id);
+    const titleUpdates = task.state === "QUEUED" ? readQueuedTitleUpdates(store, task.queue_position || 1) : [];
     const refreshedTask = requireTask(store, task.task_id);
-    return { action: "BLOCKED", task: serializeTask(refreshedTask), reason: payload.reason };
+    return { action: "BLOCKED", task: serializeTask(refreshedTask), reason: payload.reason, titleUpdates };
 }
 
 /**
@@ -929,10 +1196,35 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             return { activated: false, coordinatorTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
         }
         const workerBranch = workerBranchForTask(selectedTask.task_id);
-        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating a task.");
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
-        let currentBaseCommit: string;
-        if (currentBranch === project.base_branch) {
+        const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
+        let currentBaseCommit: string | null;
+        if (!baseCommit) {
+            assertCondition(resolveCurrentHeadIfExists(store.projectRoot) === null, `Base branch ${project.base_branch} has no commits, but ${currentBranch || "the current branch"} has a commit.`);
+            const previousTask = store.database.prepare(`
+                SELECT task_id FROM tasks
+                WHERE branch_name = ? AND state IN ('DONE', 'CANCELED')
+                LIMIT 1
+            `).get(currentBranch) as { task_id: string } | undefined;
+            assertCondition(
+                currentBranch === project.base_branch || currentBranch === workerBranch || previousTask,
+                `ControlRoom requires unborn branch ${project.base_branch}; found ${currentBranch || "detached HEAD"}.`
+            );
+            const previousActivation = store.database.prepare("SELECT task_id FROM tasks WHERE branch_name IS NOT NULL LIMIT 1").get() as { task_id: string } | undefined;
+            if (previousActivation) {
+                assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating another task.");
+            }
+            const existingWorkerBranch = runGit(store.projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${workerBranch}`]);
+            assertCondition(
+                existingWorkerBranch.status === 1,
+                existingWorkerBranch.status === 0 ?
+                    `Worker branch already exists for ${selectedTask.task_id}: ${workerBranch}` :
+                    `Inspect worker branch failed: ${existingWorkerBranch.stderr || existingWorkerBranch.stdout}`
+            );
+            requireGit(store.projectRoot, ["symbolic-ref", "HEAD", `refs/heads/${workerBranch}`], `Create unborn worker branch ${workerBranch}`);
+            currentBaseCommit = null;
+        } else if (currentBranch === project.base_branch) {
+            assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating a task.");
             currentBaseCommit = requireBaseCheckout(store.projectRoot, project.base_branch);
             const existingWorkerBranch = runGit(store.projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${workerBranch}`]);
             assertCondition(
@@ -943,8 +1235,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             );
             requireGit(store.projectRoot, ["checkout", "-b", workerBranch, project.base_branch], `Create worker branch ${workerBranch}`);
         } else {
+            assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating a task.");
             assertCondition(currentBranch === workerBranch, `ControlRoom requires branch ${project.base_branch}; found ${currentBranch || "detached HEAD"}.`);
-            currentBaseCommit = resolveLocalBranchHead(store.projectRoot, project.base_branch);
+            currentBaseCommit = baseCommit;
             assertCondition(requireBranchCheckout(store.projectRoot, workerBranch) === currentBaseCommit, `Interrupted activation branch ${workerBranch} moved before state persistence.`);
         }
         store.database.prepare(`
@@ -953,17 +1246,14 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             WHERE task_id = ?
         `).run(currentBaseCommit, workerBranch, currentTimestamp(), selectedTask.task_id);
         const runningTask = requireTask(store, selectedTask.task_id);
-        const dependencyRows = store.database.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = ? ORDER BY depends_on_id").all(runningTask.task_id) as Array<{ depends_on_id: string }>;
-        const dependencies: string[] = [];
-        for (const dependencyRow of dependencyRows) {
-            dependencies.push(dependencyRow.depends_on_id);
-        }
+        const titleUpdates = readQueuedTitleUpdates(store, selectedTask.queue_position || 1);
         const coordinatorTitle = titleForCoordinator();
         commitTransaction(store.database);
         return {
             activated: true,
             coordinatorTitle,
             task: serializeTask(runningTask),
+            titleUpdates,
             executionBrief: {
                 taskId: runningTask.task_id,
                 threadId: runningTask.thread_id,
@@ -972,7 +1262,7 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
                 baseCommit: runningTask.base_commit,
                 baseBranch: project.base_branch,
                 workerBranch: runningTask.branch_name,
-                dependencies,
+                dependencies: readTaskDependencies(store, runningTask.task_id),
                 instruction: "Implement on the active worker branch without staging or committing. Leave all changes uncommitted for review."
             }
         };
@@ -1000,10 +1290,12 @@ function resumeTask(options: IControlRoomOptions, taskId: string): Record<string
             const exclusiveTask = store.database.prepare("SELECT task_id FROM tasks WHERE state IN ('RUNNING', 'REVIEW', 'APPROVED') AND task_id <> ? LIMIT 1").get(task.task_id) as Record<string, unknown> | undefined;
             assertCondition(!exclusiveTask, exclusiveTask ? `Another task is active: ${exclusiveTask.task_id}` : "Project is not idle.");
         }
+        const resumedQueuePosition = task.blocked_from_state === "QUEUED" ? task.queue_position || 1 : null;
         store.database.prepare("UPDATE tasks SET state = blocked_from_state, blocked_from_state = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const resumedTask = requireTask(store, task.task_id);
+        const titleUpdates = resumedQueuePosition ? readQueuedTitleUpdates(store, resumedQueuePosition) : [];
         commitTransaction(store.database);
-        return { resumed: true, task: serializeTask(resumedTask) };
+        return { resumed: true, task: serializeTask(resumedTask), titleUpdates };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -1075,6 +1367,28 @@ function readWorkingTreeStatus(projectRoot: string): string {
 }
 
 /**
+ * Resolve the current commit or return null when HEAD is unborn.
+ * @param projectRoot Canonical repository root used as working directory.
+ */
+function resolveCurrentHeadIfExists(projectRoot: string): string | null {
+    const result = runGit(projectRoot, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+    assertCondition(result.status === 0 || result.status === 1, `Resolve current head failed: ${result.stderr || result.stdout || `exit ${String(result.status)}`}`);
+    return result.status === 0 ? validateCommitId(result.stdout) : null;
+}
+
+/**
+ * Resolve a local branch commit or return null when the branch is unborn or absent.
+ * @param projectRoot Canonical repository root used as working directory.
+ * @param branchName Local branch name without a refs prefix.
+ */
+function resolveLocalBranchHeadIfExists(projectRoot: string, branchName: string): string | null {
+    const validBranchName = validateBranchName(branchName);
+    const branchResult = runGit(projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${validBranchName}`]);
+    assertCondition(branchResult.status === 0 || branchResult.status === 1, `Inspect local branch ${validBranchName} failed: ${branchResult.stderr || branchResult.stdout || `exit ${String(branchResult.status)}`}`);
+    return branchResult.status === 0 ? resolveLocalBranchHead(projectRoot, validBranchName) : null;
+}
+
+/**
  * Resolve an unambiguous local branch head commit.
  * @param projectRoot Canonical repository root used as working directory.
  * @param branchName Local branch name without a refs prefix.
@@ -1086,29 +1400,63 @@ function resolveLocalBranchHead(projectRoot: string, branchName: string): string
 }
 
 /**
+ * Determine whether a commit has exactly the expected parent, including a root commit.
+ * @param projectRoot Canonical repository root used as working directory.
+ * @param commitId Commit whose parent list should be inspected.
+ * @param expectedParentCommit Expected sole parent, or null for a root commit.
+ */
+function commitHasExpectedParent(projectRoot: string, commitId: string, expectedParentCommit: string | null): boolean {
+    const validCommitId = validateCommitId(commitId);
+    const parentsResult = runGit(projectRoot, ["rev-list", "--parents", "--max-count=1", validCommitId]);
+    if (parentsResult.status !== 0) {
+        return false;
+    }
+    const commitParts = parentsResult.stdout.split(/\s+/u);
+    if (commitParts[0] !== validCommitId) {
+        return false;
+    }
+    if (expectedParentCommit === null) {
+        return commitParts.length === 1;
+    }
+    return commitParts.length === 2 && commitParts[1] === validateCommitId(expectedParentCommit);
+}
+
+/**
  * Determine whether a commit is the single approval commit expected after a recorded parent.
  * @param projectRoot Canonical repository root used as working directory.
  * @param commitId Candidate approval commit.
- * @param parentCommitId Recorded pre-approval parent commit.
+ * @param parentCommitId Recorded pre-approval parent commit, or null for an unborn repository.
  * @param expectedSubject Expected approval commit subject.
  */
-function commitMatchesApproval(projectRoot: string, commitId: string, parentCommitId: string, expectedSubject: string): boolean {
-    if (commitId === parentCommitId) {
+function commitMatchesApproval(projectRoot: string, commitId: string, parentCommitId: string | null, expectedSubject: string): boolean {
+    if (parentCommitId && commitId === parentCommitId) {
         return false;
     }
-    const parentResult = runGit(projectRoot, ["rev-parse", `${commitId}^`]);
-    if (parentResult.status !== 0 || !COMMIT_PATTERN.test(parentResult.stdout)) {
+    if (!commitHasExpectedParent(projectRoot, commitId, parentCommitId)) {
         return false;
     }
     const subjectResult = runGit(projectRoot, ["log", "-1", "--format=%s", commitId]);
-    return subjectResult.status === 0 && validateCommitId(parentResult.stdout) === parentCommitId && subjectResult.stdout === expectedSubject;
+    return subjectResult.status === 0 && subjectResult.stdout === expectedSubject;
+}
+
+/**
+ * Create the first base branch ref at an approved commit.
+ * @param projectRoot Canonical repository root used as working directory.
+ * @param baseBranch Configured base branch.
+ * @param commitId Approved commit used as the initial base tip.
+ */
+function createInitialBaseBranch(projectRoot: string, baseBranch: string, commitId: string): void {
+    const validBaseBranch = validateBranchName(baseBranch);
+    const validCommitId = validateCommitId(commitId);
+    assertCondition(resolveLocalBranchHeadIfExists(projectRoot, validBaseBranch) === null, `Base branch ${validBaseBranch} was created concurrently.`);
+    requireGit(projectRoot, ["branch", validBaseBranch, validCommitId], `Create initial base branch ${validBaseBranch}`);
 }
 
 /**
  * Compact active queue positions after a terminal transition.
  * @param store Open project store.
  */
-function compactActiveQueue(store: IStore): void {
+function compactActiveQueue(store: IStore): ITitleUpdate[] {
     const rows = store.database.prepare(`
         SELECT task_id FROM tasks
         WHERE state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
@@ -1118,7 +1466,7 @@ function compactActiveQueue(store: IStore): void {
     for (const row of rows) {
         taskIds.push(row.task_id);
     }
-    writeQueueOrder(store, taskIds);
+    return writeQueueOrder(store, taskIds);
 }
 
 /**
@@ -1150,10 +1498,10 @@ function finalizeApprovedCommit(store: IStore, taskId: string, committedCommit: 
             `).run(committedCommit, currentTimestamp(), task.task_id);
         }
         store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-        compactActiveQueue(store);
+        const titleUpdates = compactActiveQueue(store);
         const completedTask = requireTask(store, task.task_id);
         commitTransaction(store.database);
-        return { committed: true, merged, branchDeleted, coordinatorTitle: titleForCoordinator(), gitMode: GIT_MODE, task: serializeTask(completedTask) };
+        return { committed: true, merged, branchDeleted, coordinatorTitle: titleForCoordinator(), gitMode: GIT_MODE, task: serializeTask(completedTask), titleUpdates };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -1188,7 +1536,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         const workingTreeStatus = readWorkingTreeStatus(store.projectRoot);
         if (workingTreeStatus.length === 0) {
             store.database.prepare("UPDATE tasks SET state = 'DONE', queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-            compactActiveQueue(store);
+            const titleUpdates = compactActiveQueue(store);
             const completedTask = requireTask(store, task.task_id);
             commitTransaction(store.database);
             return {
@@ -1197,13 +1545,14 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
                 noUncommittedChanges: true,
                 coordinatorTitle: titleForCoordinator(),
                 gitMode: GIT_MODE,
-                task: serializeTask(completedTask)
+                task: serializeTask(completedTask),
+                titleUpdates
             };
         }
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
         const commitsOnBase = currentBranch === project.base_branch;
         assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
-        const currentHead = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve pre-approval head"));
+        const currentHead = resolveCurrentHeadIfExists(store.projectRoot);
         const timestamp = currentTimestamp();
         store.database.prepare("UPDATE tasks SET reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(currentHead, timestamp, task.task_id);
         store.database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?, updated_at = ? WHERE project_key = ?").run(task.task_id, timestamp, timestamp, store.projectKey);
@@ -1211,17 +1560,27 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         leaseAcquired = true;
 
         requireGit(store.projectRoot, ["add", "-A", "--", "."], "Stage approved changes");
-        const stagedDifference = runGit(store.projectRoot, ["diff", "--cached", "--quiet", "HEAD", "--"]);
+        const stagedDifference = currentHead ?
+            runGit(store.projectRoot, ["diff", "--cached", "--quiet", "HEAD", "--"]) :
+            runGit(store.projectRoot, ["diff", "--cached", "--quiet", "--"]);
         assertCondition(stagedDifference.status === 1, stagedDifference.status === 0 ? "Approval produced no staged changes." : `Inspect staged changes failed: ${stagedDifference.stderr || stagedDifference.stdout}`);
         const commitMessage = `${task.task_id} - ${task.semantic_name}`;
         requireGit(store.projectRoot, ["commit", "--message", commitMessage], "Commit approved changes");
         const committedCommit = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD"], "Resolve approved commit"));
-        const parentCommit = validateCommitId(requireGit(store.projectRoot, ["rev-parse", "HEAD^"], "Resolve approved commit parent"));
-        assertCondition(parentCommit === currentHead, `Approved commit parent ${parentCommit} does not match pre-approval HEAD ${currentHead}.`);
+        assertCondition(commitHasExpectedParent(store.projectRoot, committedCommit, currentHead), currentHead ?
+            `Approved commit does not have expected parent ${currentHead}.` :
+            "Approved initial commit is not a root commit.");
         if (commitsOnBase) {
             return finalizeApprovedCommit(store, task.task_id, committedCommit, false, false);
         }
         assertCondition(task.branch_name, `${task.task_id} has no worker branch.`);
+        if (resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch) === null) {
+            createInitialBaseBranch(store.projectRoot, project.base_branch, committedCommit);
+            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out initial base branch ${project.base_branch}`);
+            assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === committedCommit, `${project.base_branch} did not reach initial approved commit ${committedCommit}.`);
+            requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete worker branch ${task.branch_name}`);
+            return finalizeApprovedCommit(store, task.task_id, committedCommit, true, true);
+        }
         requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
         requireBaseCheckout(store.projectRoot, project.base_branch);
         requireGit(store.projectRoot, ["merge", "--ff-only", committedCommit], `Fast-forward ${project.base_branch} to ${task.task_id}`);
@@ -1260,17 +1619,21 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
             };
         }
         assertCondition(project.integration_task_id === task.task_id, `${task.task_id} does not hold the commit lease.`);
-        assertCondition(task.state === "APPROVED" && task.base_commit && task.reviewed_commit, `${task.task_id} does not have a recoverable approval.`);
+        const hasRecoverableAnchor = Boolean(task.base_commit && task.reviewed_commit) || task.base_commit === null;
+        assertCondition(task.state === "APPROVED" && hasRecoverableAnchor, `${task.task_id} does not have a recoverable approval.`);
         const workerBranchResult = task.branch_name ?
             runGit(store.projectRoot, ["rev-parse", "--verify", `refs/heads/${task.branch_name}^{commit}`]) :
             { status: 128, stdout: "", stderr: "" };
         assertCondition(workerBranchResult.status === 0 || workerBranchResult.status === 128, `Resolve worker branch ${String(task.branch_name)} failed: ${workerBranchResult.stderr || workerBranchResult.stdout}`);
         const workerCommit = workerBranchResult.status === 0 ? validateCommitId(workerBranchResult.stdout) : null;
-        const currentBaseCommit = resolveLocalBranchHead(store.projectRoot, project.base_branch);
+        const currentBaseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
         const expectedSubject = `${task.task_id} - ${task.semantic_name}`;
         const workerCommitIsApproval = Boolean(workerCommit && commitMatchesApproval(store.projectRoot, workerCommit, task.reviewed_commit, expectedSubject));
-        const baseCommitIsApproval = commitMatchesApproval(store.projectRoot, currentBaseCommit, task.reviewed_commit, expectedSubject);
-        if (!workerCommitIsApproval && !baseCommitIsApproval && (workerCommit === task.reviewed_commit || currentBaseCommit === task.reviewed_commit)) {
+        const baseCommitIsApproval = Boolean(currentBaseCommit && commitMatchesApproval(store.projectRoot, currentBaseCommit, task.reviewed_commit, expectedSubject));
+        const noCommitWasCreated = task.reviewed_commit === null ?
+            workerCommit === null && currentBaseCommit === null :
+            workerCommit === task.reviewed_commit || currentBaseCommit === task.reviewed_commit;
+        if (!workerCommitIsApproval && !baseCommitIsApproval && noCommitWasCreated) {
             const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
             assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
             beginTransaction(store.database);
@@ -1296,6 +1659,16 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
         assertCondition(workerCommit && task.branch_name, `${task.task_id} has no recoverable worker commit.`);
         const approvedCommit = workerCommit;
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+        if (!currentBaseCommit) {
+            assertCondition(task.base_commit === null, `Configured base branch ${project.base_branch} disappeared after activation.`);
+            assertCondition(currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
+            createInitialBaseBranch(store.projectRoot, project.base_branch, approvedCommit);
+            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out initial base branch ${project.base_branch}`);
+            assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === approvedCommit, `${project.base_branch} did not reach recovered initial commit ${approvedCommit}.`);
+            requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete recovered worker branch ${task.branch_name}`);
+            const result = finalizeApprovedCommit(store, task.task_id, approvedCommit, true, true);
+            return { ...result, recovered: true, finalized: true };
+        }
         if (currentBranch !== project.base_branch) {
             assertCondition(currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
             requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
@@ -1359,18 +1732,13 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
     try {
         requireProject(store);
         const tasks = store.database.prepare(`
-            SELECT * FROM tasks
-            WHERE state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
-            ORDER BY queue_position IS NULL, queue_position, task_number
+            ${TASK_WITH_QUEUED_POSITION_SELECT}
+            WHERE task.state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
+            ORDER BY task.queue_position IS NULL, task.queue_position, task.task_number
         `).all() as ITaskRow[];
         const queue: Record<string, unknown>[] = [];
         for (const task of tasks) {
-            const dependencyRows = store.database.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = ? ORDER BY depends_on_id").all(task.task_id) as Array<{ depends_on_id: string }>;
-            const dependencies: string[] = [];
-            for (const dependencyRow of dependencyRows) {
-                dependencies.push(dependencyRow.depends_on_id);
-            }
-            queue.push({ ...serializeTask(task), dependencies });
+            queue.push({ ...serializeTask(task), dependencies: readTaskDependencies(store, task.task_id) });
         }
         return { projectRoot: store.projectRoot, coordinatorTitle: titleForCoordinator(), queue };
     } finally {

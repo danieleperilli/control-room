@@ -34,6 +34,17 @@ function runGit(repositoryRoot: string, argumentsList: string[]): string {
 }
 
 /**
+ * Run the deterministic ControlRoom CLI in a separate process.
+ * @param argumentsList CLI command and options.
+ */
+function runCli(argumentsList: string[]) {
+    return childProcess.spawnSync(process.execPath, [path.join(__dirname, "..", "scripts", "control-room.ts"), ...argumentsList], {
+        encoding: "utf8",
+        shell: false
+    });
+}
+
+/**
  * Create an isolated Git repository and ControlRoom state root.
  */
 function createFixture(): IFixture {
@@ -55,6 +66,24 @@ function createFixture(): IFixture {
 }
 
 /**
+ * Create an isolated Git repository whose main branch has no commits.
+ */
+function createUnbornFixture(): IFixture {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "control-room-unborn-test-"));
+    const repositoryRoot = path.join(fixtureRoot, "repository");
+    const stateRoot = path.join(fixtureRoot, "state");
+    fs.mkdirSync(repositoryRoot);
+    runGit(repositoryRoot, ["init", "-b", "main"]);
+    runGit(repositoryRoot, ["config", "user.name", "Control Room Test"]);
+    runGit(repositoryRoot, ["config", "user.email", "control-room@example.invalid"]);
+    return {
+        initialCommit: "",
+        repositoryRoot,
+        stateRoot
+    };
+}
+
+/**
  * Initialize one fixture project with its coordinator.
  * @param fixture Disposable project fixture.
  */
@@ -68,6 +97,54 @@ function initializeFixture(fixture: IFixture): string {
     assert.equal(initialized.gitMode, "local-approval-commit");
     return initialized.databasePath;
 }
+
+test("initializes and completes the first task in a repository without commits", () => {
+    const fixture = createUnbornFixture();
+    const initialized = runCli([
+        "init",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--coordinator-thread",
+        "coordinator-thread",
+        "--base-branch",
+        "main"
+    ]);
+    assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
+    const initializationResult = JSON.parse(initialized.stdout);
+    const databasePath = initializationResult.databasePath;
+    assert.equal(initializationResult.coordinatorTitle, "⚫️ Control Room");
+    assert.equal(initializationResult.baseCommit, null);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    assert.equal(core.getStatus(options).baseBranch, "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "0");
+
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "existing.txt"), "present before activation\n");
+    core.registerTask(options, "thread-one", "Create initial project");
+    core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    const activation = core.activateNextTask(options);
+    assert.equal(activation.task.baseCommit, null);
+    assert.equal(activation.task.branchName, "control-room/T0001");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "0");
+
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "created.txt"), "created while running\n");
+    approveTask(options, "T0001", "first");
+    const completed = core.commitApprovedTask(options, "T0001");
+    assert.equal(completed.task.state, "DONE");
+    assert.equal(completed.committed, true);
+    assert.equal(completed.merged, true);
+    assert.equal(completed.branchDeleted, true);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "1");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "T0001 - Create initial project");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:existing.txt"]), "present before activation");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:created.txt"]), "created while running");
+    assert.equal(fs.existsSync(databasePath), true);
+});
 
 /**
  * Register, queue, process, and activate one task.
@@ -114,6 +191,42 @@ test("allocates four-digit task IDs and preserves IDs across registration retrie
     );
 });
 
+test("returns the user command list after CLI initialization", () => {
+    const fixture = createFixture();
+    const argumentsList = [
+        "init",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--coordinator-thread",
+        "coordinator-thread",
+        "--base-branch",
+        "main"
+    ];
+    const initialized = runCli(argumentsList);
+    assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
+    const result = JSON.parse(initialized.stdout);
+    assert.equal(result.coordinatorTitle, "⚫️ Control Room");
+    assert.deepEqual(result.userCommands, [
+        "$control-room init",
+        "$control-room join",
+        "$control-room queue",
+        "$control-room help",
+        "Enqueue [after T0002]",
+        "Move first | Move to 3 | Move before T0002 | Move after T0002",
+        "Depends on T0002 | Remove dependency T0002",
+        "Approve | Cancel | Status | Queue status"
+    ]);
+    const retry = runCli(argumentsList);
+    assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+    assert.equal(JSON.parse(retry.stdout).created, false);
+    assert.deepEqual(JSON.parse(retry.stdout).userCommands, result.userCommands);
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    assert.match(skillText, /End the same initialization response with the returned `userCommands` list/);
+    assert.match(skillText, /Put nothing after the list/);
+});
+
 test("uses the failure icon for blocked and canceled task titles", () => {
     const baseTask = {
         task_id: "T0001",
@@ -121,6 +234,18 @@ test("uses the failure icon for blocked and canceled task titles", () => {
     };
     assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Handle failure");
     assert.equal(core.titleForTask({ ...baseTask, state: "CANCELED" }), "❌ T0001 - Handle failure");
+});
+
+test("derives queued position markers without storing them in the semantic name", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    const registered = core.registerTask(options, "thread-one", "⭕️ ① Build queue");
+    assert.equal(registered.semanticName, "Build queue");
+    assert.equal(core.titleForTask({ task_id: "T0001", semantic_name: "Build queue", state: "QUEUED", queue_position: 1 }), "⭕️ ① T0001 - Build queue");
+    assert.equal(core.titleForTask({ task_id: "T0009", semantic_name: "Ninth task", state: "QUEUED", queue_position: 9 }), "⭕️ ⑨ T0009 - Ninth task");
+    assert.equal(core.titleForTask({ task_id: "T0010", semantic_name: "Tenth task", state: "QUEUED", queue_position: 10 }), "⭕️ ①⓪ T0010 - Tenth task");
+    assert.equal(core.titleForTask({ task_id: "T0105", semantic_name: "One hundred fifth", state: "QUEUED", queue_position: 105 }), "⭕️ ①⓪⑤ T0105 - One hundred fifth");
 });
 
 test("rejects linked Git worktrees", () => {
@@ -141,6 +266,9 @@ test("rejects linked Git worktrees", () => {
 test("migrates legacy state to approval-only commits", () => {
     const fixture = createFixture();
     const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "First legacy task");
+    core.registerTask(options, "thread-two", "Second legacy task");
     const legacyDatabase = new DatabaseSync(databasePath);
     legacyDatabase.exec(`
         ALTER TABLE projects RENAME TO projects_current;
@@ -164,6 +292,30 @@ test("migrates legacy state to approval-only commits", () => {
         FROM projects_current;
         DROP TABLE projects_current;
         ALTER TABLE tasks DROP COLUMN reviewed_commit;
+        ALTER TABLE dependencies RENAME TO dependencies_current;
+        CREATE TABLE dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+            dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'ORDER'),
+            PRIMARY KEY (task_id, depends_on_id, dependency_kind),
+            CHECK (task_id <> depends_on_id)
+        );
+        DROP TABLE dependencies_current;
+        INSERT INTO dependencies (task_id, depends_on_id, dependency_kind) VALUES ('T0002', 'T0001', 'ORDER');
+        ALTER TABLE events RENAME TO events_current;
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'REVIEW_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            processed_at TEXT,
+            result_json TEXT
+        );
+        DROP TABLE events_current;
+        INSERT INTO events (event_key, task_id, kind, payload_json, created_at)
+        VALUES ('legacy-enqueue', 'T0001', 'ENQUEUE_REQUESTED', '{}', '2026-01-01T00:00:00.000Z');
         PRAGMA user_version = 1;
     `);
     legacyDatabase.close();
@@ -174,10 +326,18 @@ test("migrates legacy state to approval-only commits", () => {
     const version = migratedDatabase.prepare("PRAGMA user_version").get().user_version;
     const project = migratedDatabase.prepare("SELECT git_mode FROM projects").get();
     const taskColumns = migratedDatabase.prepare("PRAGMA table_info(tasks)").all().map((column: Record<string, unknown>) => column.name);
+    const dependencySql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dependencies'").get().sql;
+    const eventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
+    const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
+    const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 3);
+    assert.equal(version, 4);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
+    assert.match(dependencySql, /BLOCKING/);
+    assert.match(eventSql, /MOVE_REQUESTED/);
+    assert.equal(migratedDependency.dependency_kind, "BLOCKING");
+    assert.equal(migratedEvent.kind, "ENQUEUE_REQUESTED");
 });
 
 test("rejects a broken state database symbolic link", () => {
@@ -207,14 +367,101 @@ test("keeps enqueue event-only and orders tasks without Git anchors", () => {
     assert.equal(firstRetry.created, false);
     assert.equal(firstRequest.notification, "CONTROL_ROOM_WAKE");
     assert.equal(core.getStatus(options, "T0001").task.state, "PLANNING");
-    core.processPendingEvents(options);
+    const processed = core.processPendingEvents(options);
     const queue = core.getQueue(options).queue;
     assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002"]);
-    assert.deepEqual(queue[1].dependencies, ["T0001"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0001 - First task", "⭕️ ② T0002 - Second task"]);
+    assert.deepEqual(processed.results.flatMap((result) => result.titleUpdates).map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0001 - First task", "⭕️ ② T0002 - Second task"]);
+    assert.deepEqual(queue[1].dependencies, []);
     assert.equal(queue[0].baseCommit, null);
     assert.equal(queue[0].branchName, null);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), branchesBeforeQueue);
+});
+
+test("reorders waiting tasks independently from blocking dependencies", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 4; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.processPendingEvents(options);
+    core.submitEvent(options, "dependency-add-4-1", "T0004", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0003", "T0004"]);
+
+    core.submitEvent(options, "move-4-first", "T0004", "MOVE_REQUESTED", { position: 1 });
+    const firstMove = core.processPendingEvents(options);
+    let queue = core.getQueue(options).queue;
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0004", "T0001", "T0002", "T0003"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0004 - Task 4", "⭕️ ② T0001 - Task 1", "⭕️ ③ T0002 - Task 2", "⭕️ ④ T0003 - Task 3"]);
+    assert.deepEqual(firstMove.results[0].titleUpdates.map((update: Record<string, unknown>) => update.title), queue.map((task: Record<string, unknown>) => task.title));
+    assert.deepEqual(queue[0].dependencies, ["T0001"]);
+
+    core.submitEvent(options, "move-4-after-2", "T0004", "MOVE_REQUESTED", { afterTaskId: "T0002" });
+    core.processPendingEvents(options);
+    queue = core.getQueue(options).queue;
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0004", "T0003"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0001 - Task 1", "⭕️ ② T0002 - Task 2", "⭕️ ③ T0004 - Task 4", "⭕️ ④ T0003 - Task 3"]);
+    assert.deepEqual(queue[2].dependencies, ["T0001"]);
+
+    core.submitEvent(options, "move-4-before-2", "T0004", "MOVE_REQUESTED", { beforeTaskId: "T0002" });
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0004", "T0002", "T0003"]);
+
+    core.submitEvent(options, "move-4-fourth", "T0004", "MOVE_REQUESTED", { position: 4 });
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0003", "T0004"]);
+
+    core.submitEvent(options, "dependency-remove-4-1", "T0004", "DEPENDENCY_REMOVE_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue[3].dependencies, []);
+});
+
+test("rejects dependency cycles without changing queue order", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "First task");
+    core.registerTask(options, "thread-two", "Second task");
+    core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
+    core.submitEvent(options, "enqueue-2", "T0002", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "dependency-1-2", "T0001", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0002" });
+    const rejected = core.processPendingEvents(options);
+    assert.equal(rejected.results[0].action, "REJECTED");
+    assert.match(rejected.results[0].error, /dependency cycle/);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002"]);
+});
+
+test("maps move, dependency, and global queue CLI commands", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "First task");
+    core.registerTask(options, "thread-two", "Second task");
+    core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
+    core.submitEvent(options, "enqueue-2", "T0002", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+
+    const moveResult = runCli(["request-move", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "cli-move", "--position", "1"]);
+    assert.equal(moveResult.status, 0, moveResult.stderr || moveResult.stdout);
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0002", "T0001"]);
+
+    const dependencyResult = runCli(["request-dependency-add", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "cli-dependency", "--depends-on", "T0001"]);
+    assert.equal(dependencyResult.status, 0, dependencyResult.stderr || dependencyResult.stdout);
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue[0].dependencies, ["T0001"]);
+
+    const queueResult = runCli(["queue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot]);
+    assert.equal(queueResult.status, 0, queueResult.stderr || queueResult.stdout);
+    assert.deepEqual(JSON.parse(queueResult.stdout).queue.map((task: Record<string, unknown>) => task.taskId), ["T0002", "T0001"]);
 });
 
 test("activation creates the worker branch only when the task starts", () => {
@@ -233,6 +480,42 @@ test("activation creates the worker branch only when the task starts", () => {
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "control-room/T0001\nmain");
+});
+
+test("numbers only queued tasks while another task is running", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.processPendingEvents(options);
+
+    const activation = core.activateNextTask(options);
+    assert.equal(activation.task.title, "🔴 T0001 - Task 1");
+    assert.deepEqual(activation.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3"]);
+    let queue = core.getQueue(options).queue;
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.queuedPosition), [null, 1, 2]);
+
+    core.registerTask(options, "thread-4", "Task 4");
+    core.submitEvent(options, "enqueue-4", "T0004", "ENQUEUE_REQUESTED", {});
+    const enqueued = core.processPendingEvents(options);
+    assert.equal(enqueued.results[0].task.queuePosition, 4);
+    assert.equal(enqueued.results[0].task.queuedPosition, 3);
+    assert.equal(enqueued.results[0].task.title, "⭕️ ③ T0004 - Task 4");
+    queue = core.getQueue(options).queue;
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3", "⭕️ ③ T0004 - Task 4"]);
+
+    core.submitEvent(options, "block-2", "T0002", "BLOCKED_REPORTED", { reason: "Waiting for input" });
+    const blocked = core.processPendingEvents(options);
+    assert.deepEqual(blocked.results[0].titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0003 - Task 3", "⭕️ ② T0004 - Task 4"]);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "❌ T0002 - Task 2", "⭕️ ① T0003 - Task 3", "⭕️ ② T0004 - Task 4"]);
+
+    const resumed = core.resumeTask(options, "T0002");
+    assert.deepEqual(resumed.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3", "⭕️ ③ T0004 - Task 4"]);
 });
 
 test("review and approval do not create a commit", () => {
@@ -359,15 +642,21 @@ test("dependencies activate against the latest shared base after approval commit
     core.registerTask(options, "thread-two", "Dependent task");
     core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
     core.submitEvent(options, "enqueue-2", "T0002", "ENQUEUE_REQUESTED", { afterTaskId: "T0001" });
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
     core.processPendingEvents(options);
     core.activateNextTask(options);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "first.txt"), "first\n");
     approveTask(options, "T0001", "first");
-    const firstCommit = core.commitApprovedTask(options, "T0001").task.committedCommit;
+    const firstCompletion = core.commitApprovedTask(options, "T0001");
+    const firstCommit = firstCompletion.task.committedCommit;
+    assert.deepEqual(firstCompletion.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Dependent task"]);
     const secondActivation = core.activateNextTask(options);
     assert.equal(secondActivation.task.taskId, "T0002");
     assert.equal(secondActivation.task.baseCommit, firstCommit);
     assert.equal(secondActivation.task.branchName, "control-room/T0002");
+    const dependencyRetry = core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    assert.equal(dependencyRetry.created, false);
+    assert.equal(dependencyRetry.processed, true);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "control-room/T0002\nmain");
 });
@@ -411,6 +700,28 @@ test("recovery finalizes a commit created before SQLite completion", () => {
     assert.equal(recovered.task.committedCommit, runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]));
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+});
+
+test("recovery integrates an initial root commit from the unborn worker branch", () => {
+    const fixture = createUnbornFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Recover initial commit", "enqueue-1");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "initial.txt"), "initial\n");
+    approveTask(options, "T0001", "first");
+
+    const database = new DatabaseSync(databasePath);
+    database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?").run("T0001", new Date().toISOString());
+    database.close();
+    runGit(fixture.repositoryRoot, ["add", "-A", "--", "."]);
+    runGit(fixture.repositoryRoot, ["commit", "--message", "T0001 - Recover initial commit"]);
+
+    const recovered = core.recoverCommit(options, "T0001");
+    assert.equal(recovered.finalized, true);
+    assert.equal(recovered.task.state, "DONE");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "1");
 });
 
 test("recovery recognizes a direct approval commit on the base branch", () => {
@@ -477,7 +788,8 @@ test("activation refuses leftover changes from a canceled active task", () => {
     core.activateNextTask(options);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "leftover.txt"), "leftover\n");
     core.submitEvent(options, "cancel-1", "T0001", "CANCEL_REQUESTED", { userRequestId: "cancel-message" });
-    core.processPendingEvents(options);
+    const canceled = core.processPendingEvents(options);
+    assert.deepEqual(canceled.results[0].titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Next task"]);
     assert.throws(() => core.activateNextTask(options), /working tree must be clean/);
 });
 
@@ -486,4 +798,18 @@ test("join is documented as a non-terminal directive that preserves the request"
     assert.match(skillText, /Treat `join` as a non-terminal preamble/);
     assert.match(skillText, /continue the same turn by evaluating and fulfilling every remaining request/);
     assert.match(skillText, /registration and title synchronization must never consume, replace, summarize away, or defer the user's actual request/);
+});
+
+test("documents queue and help as global read-only commands", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    assert.match(skillText, /\$control-room queue/);
+    assert.match(skillText, /\$control-room help/);
+    assert.match(skillText, /do not register the current task, change its title, submit an event, or notify the coordinator/);
+    const cliResult = runCli(["help"]);
+    assert.equal(cliResult.status, 0, cliResult.stderr || cliResult.stdout);
+    assert.match(cliResult.stdout, /\$control-room queue/);
+    assert.match(cliResult.stdout, /^\s+Enqueue \[after T0002\]$/m);
+    assert.doesNotMatch(cliResult.stdout, /^\s+Queue \[after T0002\]$/m);
+    assert.match(cliResult.stdout, /Move first/);
+    assert.match(cliResult.stdout, /Depends on T0002/);
 });

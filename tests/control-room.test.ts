@@ -380,6 +380,30 @@ test("keeps enqueue event-only and orders tasks without Git anchors", () => {
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), branchesBeforeQueue);
 });
 
+test("moves an already queued task to the end on a new enqueue request", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.processPendingEvents(options);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0003"]);
+
+    core.submitEvent(options, "enqueue-2-again", "T0002", "ENQUEUE_REQUESTED", {});
+    const processed = core.processPendingEvents(options);
+    assert.equal(processed.results[0].action, "REENQUEUED");
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002"]);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0001 - Task 1", "⭕️ ② T0003 - Task 3", "⭕️ ③ T0002 - Task 2"]);
+
+    const retry = core.submitEvent(options, "enqueue-2-again", "T0002", "ENQUEUE_REQUESTED", {});
+    assert.equal(retry.created, false);
+    assert.equal(core.processPendingEvents(options).processedCount, 0);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002"]);
+});
+
 test("reorders waiting tasks independently from blocking dependencies", () => {
     const fixture = createFixture();
     initializeFixture(fixture);

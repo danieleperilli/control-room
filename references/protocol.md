@@ -69,6 +69,8 @@ node <skill-dir>/scripts/control-room.ts request-enqueue \
     --event-key <stable-key>
 ```
 
+When the task is already `QUEUED`, a new enqueue request removes it from its current position and appends it to the end. Treat a later user `Enqueue` command as a new request with a fresh event key. Reuse the previous key only when retrying the same command after an uncertain result.
+
 Enqueue after another task:
 
 ```bash

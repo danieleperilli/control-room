@@ -938,6 +938,7 @@ function assertDependencyIsAcyclic(store: IStore, taskId: string, dependsOnId: s
  */
 function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
     assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot enqueue ${task.task_id} from ${task.state}.`);
+    const wasAlreadyQueued = task.state === "QUEUED";
     let afterTaskId: string | undefined;
     if (payload.afterTaskId) {
         afterTaskId = validateTaskId(payload.afterTaskId);
@@ -973,7 +974,7 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
     const titleUpdates = writeQueueOrder(store, orderedTaskIds);
     const refreshedTask = requireTask(store, task.task_id);
     return {
-        action: "ENQUEUED",
+        action: wasAlreadyQueued ? "REENQUEUED" : "ENQUEUED",
         task: serializeTask(refreshedTask),
         afterTaskId: afterTaskId || null,
         titleUpdates,

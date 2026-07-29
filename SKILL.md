@@ -97,7 +97,7 @@ The worker-to-coordinator notification is the fixed wake token `CONTROL_ROOM_WAK
 
 Use English as the canonical command language. Also recognize the commands in multiple languages:
 
-- `Enqueue`: submit one idempotent `ENQUEUE_REQUESTED` event. Do not write code or create a branch.
+- `Enqueue`: submit one idempotent `ENQUEUE_REQUESTED` event. If the task is already `QUEUED`, remove it from its current position and append it to the end of the waiting queue. Do not write code or create a branch.
 - `Enqueue after T0005`: submit the same event with `--after T0005`. This changes placement only and does not create a dependency.
 - `Move first`: submit `MOVE_REQUESTED` with `--position 1`.
 - `Move to 3`: submit `MOVE_REQUESTED` with `--position 3`.
@@ -115,7 +115,7 @@ In a worker task, `Move` and dependency commands target the current task. In the
 
 Queue position and dependencies are independent. Moving a task never adds, removes, or changes dependencies. Adding or removing a dependency never changes queue order.
 
-Generate one caller-stable event key per user request and reuse it on retries. After submitting an event, send the returned `notification` to the recorded `coordinatorThreadId`. A worker must never run `process`, `activate-next`, `resume`, `commit-approved`, or `recover-commit`.
+Generate one caller-stable event key per user request and reuse it only on retries of that same request. A later direct `Enqueue` command is a new user request: generate a new event key so an already queued task moves to the end. After submitting an event, send the returned `notification` to the recorded `coordinatorThreadId`. A worker must never run `process`, `activate-next`, `resume`, `commit-approved`, or `recover-commit`.
 
 Do not create a branch during `PLANNING` or `QUEUED`. `activate-next` alone creates and checks out the task's deterministic worker branch. In an unborn repository, the first activation may adopt the existing uncommitted files as the initial task's working tree; it still must not commit them. Do not stage or commit during `RUNNING` or `REVIEW`. `REVIEW` does not require uncommitted changes and does not freeze or pin the working tree. Do not reject approval merely because Git history changed outside ControlRoom.
 

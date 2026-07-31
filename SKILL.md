@@ -70,7 +70,7 @@ Use the returned `title` exactly:
 - `PLANNING`: `⚪️ T0001 - Semantic name`
 - `QUEUED`: concatenate one circled glyph per decimal digit, for example `⭕️ ① T0001 - Semantic name`, `⭕️ ⑨ T0009 - Semantic name`, and `⭕️ ①⓪ T0010 - Semantic name`
 - `RUNNING`: `🔴 T0001 - Semantic name`
-- `REVIEW`: `🟡 T0001 - Semantic name`
+- `REVIEW`: `⁉️ T0001 - Semantic name`
 - `APPROVED`: `🟢 T0001 - Semantic name`
 - `DONE`: `🟢 T0001 - Semantic name`
 - `BLOCKED` or `CANCELED`: `❌ T0001 - Semantic name`
@@ -110,6 +110,8 @@ Use English as the canonical command language. Also recognize the commands in mu
 - `Queue status`: read the project queue without changing it.
 - `$control-room queue`: read the same project queue from any top-level task in the initialized Local project.
 - `$control-room help`: show these commands without changing project state.
+
+When a task is in `REVIEW` and the user directly requests additional implementation or file changes, submit one idempotent `REWORK_REQUESTED` event with a compact summary, notify the coordinator, and preserve the full request. Do not edit files until the coordinator has processed the event, returned the task to `RUNNING`, and applied its red title. Continue the same task on its existing checkout and branch; rework must not create, switch, stage, or commit anything. A question, status request, explanation, or other read-only inspection during review does not restart the task. When the revised implementation is ready, submit the normal `REVIEW_REQUESTED` event and apply the returned review title.
 
 In a worker task, `Move` and dependency commands target the current task. In the coordinator, accept an explicit target such as `Move T0003 before T0005` or `Make T0003 depend on T0005`. A move is valid only for a `QUEUED` task and its numeric position is counted among waiting `QUEUED` tasks; tasks in other states retain their relative order. Dependency changes are valid only in `PLANNING` or `QUEUED`.
 

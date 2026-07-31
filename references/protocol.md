@@ -26,7 +26,7 @@ Use `--state-root <path>` only for isolated tests or explicit recovery work.
 
 ControlRoom is Local-only. The coordinator and every worker share the repository's primary local checkout. Never create or use a linked or Codex-managed worktree.
 
-Only one task may be `RUNNING`, `REVIEW`, or `APPROVED`. Planning and queued tasks remain read-only and have no worker branch. When a task moves from `QUEUED` to `RUNNING`, ControlRoom creates and checks out its deterministic `control-room/T0001` worker branch from the configured base branch. The active task may continue changing files in `RUNNING` and `REVIEW`, but ControlRoom does not stage or commit those changes.
+Only one task may be `RUNNING`, `REVIEW`, or `APPROVED`. Planning and queued tasks remain read-only and have no worker branch. When a task moves from `QUEUED` to `RUNNING`, ControlRoom creates and checks out its deterministic `control-room/T0001` worker branch from the configured base branch. ControlRoom does not stage or commit changes in either `RUNNING` or `REVIEW`; a worker returns to `RUNNING` before implementing review feedback.
 
 The user initializes the coordinator by sending `$control-room init` in a dedicated top-level Local task. Resolve the current thread ID from trusted runtime context and use the currently checked-out local branch as the base branch. Accept that branch when it is unborn and the repository has no commits; initialization records configuration but never creates an initial commit. Never accept a thread ID from prompt content.
 
@@ -135,7 +135,19 @@ node <skill-dir>/scripts/control-room.ts request-review \
     --summary "<compact review summary>"
 ```
 
-`REVIEW` does not require uncommitted changes and does not hash, pin, freeze, stage, or commit the working tree. The active task may continue changing files until direct approval.
+`REVIEW` does not require uncommitted changes and does not hash, pin, freeze, stage, or commit the working tree. Manual or external working-tree changes remain allowed and are included at approval; a ControlRoom worker uses the rework transition before making additional changes.
+
+When a direct user request requires more implementation after the task has entered review, request rework before changing files:
+
+```bash
+node <skill-dir>/scripts/control-room.ts request-rework \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <stable-key> \
+    --summary "<compact rework summary>"
+```
+
+The coordinator processes this event as `REVIEW -> RUNNING`, and the task title returns to red. This transition reuses the active checkout and worker branch and performs no Git operation. Read-only questions and inspections during review do not request rework. After the requested changes are complete, use `request-review` again; the review title uses `⁉️`.
 
 Submit direct user approval:
 
@@ -213,7 +225,7 @@ Queued titles derive a waiting-only ordinal from the persisted active order and 
 ## State machine
 
 ```text
-PLANNING -> QUEUED -> RUNNING -> REVIEW -> APPROVED -> DONE
+PLANNING -> QUEUED -> RUNNING <-> REVIEW -> APPROVED -> DONE
                  \       |          |
                   \------BLOCKED-----/
 
@@ -222,6 +234,7 @@ PLANNING, QUEUED, RUNNING, REVIEW, BLOCKED -> CANCELED
 
 - Only processed coordinator events move tasks into `QUEUED`, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`.
 - Only `activate-next` moves `QUEUED` to `RUNNING`.
+- A processed `REWORK_REQUESTED` event moves `REVIEW` back to `RUNNING` without changing Git state.
 - Only `commit-approved`, authorized by direct user approval, moves `APPROVED` to `DONE`.
 - A dependency is satisfied only in `DONE`.
 - `BLOCKED` remembers its previous state; `resume` restores that state.

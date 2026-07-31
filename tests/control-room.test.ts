@@ -237,6 +237,15 @@ test("uses the failure icon for blocked and canceled task titles", () => {
     assert.equal(core.titleForTask({ ...baseTask, state: "CANCELED" }), "❌ T0001 - Handle failure");
 });
 
+test("uses the review marker and red when review rework starts", () => {
+    const baseTask = {
+        task_id: "T0001",
+        semantic_name: "Refine review"
+    };
+    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "⁉️ T0001 - Refine review");
+    assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🔴 T0001 - Refine review");
+});
+
 test("derives queued position markers without storing them in the semantic name", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
@@ -332,11 +341,12 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 4);
+    assert.equal(version, 5);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.match(dependencySql, /BLOCKING/);
     assert.match(eventSql, /MOVE_REQUESTED/);
+    assert.match(eventSql, /REWORK_REQUESTED/);
     assert.equal(migratedDependency.dependency_kind, "BLOCKING");
     assert.equal(migratedEvent.kind, "ENQUEUE_REQUESTED");
 });
@@ -552,6 +562,7 @@ test("review and approval do not create a commit", () => {
     core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Ready" });
     core.processPendingEvents(options);
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
+    assert.equal(core.getStatus(options, "T0001").task.title, "⁉️ T0001 - Commit on approval");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
     core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Commit approved changes safely", userRequestId: "user-message-1" });
@@ -559,6 +570,65 @@ test("review and approval do not create a commit", () => {
     assert.equal(core.getStatus(options, "T0001").task.state, "APPROVED");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
+});
+
+test("returns review to running before rework without changing Git state", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Refine review", "enqueue-1");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "first pass\n");
+    core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "First pass ready" });
+    core.processPendingEvents(options);
+    const branchBeforeRework = runGit(fixture.repositoryRoot, ["branch", "--show-current"]);
+    const headBeforeRework = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+    const statusBeforeRework = runGit(fixture.repositoryRoot, ["status", "--porcelain"]);
+
+    const requested = runCli([
+        "request-rework",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--task",
+        "T0001",
+        "--event-key",
+        "rework-1",
+        "--summary",
+        "Address review feedback"
+    ]);
+    assert.equal(requested.status, 0, requested.stderr || requested.stdout);
+    assert.equal(JSON.parse(requested.stdout).created, true);
+    assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
+
+    const processed = core.processPendingEvents(options);
+    assert.equal(processed.results[0].action, "REWORK_STARTED");
+    assert.equal(processed.results[0].summary, "Address review feedback");
+    assert.equal(processed.results[0].task.state, "RUNNING");
+    assert.equal(processed.results[0].task.title, "🔴 T0001 - Refine review");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), branchBeforeRework);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), headBeforeRework);
+    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), statusBeforeRework);
+
+    const retry = runCli([
+        "request-rework",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--task",
+        "T0001",
+        "--event-key",
+        "rework-1",
+        "--summary",
+        "Address review feedback"
+    ]);
+    assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+    assert.equal(JSON.parse(retry.stdout).created, false);
+
+    core.submitEvent(options, "review-2", "T0001", "REVIEW_REQUESTED", { summary: "Rework ready" });
+    core.processPendingEvents(options);
+    assert.equal(core.getStatus(options, "T0001").task.title, "⁉️ T0001 - Refine review");
 });
 
 test("requires a meaningful approval commit subject distinct from the task title", () => {

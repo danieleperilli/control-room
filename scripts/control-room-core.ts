@@ -6,7 +6,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "ENQUEUE_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type EventKind = "ENQUEUE_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 
 interface IControlRoomOptions {
     projectRoot: string;
@@ -165,7 +165,7 @@ function validateThreadId(threadId: string): string {
  */
 function validateSemanticName(semanticName: string): string {
     assertCondition(typeof semanticName === "string", "A semantic task name is required.");
-    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🟢|✅|❌|👉)\s*(?:(?:[⓪①-⑨]+|[❶-❾]|#\d{1,4})\s+)?/u, "");
+    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🔵|⁉️|🟢|✅|❌|👉)\s*(?:(?:[⓪①-⑨]+|[❶-❾]|#\d{1,4})\s+)?/u, "");
     assertCondition(normalizedName.length > 0 && normalizedName.length <= 80, "Semantic task name must contain 1 to 80 characters.");
     assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedName), "Semantic task name contains control characters.");
     return normalizedName;
@@ -305,9 +305,9 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
             dependencyTaskId: validateTaskId(String(payload.dependencyTaskId || ""))
         };
     }
-    if (kind === "REVIEW_REQUESTED") {
+    if (kind === "REVIEW_REQUESTED" || kind === "REWORK_REQUESTED") {
         return {
-            summary: validateCompactText(payload.summary, "Review summary", 2000, false)
+            summary: validateCompactText(payload.summary, kind === "REVIEW_REQUESTED" ? "Review summary" : "Rework summary", 2000, false)
         };
     }
     if (kind === "APPROVAL_REQUESTED") {
@@ -378,7 +378,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 4, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 5, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -420,7 +420,7 @@ function initializeSchema(database: any): void {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -480,14 +480,14 @@ function initializeSchema(database: any): void {
             `);
         }
         const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
-        if (eventTable && !eventTable.sql.includes("MOVE_REQUESTED")) {
+        if (eventTable && !eventTable.sql.includes("REWORK_REQUESTED")) {
             database.exec(`
                 ALTER TABLE events RENAME TO events_legacy;
                 CREATE TABLE events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_key TEXT NOT NULL UNIQUE,
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     processed_at TEXT,
@@ -502,7 +502,7 @@ function initializeSchema(database: any): void {
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -616,7 +616,7 @@ function titleForTask(task: ITaskRow): string {
     } else if (task.state === "RUNNING") {
         prefix = "🔴 ";
     } else if (task.state === "REVIEW") {
-        prefix = "🟡 ";
+        prefix = "⁉️ ";
     } else if (task.state === "APPROVED") {
         prefix = "🟢 ";
     } else if (task.state === "DONE") {
@@ -812,6 +812,8 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             requireTask(store, String(validPayload.dependencyTaskId));
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
+        } else if (kind === "REWORK_REQUESTED") {
+            assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
             assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
@@ -1100,6 +1102,15 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         store.database.prepare("UPDATE tasks SET state = 'REVIEW', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "REVIEW_READY", task: serializeTask(refreshedTask), summary: payload.summary || null };
+    }
+    if (event.kind === "REWORK_REQUESTED") {
+        if (task.state === "RUNNING") {
+            return { action: "REWORK_ALREADY_STARTED", task: serializeTask(task), summary: payload.summary || null };
+        }
+        assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
+        store.database.prepare("UPDATE tasks SET state = 'RUNNING', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        const refreshedTask = requireTask(store, task.task_id);
+        return { action: "REWORK_STARTED", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
     if (event.kind === "APPROVAL_REQUESTED") {
         if (task.state === "APPROVED" || task.state === "DONE") {

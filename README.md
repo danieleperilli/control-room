@@ -194,7 +194,7 @@ To see the available commands at any time:
 
 > $control-room help
 
-While the task is queued, no branch exists for it. When ControlRoom activates the task, it creates and checks out `control-room/T0001`; Codex implements the approved plan there without committing, then moves it to review. You may continue requesting changes during review. When the current working tree is ready, approve it from that task:
+While the task is queued, no branch exists for it. When ControlRoom activates the task, it creates and checks out `control-room/T0001`; Codex implements the approved plan there without committing, then moves it to review. If you request more implementation during review, the task returns to running before Codex changes files, keeps the same branch, and enters review again afterward. Questions and read-only checks do not restart it. When the current working tree is ready, approve it from that task:
 
 > Approve
 
@@ -212,7 +212,7 @@ ControlRoom keeps task titles synchronized with their state:
 | Queued | `⭕️ ① T0001 - Add audit log` |
 | Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
-| Review | `🟡 T0001 - Add audit log` |
+| Review | `⁉️ T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
 | Done | `🟢 T0001 - Add audit log` |
 | Blocked | `❌ T0001 - Add audit log` |
@@ -229,7 +229,7 @@ The queue marker is derived from SQLite's active order, but it counts only tasks
 3. Say `Enqueue`; use `Move` to reprioritize it and `Depends on T0005` only when it truly depends on another task.
 4. ControlRoom activates the first eligible task after its dependencies are done.
 5. Codex implements and verifies the change inside that dedicated task.
-6. The task moves to review.
+6. The task moves to review. Further implementation requests return it to running, then back to review when the changes are ready.
 7. Review the result and say `Approve` in the same task.
 8. ControlRoom completes the task: it either performs no Git operation for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.
 9. The task becomes done and the next eligible task can start from the updated base.
@@ -244,8 +244,8 @@ The only supported mode uses an activation-time worker branch and approval-time 
 - ControlRoom never creates a worktree.
 - Planning and queued tasks do not modify files or create branches.
 - When a queued task starts, ControlRoom creates and checks out `control-room/T0001` from the configured base branch.
-- The active task may change files while running or in review, without staging or committing them.
-- Review does not require dirty files and does not freeze them; changes may continue until `Approve`.
+- The worker changes files while running, without staging or committing them. Review feedback that requires edits first returns the task to running on the same branch.
+- Review does not require dirty files and does not freeze the working tree; manual or external changes may still continue until `Approve`.
 - A clean approval performs no Git write, does not interpret existing commits, and only removes the task from the active queue.
 - When dirty changes are already on the configured base branch, approval commits them there using the meaningful English subject captured by the approval event.
 - When dirty changes are on the worker branch, approval creates that commit on the worker branch.

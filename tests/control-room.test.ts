@@ -242,7 +242,7 @@ test("uses the review marker and red when review rework starts", () => {
         task_id: "T0001",
         semantic_name: "Refine review"
     };
-    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "⁉️ T0001 - Refine review");
+    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "💪 T0001 - Refine review");
     assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🔴 T0001 - Refine review");
 });
 
@@ -562,7 +562,7 @@ test("review and approval do not create a commit", () => {
     core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Ready" });
     core.processPendingEvents(options);
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
-    assert.equal(core.getStatus(options, "T0001").task.title, "⁉️ T0001 - Commit on approval");
+    assert.equal(core.getStatus(options, "T0001").task.title, "💪 T0001 - Commit on approval");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
     core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Commit approved changes safely", userRequestId: "user-message-1" });
@@ -628,7 +628,7 @@ test("returns review to running before rework without changing Git state", () =>
 
     core.submitEvent(options, "review-2", "T0001", "REVIEW_REQUESTED", { summary: "Rework ready" });
     core.processPendingEvents(options);
-    assert.equal(core.getStatus(options, "T0001").task.title, "⁉️ T0001 - Refine review");
+    assert.equal(core.getStatus(options, "T0001").task.title, "💪 T0001 - Refine review");
 });
 
 test("requires a meaningful approval commit subject distinct from the task title", () => {

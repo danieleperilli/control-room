@@ -147,7 +147,7 @@ node <skill-dir>/scripts/control-room.ts request-rework \
     --summary "<compact rework summary>"
 ```
 
-The coordinator processes this event as `REVIEW -> RUNNING`, and the task title returns to red. This transition reuses the active checkout and worker branch and performs no Git operation. Read-only questions and inspections during review do not request rework. After the requested changes are complete, use `request-review` again; the review title uses `⁉️`.
+The coordinator processes this event as `REVIEW -> RUNNING`, and the task title returns to red. This transition reuses the active checkout and worker branch and performs no Git operation. Read-only questions and inspections during review do not request rework. After the requested changes are complete, use `request-review` again; the review title uses `💪`.
 
 Submit direct user approval:
 

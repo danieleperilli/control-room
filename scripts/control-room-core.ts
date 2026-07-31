@@ -165,7 +165,7 @@ function validateThreadId(threadId: string): string {
  */
 function validateSemanticName(semanticName: string): string {
     assertCondition(typeof semanticName === "string", "A semantic task name is required.");
-    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🔵|⁉️|🟢|✅|❌|👉)\s*(?:(?:[⓪①-⑨]+|[❶-❾]|#\d{1,4})\s+)?/u, "");
+    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🔵|💪|🟢|✅|❌|👉)\s*(?:(?:[⓪①-⑨]+|[❶-❾]|#\d{1,4})\s+)?/u, "");
     assertCondition(normalizedName.length > 0 && normalizedName.length <= 80, "Semantic task name must contain 1 to 80 characters.");
     assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedName), "Semantic task name contains control characters.");
     return normalizedName;
@@ -616,7 +616,7 @@ function titleForTask(task: ITaskRow): string {
     } else if (task.state === "RUNNING") {
         prefix = "🔴 ";
     } else if (task.state === "REVIEW") {
-        prefix = "⁉️ ";
+        prefix = "💪 ";
     } else if (task.state === "APPROVED") {
         prefix = "🟢 ";
     } else if (task.state === "DONE") {

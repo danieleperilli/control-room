@@ -212,7 +212,7 @@ ControlRoom keeps task titles synchronized with their state:
 | Queued | `⭕️ ① T0001 - Add audit log` |
 | Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
-| Review | `⁉️ T0001 - Add audit log` |
+| Review | `💪 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
 | Done | `🟢 T0001 - Add audit log` |
 | Blocked | `❌ T0001 - Add audit log` |

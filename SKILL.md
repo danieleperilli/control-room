@@ -70,7 +70,7 @@ Use the returned `title` exactly:
 - `PLANNING`: `⚪️ T0001 - Semantic name`
 - `QUEUED`: concatenate one circled glyph per decimal digit, for example `⭕️ ① T0001 - Semantic name`, `⭕️ ⑨ T0009 - Semantic name`, and `⭕️ ①⓪ T0010 - Semantic name`
 - `RUNNING`: `🔴 T0001 - Semantic name`
-- `REVIEW`: `⁉️ T0001 - Semantic name`
+- `REVIEW`: `💪 T0001 - Semantic name`
 - `APPROVED`: `🟢 T0001 - Semantic name`
 - `DONE`: `🟢 T0001 - Semantic name`
 - `BLOCKED` or `CANCELED`: `❌ T0001 - Semantic name`

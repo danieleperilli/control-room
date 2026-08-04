@@ -103,7 +103,7 @@ User commands:
 ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 
 Commands:
-  init --project-root ROOT --coordinator-thread ID --base-branch BRANCH [--state-root PATH]
+  init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
   request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
@@ -114,6 +114,7 @@ Commands:
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
+  settle --project-root ROOT [--state-root PATH]
   process --project-root ROOT [--state-root PATH]
   activate-next --project-root ROOT [--state-root PATH]
   recover-commit --project-root ROOT --task T0001 [--state-root PATH]
@@ -136,9 +137,9 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     }
     const core = require("./control-room-core.ts");
     if (parsed.command === "init") {
-        validateOptions(values, ["project-root", "coordinator-thread", "base-branch", "state-root"]);
+        validateOptions(values, ["project-root", "control-room-thread", "base-branch", "state-root"]);
         return {
-            ...core.initializeProject(buildOptions(values), requireOption(values, "coordinator-thread"), requireOption(values, "base-branch")),
+            ...core.initializeProject(buildOptions(values), requireOption(values, "control-room-thread"), requireOption(values, "base-branch")),
             userCommands: USER_COMMANDS
         };
     }
@@ -206,6 +207,10 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "BLOCKED_REPORTED", {
             reason: requireOption(values, "reason")
         });
+    }
+    if (parsed.command === "settle") {
+        validateOptions(values, ["project-root", "state-root"]);
+        return core.settleProject(buildOptions(values));
     }
     if (parsed.command === "process") {
         validateOptions(values, ["project-root", "state-root"]);

@@ -84,16 +84,16 @@ function createUnbornFixture(): IFixture {
 }
 
 /**
- * Initialize one fixture project with its coordinator.
+ * Initialize one fixture project with its Control Room console.
  * @param fixture Disposable project fixture.
  */
 function initializeFixture(fixture: IFixture): string {
     const initialized = core.initializeProject(
         { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot },
-        "coordinator-thread",
+        "control-room-thread",
         "main"
     );
-    assert.equal(initialized.coordinatorTitle, "⚫️ Control Room");
+    assert.equal(initialized.controlRoomTitle, "⚫️ Control Room");
     assert.equal(initialized.gitMode, "local-approval-commit");
     return initialized.databasePath;
 }
@@ -106,15 +106,15 @@ test("initializes and completes the first task in a repository without commits",
         fixture.repositoryRoot,
         "--state-root",
         fixture.stateRoot,
-        "--coordinator-thread",
-        "coordinator-thread",
+        "--control-room-thread",
+        "control-room-thread",
         "--base-branch",
         "main"
     ]);
     assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
     const initializationResult = JSON.parse(initialized.stdout);
     const databasePath = initializationResult.databasePath;
-    assert.equal(initializationResult.coordinatorTitle, "⚫️ Control Room");
+    assert.equal(initializationResult.controlRoomTitle, "⚫️ Control Room");
     assert.equal(initializationResult.baseCommit, null);
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     assert.equal(core.getStatus(options).baseBranch, "main");
@@ -187,12 +187,12 @@ test("allocates four-digit task IDs and preserves IDs across registration retrie
     assert.equal(retry.created, false);
     assert.equal(second.taskId, "T0002");
     assert.throws(
-        () => core.registerTask(options, "coordinator-thread", "Invalid worker"),
-        /coordinator thread cannot be registered/
+        () => core.registerTask(options, "control-room-thread", "Invalid worker"),
+        /Control Room task cannot be registered/
     );
 });
 
-test("returns the user command list after CLI initialization", () => {
+test("returns the user command list for the created Control Room console", () => {
     const fixture = createFixture();
     const argumentsList = [
         "init",
@@ -200,15 +200,15 @@ test("returns the user command list after CLI initialization", () => {
         fixture.repositoryRoot,
         "--state-root",
         fixture.stateRoot,
-        "--coordinator-thread",
-        "coordinator-thread",
+        "--control-room-thread",
+        "control-room-thread",
         "--base-branch",
         "main"
     ];
     const initialized = runCli(argumentsList);
     assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
     const result = JSON.parse(initialized.stdout);
-    assert.equal(result.coordinatorTitle, "⚫️ Control Room");
+    assert.equal(result.controlRoomTitle, "⚫️ Control Room");
     assert.deepEqual(result.userCommands, [
         "$control-room init",
         "$control-room join",
@@ -224,7 +224,7 @@ test("returns the user command list after CLI initialization", () => {
     assert.equal(JSON.parse(retry.stdout).created, false);
     assert.deepEqual(JSON.parse(retry.stdout).userCommands, result.userCommands);
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
-    assert.match(skillText, /End the same initialization response with the returned `userCommands` list/);
+    assert.match(skillText, /End that response with the same command list returned by CLI `help`/);
     assert.match(skillText, /Put nothing after the list/);
 });
 
@@ -376,7 +376,8 @@ test("keeps enqueue event-only and orders tasks without Git anchors", () => {
     core.submitEvent(options, "enqueue-2", "T0002", "ENQUEUE_REQUESTED", { afterTaskId: "T0001" });
     assert.equal(firstRequest.created, true);
     assert.equal(firstRetry.created, false);
-    assert.equal(firstRequest.notification, "CONTROL_ROOM_WAKE");
+    assert.equal(Object.hasOwn(firstRequest, "notification"), false);
+    assert.equal(Object.hasOwn(firstRequest, "controlRoomThreadId"), false);
     assert.equal(core.getStatus(options, "T0001").task.state, "PLANNING");
     const processed = core.processPendingEvents(options);
     const queue = core.getQueue(options).queue;
@@ -388,6 +389,61 @@ test("keeps enqueue event-only and orders tasks without Git anchors", () => {
     assert.equal(queue[0].branchName, null);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), branchesBeforeQueue);
+});
+
+test("settles worker events directly and returns the fully renumbered queue", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+
+    const settledResult = runCli(["settle", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot]);
+    assert.equal(settledResult.status, 0, settledResult.stderr || settledResult.stdout);
+    const settled = JSON.parse(settledResult.stdout);
+    assert.equal(settled.settled, true);
+    assert.equal(settled.processed.processedCount, 3);
+    assert.equal(settled.activation.activated, true);
+    assert.equal(settled.activation.task.taskId, "T0001");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), [
+        "🔴 T0001 - Task 1",
+        "⭕️ ① T0002 - Task 2",
+        "⭕️ ② T0003 - Task 3"
+    ]);
+
+    const retry = core.settleProject(options);
+    assert.equal(retry.processed.processedCount, 0);
+    assert.equal(retry.activation.activated, false);
+    assert.equal(retry.activation.reason, "ACTIVE_TASK_PRESENT");
+    assert.deepEqual(retry.queue.map((task: Record<string, unknown>) => task.title), settled.queue.map((task: Record<string, unknown>) => task.title));
+});
+
+test("settlement commits an approved task and activates the next worker", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 2; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.settleProject(options);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "settled.txt"), "approved\n");
+    core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Ready" });
+    core.settleProject(options);
+    core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Add settled workflow coverage", userRequestId: "user-message-1" });
+
+    const settled = core.settleProject(options);
+    assert.equal(settled.completion.task.state, "DONE");
+    assert.equal(settled.completion.committed, true);
+    assert.equal(settled.activation.activated, true);
+    assert.equal(settled.activation.task.taskId, "T0002");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Task 2"]);
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Add settled workflow coverage");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
 });
 
 test("moves an already queued task to the end on a new enqueue request", () => {
@@ -933,16 +989,17 @@ test("activation refuses leftover changes from a canceled active task", () => {
 
 test("join is documented as a non-terminal directive that preserves the request", () => {
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
-    assert.match(skillText, /Treat `join` as a non-terminal preamble/);
-    assert.match(skillText, /continue the same turn by evaluating and fulfilling every remaining request/);
-    assert.match(skillText, /registration and title synchronization must never consume, replace, summarize away, or defer the user's actual request/);
+    assert.match(skillText, /Preserve the complete message before handling the directive/);
+    assert.match(skillText, /Remove only the directive, then evaluate and fulfill every remaining request in the same turn/);
+    assert.match(skillText, /Joining is idempotent and never consumes the substantive request/);
 });
 
 test("documents queue and help as global read-only commands", () => {
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     assert.match(skillText, /\$control-room queue/);
     assert.match(skillText, /\$control-room help/);
-    assert.match(skillText, /do not register the current task, change its title, submit an event, or notify the coordinator/);
+    assert.match(skillText, /Treat these as read-only commands that never register or rename the caller/);
+    assert.match(skillText, /They do not submit or settle events/);
     const cliResult = runCli(["help"]);
     assert.equal(cliResult.status, 0, cliResult.stderr || cliResult.stdout);
     assert.match(cliResult.stdout, /\$control-room queue/);
@@ -950,4 +1007,13 @@ test("documents queue and help as global read-only commands", () => {
     assert.doesNotMatch(cliResult.stdout, /^\s+Queue \[after T0002\]$/m);
     assert.match(cliResult.stdout, /Move first/);
     assert.match(cliResult.stdout, /Depends on T0002/);
+});
+
+test("documents init as creation of a silent manual Control Room task", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    assert.match(skillText, /Create one top-level task in that project with the \*\*Local\*\* environment/);
+    assert.match(skillText, /initial prompt `\$control-room console`/);
+    assert.match(skillText, /Leave the calling task unchanged and unregistered/);
+    assert.match(skillText, /does not process routine events or receive wake notifications/);
+    assert.match(skillText, /apply the title of every task in the returned final `queue`/);
 });

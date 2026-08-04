@@ -12,6 +12,8 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Creates a worker branch only when a queued task starts running.
 - Creates a commit only after direct user approval and only when uncommitted changes exist.
 - Deletes the merged worker branch, but never pushes, creates a pull request, or rewrites Git history.
+- Settles queue changes directly from the task issuing the command, without waking the Control Room task.
+- Creates one optional manual `⚫️ Control Room` console for project-wide commands and recovery.
 - Persists project state locally in SQLite.
 
 ## Requirements
@@ -67,17 +69,19 @@ This exception covers every ControlRoom subcommand, including the approval-only 
 
 ## Use ControlRoom
 
-Before creating project tasks, open one dedicated top-level task in the repository, select **Local** under the composer, and send:
+From any top-level task in the repository, select **Local** under the composer and send:
 
 ```text
 $control-room init
 ```
 
-ControlRoom uses the current Local checkout as the shared project checkout, records its currently checked-out Git branch as the base branch, and keeps the coordinator title fixed as `⚫️ Control Room`.
+ControlRoom leaves the current task unchanged and creates a separate Local task named `⚫️ Control Room`. That task explains the available commands and acts only as an optional manual console. It does not process events in the background or receive routine notifications.
+
+The project records the current Local checkout and checked-out Git branch as its shared root and base branch. Running `$control-room init` again does not create a duplicate console or replace the registered one.
 
 Initialization does not create a commit. In a new repository, the first activated task may start with files that are still untracked or otherwise uncommitted. They remain uncommitted through implementation and review; `Approve` creates the root commit, establishes the configured base branch, and removes the worker branch.
 
-The coordinator does not receive a `T_ID` and must not be used for planning or implementation. Running `$control-room init` again in the same task is safe; another task cannot silently replace the registered coordinator.
+The Control Room console does not receive a `T_ID` and must not be used for planning or implementation. You can open it manually to inspect or reorder the queue, manage dependencies with explicit task IDs, or perform recovery.
 
 Use a separate top-level Codex task in **Local** mode to discuss and plan each change. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
 
@@ -105,7 +109,7 @@ English is the canonical command language. ControlRoom can still interpret equiv
 
 | Command | Result |
 | --- | --- |
-| `$control-room init` | Initialize the current top-level task as the project coordinator. |
+| `$control-room init` | Initialize the project and create a separate manual `⚫️ Control Room` console. |
 | `$control-room join` | Register an existing top-level task in planning without queueing it. |
 | `$control-room queue` | Show the current ordered queue from any task in the initialized Local project. |
 | `$control-room help` | Show the available user commands from any task. |
@@ -122,7 +126,7 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | `Status` | Show the current task state. |
 | `Queue status` | Show the ordered project queue. |
 
-`$control-room queue` is the fast, read-only queue command. It works in the coordinator, in a registered worker, or in an unregistered top-level task whose Local environment points to the initialized repository. It does not register the task, change its title, or notify the coordinator. `$control-room help` is also read-only and does not require an initialized project.
+`$control-room queue` is the fast, read-only queue command. It works in the manual console, a registered worker, or an unregistered top-level task whose Local environment points to the initialized repository. It does not register or rename the caller. `$control-room help` is also read-only and does not require an initialized project.
 
 Queue order and dependencies are separate. `Enqueue after` and every `Move` command change only the order. `Depends on` and `Remove dependency` change only start eligibility and never move a task.
 
@@ -148,17 +152,17 @@ ControlRoom uses task titles as the normal status display and keeps routine orch
 - Additional operational messages appear only when an error, blocker, recovery step, or user action needs attention.
 - `Status` and `Queue status` show details only when requested.
 
-Workers send the coordinator a minimal internal wake-up rather than a detailed status notification. The authoritative event remains in SQLite, and the coordinator processes all pending events together. The wake-up token and routine processing output should not be echoed into user-visible messages.
+The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, completes an approved task, activates the next eligible worker, and returns the final queue in the same turn. No wake or routine message is sent to `⚫️ Control Room`.
 
 ## Example usage
 
-First, create a dedicated top-level task for the repository and initialize the coordinator:
+Initialize from any top-level Local task:
 
 > $control-room init
 
-ControlRoom renames that task `⚫️ Control Room` and keeps that title in every state. Leave it dedicated to coordination.
+ControlRoom leaves that task unchanged and creates a separate `⚫️ Control Room` task. Its first response explains that it is a silent manual console and ends with the command list. You do not need to keep it open.
 
-After initialization, the final response confirms the configured base branch and ends with the same concise command list available through `$control-room help`. The list is shown on both the first initialization and an idempotent retry.
+Routine queue work happens directly in worker tasks. The console runs only when you open it and send a command.
 
 You can start a dedicated top-level task with a normal planning prompt:
 
@@ -178,7 +182,7 @@ Suppose two more tasks are waiting and the queue is `T0001`, `T0002`, `T0003`. Y
 
 > Move first
 
-Or do the same from the coordinator:
+Or do the same from the manual console:
 
 > Move T0003 before T0001
 
@@ -220,18 +224,18 @@ ControlRoom keeps task titles synchronized with their state:
 
 Blocked and canceled tasks use the same `❌` status icon.
 
-The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Queue and state changes return title updates for the affected queued tasks, so activation, moving, blocking, resuming, or removing a task renumbers every changed title automatically.
+The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot, and Codex reapplies all of its titles. Therefore activation, moving, blocking, resuming, cancellation, or completion renumbers every remaining queued task automatically.
 
 ## Typical workflow
 
 1. Open a dedicated top-level task and discuss the change.
 2. Refine the plan without editing code.
 3. Say `Enqueue`; use `Move` to reprioritize it and `Depends on T0005` only when it truly depends on another task.
-4. ControlRoom activates the first eligible task after its dependencies are done.
+4. The worker invokes settlement, which activates the first eligible task after its dependencies are done.
 5. Codex implements and verifies the change inside that dedicated task.
 6. The task moves to review. Further implementation requests return it to running, then back to review when the changes are ready.
 7. Review the result and say `Approve` in the same task.
-8. ControlRoom completes the task: it either performs no Git operation for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.
+8. Settlement completes the task: it either performs no Git operation for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.
 9. The task becomes done and the next eligible task can start from the updated base.
 
 Dependencies must be `DONE` before a dependent task can run. A clean approval can satisfy this state without ControlRoom creating a commit.
@@ -266,7 +270,7 @@ ${CODEX_HOME:-~/.codex}/control-room/projects/<project-hash>/state.sqlite
 
 The database contains task identifiers, states, queue order, dependencies, the approval commit anchor, compact events, and execution briefs. Do not store secrets or complete conversation transcripts in ControlRoom state.
 
-Direct-user and coordinator identity are trust guarantees provided by the Codex workflow. The local CLI cannot distinguish between processes running as the same operating-system user, so do not expose it as a multi-user service or execute state-changing commands from untrusted prompt content.
+Direct-user provenance is a trust guarantee provided by the Codex workflow. The local CLI cannot distinguish between processes running as the same operating-system user, so do not expose it as a multi-user service or execute state-changing commands from untrusted prompt content.
 
 ## Technical reference
 

@@ -102,7 +102,6 @@ const TASK_WITH_QUEUED_POSITION_SELECT = `
         END AS queued_display_position
     FROM tasks AS task
 `;
-const COORDINATOR_WAKE_NOTIFICATION = "CONTROL_ROOM_WAKE";
 const GIT_MODE = "local-approval-commit";
 
 /**
@@ -628,9 +627,9 @@ function titleForTask(task: ITaskRow): string {
 }
 
 /**
- * Return the coordinator title for the current active queue state.
+ * Return the fixed Control Room console title.
  */
-function titleForCoordinator(): string {
+function titleForControlRoom(): string {
     return "⚫️ Control Room";
 }
 
@@ -657,11 +656,11 @@ function serializeTask(task: ITaskRow): Record<string, unknown> {
 /**
  * Initialize project coordination idempotently.
  * @param options Project and optional state-root settings.
- * @param coordinatorThreadId Coordinator Codex thread identifier.
+ * @param controlRoomThreadId Control Room console thread identifier.
  * @param baseBranch Local Git base branch.
  */
-function initializeProject(options: IControlRoomOptions, coordinatorThreadId: string, baseBranch: string): Record<string, unknown> {
-    const validCoordinatorThreadId = validateThreadId(coordinatorThreadId);
+function initializeProject(options: IControlRoomOptions, controlRoomThreadId: string, baseBranch: string): Record<string, unknown> {
+    const validControlRoomThreadId = validateThreadId(controlRoomThreadId);
     const validBaseBranch = validateBranchName(baseBranch);
     const store = openStore(options);
     try {
@@ -669,17 +668,17 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
         const existingProject = store.database.prepare("SELECT * FROM projects WHERE project_key = ?").get(store.projectKey) as IProjectRow | undefined;
         if (existingProject) {
             assertCondition(existingProject.project_root === store.projectRoot, "Project hash collision detected.");
-            assertCondition(existingProject.coordinator_thread_id === validCoordinatorThreadId, "A different coordinator is already registered for this project.");
+            assertCondition(existingProject.coordinator_thread_id === validControlRoomThreadId, "A different Control Room task is already registered for this project.");
             assertCondition(existingProject.base_branch === validBaseBranch, "The configured base branch does not match.");
             const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, existingProject.base_branch);
-            const coordinatorTitle = titleForCoordinator();
+            const controlRoomTitle = titleForControlRoom();
             commitTransaction(store.database);
             return {
                 created: false,
-                title: coordinatorTitle,
-                coordinatorTitle,
+                title: controlRoomTitle,
+                controlRoomTitle,
                 projectRoot: store.projectRoot,
-                coordinatorThreadId: existingProject.coordinator_thread_id,
+                controlRoomThreadId: existingProject.coordinator_thread_id,
                 baseBranch: existingProject.base_branch,
                 baseCommit,
                 gitMode: existingProject.git_mode,
@@ -696,15 +695,15 @@ function initializeProject(options: IControlRoomOptions, coordinatorThreadId: st
         store.database.prepare(`
             INSERT INTO projects (project_key, project_root, coordinator_thread_id, base_branch, git_mode, next_task_number, created_at, updated_at)
             VALUES (?, ?, ?, ?, 'local-approval-commit', 1, ?, ?)
-        `).run(store.projectKey, store.projectRoot, validCoordinatorThreadId, validBaseBranch, timestamp, timestamp);
-        const coordinatorTitle = titleForCoordinator();
+        `).run(store.projectKey, store.projectRoot, validControlRoomThreadId, validBaseBranch, timestamp, timestamp);
+        const controlRoomTitle = titleForControlRoom();
         commitTransaction(store.database);
         return {
             created: true,
-            title: coordinatorTitle,
-            coordinatorTitle,
+            title: controlRoomTitle,
+            controlRoomTitle,
             projectRoot: store.projectRoot,
-            coordinatorThreadId: validCoordinatorThreadId,
+            controlRoomThreadId: validControlRoomThreadId,
             baseBranch: validBaseBranch,
             baseCommit,
             gitMode: GIT_MODE,
@@ -731,7 +730,7 @@ function registerTask(options: IControlRoomOptions, threadId: string, semanticNa
     try {
         beginTransaction(store.database);
         const project = requireProject(store);
-        assertCondition(project.coordinator_thread_id !== validThreadId, "The coordinator thread cannot be registered as a worker task.");
+        assertCondition(project.coordinator_thread_id !== validThreadId, "The Control Room task cannot be registered as a worker task.");
         const existingTask = store.database.prepare("SELECT * FROM tasks WHERE thread_id = ?").get(validThreadId) as ITaskRow | undefined;
         if (existingTask) {
             if (existingTask.semantic_name !== validSemanticName) {
@@ -740,7 +739,7 @@ function registerTask(options: IControlRoomOptions, threadId: string, semanticNa
             }
             const refreshedTask = requireTask(store, existingTask.task_id);
             commitTransaction(store.database);
-            return { created: false, coordinatorThreadId: project.coordinator_thread_id, ...serializeTask(refreshedTask) };
+            return { created: false, controlRoomThreadId: project.coordinator_thread_id, ...serializeTask(refreshedTask) };
         }
         assertCondition(project.next_task_number <= 9999, "The project task ID space T0001-T9999 is exhausted.");
         const taskNumber = project.next_task_number;
@@ -753,7 +752,7 @@ function registerTask(options: IControlRoomOptions, threadId: string, semanticNa
         store.database.prepare("UPDATE projects SET next_task_number = ?, updated_at = ? WHERE project_key = ?").run(taskNumber + 1, timestamp, store.projectKey);
         const createdTask = requireTask(store, taskId);
         commitTransaction(store.database);
-        return { created: true, coordinatorThreadId: project.coordinator_thread_id, ...serializeTask(createdTask) };
+        return { created: true, controlRoomThreadId: project.coordinator_thread_id, ...serializeTask(createdTask) };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -777,7 +776,7 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
     const store = openStore(options);
     try {
         beginTransaction(store.database);
-        const project = requireProject(store);
+        requireProject(store);
         const task = requireTask(store, validTaskId);
         const payloadJson = JSON.stringify(validPayload);
         const existingEvent = store.database.prepare("SELECT event_key, task_id, kind, payload_json, processed_at FROM events WHERE event_key = ?").get(validEventKey) as Record<string, unknown> | undefined;
@@ -787,9 +786,7 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             return {
                 created: false,
                 processed: Boolean(existingEvent.processed_at),
-                eventKey: validEventKey,
-                coordinatorThreadId: project.coordinator_thread_id,
-                notification: COORDINATOR_WAKE_NOTIFICATION
+                eventKey: validEventKey
             };
         }
         if (kind === "ENQUEUE_REQUESTED") {
@@ -830,9 +827,7 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
         return {
             created: true,
             processed: false,
-            eventKey: validEventKey,
-            coordinatorThreadId: project.coordinator_thread_id,
-            notification: COORDINATOR_WAKE_NOTIFICATION
+            eventKey: validEventKey
         };
     } catch (error) {
         rollbackTransaction(store.database);
@@ -1157,7 +1152,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
 }
 
 /**
- * Process pending events serially as the coordinator.
+ * Process pending events serially through the deterministic engine.
  * @param options Project and optional state-root settings.
  */
 function processPendingEvents(options: IControlRoomOptions): Record<string, unknown> {
@@ -1198,7 +1193,7 @@ function processPendingEvents(options: IControlRoomOptions): Record<string, unkn
                 }
             }
         }
-        return { processedCount: results.length, coordinatorTitle: titleForCoordinator(), results };
+        return { processedCount: results.length, controlRoomTitle: titleForControlRoom(), results };
     } finally {
         store.database.close();
     }
@@ -1229,7 +1224,11 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
         beginTransaction(store.database);
         const project = requireProject(store);
         const exclusiveTask = store.database.prepare("SELECT task_id, state FROM tasks WHERE state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as Record<string, unknown> | undefined;
-        assertCondition(!exclusiveTask, exclusiveTask ? `Project is waiting on ${exclusiveTask.task_id} in ${exclusiveTask.state}.` : "Project is not idle.");
+        if (exclusiveTask) {
+            const controlRoomTitle = titleForControlRoom();
+            commitTransaction(store.database);
+            return { activated: false, controlRoomTitle, reason: "ACTIVE_TASK_PRESENT", taskId: exclusiveTask.task_id, state: exclusiveTask.state };
+        }
         const queuedTasks = store.database.prepare("SELECT * FROM tasks WHERE state = 'QUEUED' ORDER BY queue_position, task_number").all() as ITaskRow[];
         let selectedTask: ITaskRow | undefined;
         for (const queuedTask of queuedTasks) {
@@ -1239,9 +1238,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             }
         }
         if (!selectedTask) {
-            const coordinatorTitle = titleForCoordinator();
+            const controlRoomTitle = titleForControlRoom();
             commitTransaction(store.database);
-            return { activated: false, coordinatorTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
+            return { activated: false, controlRoomTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
         }
         const workerBranch = workerBranchForTask(selectedTask.task_id);
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
@@ -1295,11 +1294,11 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
         `).run(currentBaseCommit, workerBranch, currentTimestamp(), selectedTask.task_id);
         const runningTask = requireTask(store, selectedTask.task_id);
         const titleUpdates = readQueuedTitleUpdates(store, selectedTask.queue_position || 1);
-        const coordinatorTitle = titleForCoordinator();
+        const controlRoomTitle = titleForControlRoom();
         commitTransaction(store.database);
         return {
             activated: true,
-            coordinatorTitle,
+            controlRoomTitle,
             task: serializeTask(runningTask),
             titleUpdates,
             executionBrief: {
@@ -1577,7 +1576,7 @@ function finalizeApprovedCommit(store: IStore, taskId: string, committedCommit: 
         const titleUpdates = compactActiveQueue(store);
         const completedTask = requireTask(store, task.task_id);
         commitTransaction(store.database);
-        return { committed: true, merged, branchDeleted, coordinatorTitle: titleForCoordinator(), gitMode: GIT_MODE, task: serializeTask(completedTask), titleUpdates };
+        return { committed: true, merged, branchDeleted, controlRoomTitle: titleForControlRoom(), gitMode: GIT_MODE, task: serializeTask(completedTask), titleUpdates };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -1602,7 +1601,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
                 committed: false,
                 alreadyCompleted: true,
                 alreadyCommitted: Boolean(task.integrated_commit),
-                coordinatorTitle: titleForCoordinator(),
+                controlRoomTitle: titleForControlRoom(),
                 gitMode: GIT_MODE,
                 task: serializeTask(task)
             };
@@ -1619,7 +1618,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
                 committed: false,
                 dequeued: true,
                 noUncommittedChanges: true,
-                coordinatorTitle: titleForCoordinator(),
+                controlRoomTitle: titleForControlRoom(),
                 gitMode: GIT_MODE,
                 task: serializeTask(completedTask),
                 titleUpdates
@@ -1690,7 +1689,7 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
                 recovered: false,
                 alreadyCompleted: true,
                 alreadyCommitted: Boolean(task.integrated_commit),
-                coordinatorTitle: titleForCoordinator(),
+                controlRoomTitle: titleForControlRoom(),
                 task: serializeTask(task)
             };
         }
@@ -1719,7 +1718,7 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
             store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
             const retryTask = requireTask(store, task.task_id);
             commitTransaction(store.database);
-            return { recovered: true, finalized: false, retryCommit: true, coordinatorTitle: titleForCoordinator(), task: serializeTask(retryTask) };
+            return { recovered: true, finalized: false, retryCommit: true, controlRoomTitle: titleForControlRoom(), task: serializeTask(retryTask) };
         }
         assertCondition(workerCommitIsApproval || baseCommitIsApproval, `Git history does not contain the approved commit expected for ${task.task_id}.`);
         if (baseCommitIsApproval && workerCommit !== currentBaseCommit) {
@@ -1777,7 +1776,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string): Record<string
     try {
         const project = requireProject(store);
         if (taskId) {
-            return { projectRoot: store.projectRoot, coordinatorTitle: titleForCoordinator(), task: serializeTask(requireTask(store, taskId)) };
+            return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), task: serializeTask(requireTask(store, taskId)) };
         }
         const counts = store.database.prepare("SELECT state, COUNT(*) AS count FROM tasks GROUP BY state ORDER BY state").all() as Array<{ state: TaskState; count: number }>;
         const stateCounts: Record<string, number> = {};
@@ -1786,8 +1785,8 @@ function getStatus(options: IControlRoomOptions, taskId?: string): Record<string
         }
         return {
             projectRoot: store.projectRoot,
-            coordinatorTitle: titleForCoordinator(),
-            coordinatorThreadId: project.coordinator_thread_id,
+            controlRoomTitle: titleForControlRoom(),
+            controlRoomThreadId: project.coordinator_thread_id,
             baseBranch: project.base_branch,
             gitMode: project.git_mode,
             commitTaskId: project.integration_task_id,
@@ -1816,10 +1815,56 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
         for (const task of tasks) {
             queue.push({ ...serializeTask(task), dependencies: readTaskDependencies(store, task.task_id) });
         }
-        return { projectRoot: store.projectRoot, coordinatorTitle: titleForCoordinator(), queue };
+        return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), queue };
     } finally {
         store.database.close();
     }
+}
+
+/**
+ * Process pending events, complete an approved task, and activate the next eligible task.
+ * @param options Project and optional state-root settings.
+ */
+function settleProject(options: IControlRoomOptions): Record<string, unknown> {
+    const processed = processPendingEvents(options);
+    let status = getStatus(options);
+    if (status.commitTaskId) {
+        const queue = getQueue(options);
+        return {
+            settled: false,
+            reason: "COMMIT_RECOVERY_REQUIRED",
+            commitTaskId: status.commitTaskId,
+            controlRoomTitle: titleForControlRoom(),
+            processed,
+            completion: null,
+            activation: null,
+            queue: queue.queue
+        };
+    }
+    const stateCounts = status.stateCounts as Record<string, number>;
+    let completion: Record<string, unknown> | null = null;
+    if (Number(stateCounts.APPROVED || 0) > 0) {
+        const activeQueue = getQueue(options).queue as Record<string, unknown>[];
+        const approvedTasks = activeQueue.filter((task) => task.state === "APPROVED");
+        assertCondition(approvedTasks.length === 1, "ControlRoom requires exactly one approved task before settlement.");
+        completion = commitApprovedTask(options, String(approvedTasks[0].taskId));
+        status = getStatus(options);
+    }
+    let activation: Record<string, unknown>;
+    if (status.commitTaskId) {
+        activation = { activated: false, reason: "COMMIT_RECOVERY_REQUIRED", commitTaskId: status.commitTaskId };
+    } else {
+        activation = activateNextTask(options);
+    }
+    const queue = getQueue(options);
+    return {
+        settled: !status.commitTaskId,
+        controlRoomTitle: titleForControlRoom(),
+        processed,
+        completion,
+        activation,
+        queue: queue.queue
+    };
 }
 
 module.exports = {
@@ -1832,7 +1877,8 @@ module.exports = {
     recoverCommit,
     registerTask,
     resumeTask,
+    settleProject,
     submitEvent,
-    titleForCoordinator,
+    titleForControlRoom,
     titleForTask
 };

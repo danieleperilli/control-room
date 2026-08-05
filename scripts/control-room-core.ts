@@ -1767,16 +1767,32 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
 }
 
 /**
- * Read the project snapshot or one task without changing state.
+ * Read the project snapshot, one task, or the role of one Codex thread without changing state.
  * @param options Project and optional state-root settings.
  * @param taskId Optional task identifier to select.
+ * @param threadId Optional Codex thread identifier to resolve.
  */
-function getStatus(options: IControlRoomOptions, taskId?: string): Record<string, unknown> {
+function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: string): Record<string, unknown> {
+    assertCondition(!(taskId && threadId), "Status accepts either a task ID or a thread ID, not both.");
+    const validThreadId = threadId ? validateThreadId(threadId) : null;
     const store = openStore(options);
     try {
         const project = requireProject(store);
         if (taskId) {
             return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), task: serializeTask(requireTask(store, taskId)) };
+        }
+        if (validThreadId) {
+            if (validThreadId === project.coordinator_thread_id) {
+                return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
+            }
+            const task = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.thread_id = ?`).get(validThreadId) as ITaskRow | undefined;
+            return {
+                projectRoot: store.projectRoot,
+                controlRoomTitle: titleForControlRoom(),
+                controlRoomThreadId: project.coordinator_thread_id,
+                role: task ? "WORKER" : "UNREGISTERED",
+                task: task ? serializeTask(task) : null
+            };
         }
         const counts = store.database.prepare("SELECT state, COUNT(*) AS count FROM tasks GROUP BY state ORDER BY state").all() as Array<{ state: TaskState; count: number }>;
         const stateCounts: Record<string, number> = {};
@@ -1822,6 +1838,49 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
 }
 
 /**
+ * Add one serialized task title to a deduplicated settlement update map.
+ * @param updates Title updates keyed by Codex thread ID.
+ * @param task Serialized task candidate.
+ */
+function addSettlementTitleUpdate(updates: Map<string, ITitleUpdate>, task: unknown): void {
+    if (!task || typeof task !== "object") {
+        return;
+    }
+    const candidate = task as Record<string, unknown>;
+    if (typeof candidate.taskId !== "string" || typeof candidate.threadId !== "string" || typeof candidate.title !== "string") {
+        return;
+    }
+    updates.set(candidate.threadId, {
+        taskId: candidate.taskId,
+        threadId: candidate.threadId,
+        title: candidate.title
+    });
+}
+
+/**
+ * Collect every final title that the caller must apply after settlement.
+ * @param processed Processed event batch.
+ * @param queue Final active queue snapshot.
+ * @param completion Optional approval completion result.
+ */
+function collectSettlementTitleUpdates(processed: Record<string, unknown>, queue: Record<string, unknown>[], completion: Record<string, unknown> | null): ITitleUpdate[] {
+    const updates = new Map<string, ITitleUpdate>();
+    const results = Array.isArray(processed.results) ? processed.results : [];
+    for (const result of results) {
+        if (result && typeof result === "object") {
+            addSettlementTitleUpdate(updates, (result as Record<string, unknown>).task);
+        }
+    }
+    for (const task of queue) {
+        addSettlementTitleUpdate(updates, task);
+    }
+    if (completion) {
+        addSettlementTitleUpdate(updates, completion.task);
+    }
+    return Array.from(updates.values());
+}
+
+/**
  * Process pending events, complete an approved task, and activate the next eligible task.
  * @param options Project and optional state-root settings.
  */
@@ -1830,6 +1889,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
     let status = getStatus(options);
     if (status.commitTaskId) {
         const queue = getQueue(options);
+        const activeQueue = queue.queue as Record<string, unknown>[];
         return {
             settled: false,
             reason: "COMMIT_RECOVERY_REQUIRED",
@@ -1838,7 +1898,8 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
             processed,
             completion: null,
             activation: null,
-            queue: queue.queue
+            queue: activeQueue,
+            titleUpdates: collectSettlementTitleUpdates(processed, activeQueue, null)
         };
     }
     const stateCounts = status.stateCounts as Record<string, number>;
@@ -1857,13 +1918,15 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         activation = activateNextTask(options);
     }
     const queue = getQueue(options);
+    const activeQueue = queue.queue as Record<string, unknown>[];
     return {
         settled: !status.commitTaskId,
         controlRoomTitle: titleForControlRoom(),
         processed,
         completion,
         activation,
-        queue: queue.queue
+        queue: activeQueue,
+        titleUpdates: collectSettlementTitleUpdates(processed, activeQueue, completion)
     };
 }
 

@@ -32,7 +32,23 @@ If project initialization fails after task creation, archive the new task and su
 
 When the created task receives the internal `$control-room console` prompt, do not run `init`, register it as a worker, or start background work. Explain that the task is an optional manual console: it does not process routine events or receive wake notifications, but the user can use it to inspect or reorder the queue, manage dependencies, and perform recovery. End that response with the same command list returned by CLI `help` under a concise `Commands` heading. Put nothing after the list.
 
-If a worker is used before initialization, tell the user to run `$control-room init` from any top-level Local task.
+## Register project workers automatically
+
+At the start of the first substantive turn in a top-level Local task, or whenever its ControlRoom identity is absent after compaction:
+
+1. Preserve the complete user message.
+2. Resolve the canonical Git root and trusted current thread ID. Skip subagents, side chats, linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`.
+3. Run:
+
+   ```bash
+   node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> --thread-id <current-thread-id>
+   ```
+
+4. If the project is not initialized, continue without registration or commentary. Mention initialization only when the user explicitly invokes a ControlRoom command.
+5. If the result role is `CONTROL_ROOM` or `WORKER`, keep the recorded identity unchanged.
+6. If it returns `UNREGISTERED`, derive a short semantic name from the substantive request, run `register`, apply its `PLANNING` title, and continue the complete original request in the same turn.
+
+Automatic registration never enqueues the task, creates a branch, or modifies files. Do not change global or project `AGENTS.md`; initialization state in SQLite is the scope switch. Keep `$control-room join` as an idempotent fallback for explicit adoption.
 
 ## Use global read commands
 
@@ -84,7 +100,7 @@ Use every returned title exactly:
 
 The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. Persist only numeric `queue_position` and the undecorated semantic name.
 
-After every settlement, apply the title of every task in the returned final `queue`, plus any completed or canceled task returned outside that queue. This final snapshot guarantees that enqueueing, moving, activation, blocking, resumption, cancellation, and completion immediately renumber every remaining queued title.
+After every settlement, apply the title of every task in the returned final `queue`, plus any completed or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A `DONE` task must receive its returned `🟢` title even though it is absent from the final queue. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that enqueueing, moving, activation, blocking, resumption, cancellation, and completion immediately renumber every remaining queued title.
 
 When controlling Chrome for a worker, name the browser session or tab group `🤖 <T_ID>`, such as `🤖 T0001`.
 
@@ -117,7 +133,7 @@ node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 
 Do not message or wake the Control Room task. Settlement processes every pending event, completes an approved task, activates the next eligible task when the project is idle, and returns the final active queue.
 
-Apply all returned titles silently. If `activation.activated` is true, send its `executionBrief` directly to the target worker; if that worker is the caller, continue locally without a background message. Surface rejected events, blockers, commit recovery, and user-action requirements. Routine success needs at most one concise acknowledgement.
+Apply all returned `titleUpdates` silently before sending any activation brief or final response. If `activation.activated` is true, send its `executionBrief` directly to the target worker; if that worker is the caller, continue locally without a background message. Surface rejected events, blockers, commit recovery, title synchronization failures, and user-action requirements. Routine success needs at most one concise acknowledgement.
 
 When a task in `REVIEW` receives a direct request for additional implementation or file changes, submit `REWORK_REQUESTED` and settle before editing. Continue on the existing checkout and branch after the returned state is `RUNNING`. Questions, explanations, status requests, and read-only inspections do not restart the task. Submit and settle `REVIEW_REQUESTED` again when the revision is ready.
 

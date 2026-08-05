@@ -5,6 +5,7 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 ## What it does
 
 - Assigns project-scoped task IDs such as `T0001`.
+- Automatically registers new substantive Local tasks after project initialization.
 - Keeps planned work separate from active implementation.
 - Queues tasks in a deterministic order with optional dependencies.
 - Allows only one task at a time to run, wait for review, or await its approval commit.
@@ -83,9 +84,11 @@ Initialization does not create a commit. In a new repository, the first activate
 
 The Control Room console does not receive a `T_ID` and must not be used for planning or implementation. You can open it manually to inspect or reorder the queue, manage dependencies with explicit task IDs, or perform recovery.
 
-Use a separate top-level Codex task in **Local** mode to discuss and plan each change. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
+Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, ControlRoom automatically registers it on its first substantive prompt, assigns a `T_ID`, derives its semantic name, and leaves it in planning. This scope comes from the project's SQLite state; no additional `AGENTS.md` change is required. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
 
-An existing top-level task can also join the initialized project. Send:
+Automatic registration does not run for the manual Control Room console, subagents, side chats, `$control-room init`, `$control-room queue`, or `$control-room help`. Outside initialized projects it does nothing.
+
+If automatic registration did not run, an existing top-level task can still join explicitly:
 
 ```text
 $control-room join
@@ -110,7 +113,7 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | Command | Result |
 | --- | --- |
 | `$control-room init` | Initialize the project and create a separate manual `⚫️ Control Room` console. |
-| `$control-room join` | Register an existing top-level task in planning without queueing it. |
+| `$control-room join` | Explicitly register an existing top-level task when automatic registration did not run. |
 | `$control-room queue` | Show the current ordered queue from any task in the initialized Local project. |
 | `$control-room help` | Show the available user commands from any task. |
 | `Enqueue` | Add or update the current task at the end of the queue. |
@@ -152,7 +155,7 @@ ControlRoom uses task titles as the normal status display and keeps routine orch
 - Additional operational messages appear only when an error, blocker, recovery step, or user action needs attention.
 - `Status` and `Queue status` show details only when requested.
 
-The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, completes an approved task, activates the next eligible worker, and returns the final queue in the same turn. No wake or routine message is sent to `⚫️ Control Room`.
+The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, completes an approved task, activates the next eligible worker, and returns one mandatory `titleUpdates` list in the same turn. Codex applies every entry before replying, including the green title for a completed task and the renumbered titles of all remaining queued tasks. No wake or routine message is sent to `⚫️ Control Room`.
 
 ## Example usage
 
@@ -164,15 +167,11 @@ ControlRoom leaves that task unchanged and creates a separate `⚫️ Control Ro
 
 Routine queue work happens directly in worker tasks. The console runs only when you open it and send a command.
 
-You can start a dedicated top-level task with a normal planning prompt:
+You can then start a dedicated top-level Local task with a normal planning prompt:
 
 > Add an audit log for changes to user permissions. First inspect the current authorization flow, identify the files involved, and propose an implementation plan. Do not modify files yet.
 
-If this task already existed before ControlRoom was initialized, adopt it:
-
-> $control-room join
-
-For example, ControlRoom may rename it `⚪️ T0001 - Add permission audit log`. It remains in planning.
+ControlRoom automatically registers it and may rename it `⚪️ T0001 - Add permission audit log`. It remains in planning. `$control-room join` remains available as a fallback.
 
 After reviewing the plan, queue the task:
 
@@ -224,7 +223,7 @@ ControlRoom keeps task titles synchronized with their state:
 
 Blocked and canceled tasks use the same `❌` status icon.
 
-The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot, and Codex reapplies all of its titles. Therefore activation, moving, blocking, resuming, cancellation, or completion renumbers every remaining queued task automatically.
+The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` list. Codex applies the list before reporting success, including terminal tasks that no longer appear in the queue. Therefore activation, moving, blocking, resuming, cancellation, or completion renumbers every remaining queued task automatically and changes `DONE` to `🟢`.
 
 ## Typical workflow
 

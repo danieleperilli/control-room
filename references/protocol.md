@@ -46,6 +46,16 @@ The initial console turn explains that the task is a manual, optional control su
 
 If CLI initialization fails after task creation, archive the new task and report the error. A different registered Control Room task or base branch must fail rather than be replaced.
 
+After initialization, resolve the role of a top-level Local task on its first substantive turn:
+
+```bash
+node <skill-dir>/scripts/control-room.ts status \
+    --project-root <canonical-root> \
+    --thread-id <current-thread-id>
+```
+
+The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. Register only `UNREGISTERED` tasks, derive their semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. This uses the existing skill-loading rule unchanged; SQLite initialization is the project-scoped switch.
+
 `$control-room join` remains a worker operation. It registers the current existing top-level task:
 
 ```bash
@@ -128,7 +138,7 @@ Settlement performs the normal operational sequence:
 3. If the project has no `RUNNING`, `REVIEW`, or `APPROVED` task, activate the first dependency-eligible queued task.
 4. Return the final active queue.
 
-The caller applies every title in the returned `queue`. This deliberately refreshes all active task titles, so any enqueue, move, activation, block, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. Apply completed or canceled task titles from `completion.task` or processed event results because those tasks are absent from the final queue.
+Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so any enqueue, move, activation, block, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes completed and canceled tasks that are absent from the final queue; in particular, `DONE` must be synchronized to its returned `🟢` title. Retry one failed title operation once, then surface the exact failure.
 
 When `activation.activated` is true, send `activation.executionBrief` directly to its worker. Do not route it through the manual console. If the activated worker is the caller, continue there without sending a background message.
 
@@ -150,6 +160,7 @@ Read state from any task:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts status --project-root <root> --task T0001
+node <skill-dir>/scripts/control-room.ts status --project-root <root> --thread-id <thread-id>
 node <skill-dir>/scripts/control-room.ts queue --project-root <root>
 ```
 

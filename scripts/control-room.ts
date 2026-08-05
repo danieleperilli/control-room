@@ -120,7 +120,7 @@ Commands:
   recover-commit --project-root ROOT --task T0001 [--state-root PATH]
   resume --project-root ROOT --task T0001 [--state-root PATH]
   commit-approved --project-root ROOT --task T0001 [--state-root PATH]
-  status --project-root ROOT [--task T0001] [--state-root PATH]
+  status --project-root ROOT [--task T0001 | --thread-id ID] [--state-root PATH]
   queue --project-root ROOT [--state-root PATH]
 `);
 }
@@ -233,8 +233,11 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         return core.commitApprovedTask(buildOptions(values), requireOption(values, "task"));
     }
     if (parsed.command === "status") {
-        validateOptions(values, ["project-root", "task", "state-root"]);
-        return core.getStatus(buildOptions(values), values.task);
+        validateOptions(values, ["project-root", "task", "thread-id", "state-root"]);
+        if (values.task && values["thread-id"]) {
+            throw new Error("status accepts either --task or --thread-id, not both.");
+        }
+        return core.getStatus(buildOptions(values), values.task, values["thread-id"]);
     }
     if (parsed.command === "queue") {
         validateOptions(values, ["project-root", "state-root"]);

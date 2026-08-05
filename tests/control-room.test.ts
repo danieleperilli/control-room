@@ -192,6 +192,28 @@ test("allocates four-digit task IDs and preserves IDs across registration retrie
     );
 });
 
+test("resolves Control Room, registered worker, and unregistered thread roles", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "Build queue");
+
+    const controlRoom = core.getStatus(options, undefined, "control-room-thread");
+    const worker = core.getStatus(options, undefined, "thread-one");
+    const unregistered = core.getStatus(options, undefined, "new-thread");
+    assert.equal(controlRoom.role, "CONTROL_ROOM");
+    assert.equal(controlRoom.task, null);
+    assert.equal(worker.role, "WORKER");
+    assert.equal(worker.task.taskId, "T0001");
+    assert.equal(unregistered.role, "UNREGISTERED");
+    assert.equal(unregistered.task, null);
+
+    const cliResult = runCli(["status", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--thread-id", "new-thread"]);
+    assert.equal(cliResult.status, 0, cliResult.stderr || cliResult.stdout);
+    assert.equal(JSON.parse(cliResult.stdout).role, "UNREGISTERED");
+    assert.throws(() => core.getStatus(options, "T0001", "thread-one"), /either a task ID or a thread ID/);
+});
+
 test("returns the user command list for the created Control Room console", () => {
     const fixture = createFixture();
     const argumentsList = [
@@ -413,6 +435,11 @@ test("settles worker events directly and returns the fully renumbered queue", ()
         "⭕️ ① T0002 - Task 2",
         "⭕️ ② T0003 - Task 3"
     ]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), [
+        "🔴 T0001 - Task 1",
+        "⭕️ ① T0002 - Task 2",
+        "⭕️ ② T0003 - Task 3"
+    ]);
 
     const retry = core.settleProject(options);
     assert.equal(retry.processed.processedCount, 0);
@@ -442,6 +469,10 @@ test("settlement commits an approved task and activates the next worker", () => 
     assert.equal(settled.activation.activated, true);
     assert.equal(settled.activation.task.taskId, "T0002");
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Task 2"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), [
+        "🟢 T0001 - Task 1",
+        "🔴 T0002 - Task 2"
+    ]);
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Add settled workflow coverage");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
 });
@@ -1016,4 +1047,14 @@ test("documents init as creation of a silent manual Control Room task", () => {
     assert.match(skillText, /Leave the calling task unchanged and unregistered/);
     assert.match(skillText, /does not process routine events or receive wake notifications/);
     assert.match(skillText, /apply the title of every task in the returned final `queue`/);
+});
+
+test("documents project-scoped automatic registration and mandatory title synchronization", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    assert.match(skillText, /status --project-root <canonical-root> --thread-id <current-thread-id>/);
+    assert.match(skillText, /If it returns `UNREGISTERED`, derive a short semantic name/);
+    assert.match(skillText, /If the project is not initialized, continue without registration or commentary/);
+    assert.match(skillText, /Do not change global or project `AGENTS\.md`/);
+    assert.match(skillText, /Apply every `titleUpdates` entry with the Codex app title tool before sending the final response/);
+    assert.match(skillText, /A `DONE` task must receive its returned `🟢` title/);
 });

@@ -103,6 +103,7 @@ const TASK_WITH_QUEUED_POSITION_SELECT = `
     FROM tasks AS task
 `;
 const GIT_MODE = "local-approval-commit";
+const ROUTING_FILE_LIMIT_BYTES = 1024 * 1024;
 
 /**
  * Reject an invalid condition with a stable error message.
@@ -355,6 +356,70 @@ function pathIsSymbolicLink(targetPath: string): boolean {
 }
 
 /**
+ * Resolve the active Codex home directory.
+ */
+function resolveCodexHome(): string {
+    return process.env.CODEX_HOME ? path.resolve(process.env.CODEX_HOME) : path.join(os.homedir(), ".codex");
+}
+
+/**
+ * Validate one existing instruction file before reading or replacing it.
+ * @param agentsPath Absolute instruction file path.
+ */
+function validateAgentsFile(agentsPath: string): void {
+    const fileStatus = fs.lstatSync(agentsPath);
+    assertCondition(!fileStatus.isSymbolicLink(), `Codex instruction file cannot be a symbolic link: ${agentsPath}`);
+    assertCondition(fileStatus.isFile(), `Codex instruction path is not a file: ${agentsPath}`);
+    assertCondition(fileStatus.size <= ROUTING_FILE_LIMIT_BYTES, `Codex instruction file exceeds ${ROUTING_FILE_LIMIT_BYTES} bytes: ${agentsPath}`);
+}
+
+/**
+ * Resolve the active instruction file in the project Git root.
+ * @param projectRoot Canonical project Git root.
+ */
+function resolveProjectAgentsPath(projectRoot: string): string {
+    const overridePath = path.join(projectRoot, "AGENTS.override.md");
+    if (fs.existsSync(overridePath)) {
+        validateAgentsFile(overridePath);
+        if (fs.readFileSync(overridePath, "utf8").trim().length > 0) {
+            return overridePath;
+        }
+    }
+    const agentsPath = path.join(projectRoot, "AGENTS.md");
+    if (fs.existsSync(agentsPath)) {
+        validateAgentsFile(agentsPath);
+    }
+    return agentsPath;
+}
+
+/**
+ * Atomically replace one Codex instruction file.
+ * @param agentsPath Absolute instruction file path.
+ * @param content Complete replacement content.
+ */
+function writeAgentsFileAtomically(agentsPath: string, content: string): void {
+    const existingMode = fs.existsSync(agentsPath) ? fs.lstatSync(agentsPath).mode & 0o777 : 0o644;
+    const temporaryPath = path.join(path.dirname(agentsPath), `.${path.basename(agentsPath)}.control-room-${process.pid}-${nodeCrypto.randomBytes(6).toString("hex")}.tmp`);
+    let descriptor: number | null = null;
+    try {
+        descriptor = fs.openSync(temporaryPath, "wx", existingMode);
+        fs.writeFileSync(descriptor, content, "utf8");
+        fs.fsyncSync(descriptor);
+        fs.closeSync(descriptor);
+        descriptor = null;
+        fs.renameSync(temporaryPath, agentsPath);
+    } catch (error) {
+        if (descriptor !== null) {
+            fs.closeSync(descriptor);
+        }
+        if (fs.existsSync(temporaryPath)) {
+            fs.unlinkSync(temporaryPath);
+        }
+        throw error;
+    }
+}
+
+/**
  * Determine whether a SQLite table contains a named column.
  * @param database Open SQLite database.
  * @param tableName Fixed internal table name.
@@ -516,7 +581,7 @@ function initializeSchema(database: any): void {
  */
 function openStore(options: IControlRoomOptions): IStore {
     const projectRoot = canonicalizeProjectRoot(options.projectRoot);
-    const codexHome = process.env.CODEX_HOME ? path.resolve(process.env.CODEX_HOME) : path.join(os.homedir(), ".codex");
+    const codexHome = resolveCodexHome();
     const stateRoot = options.stateRoot ? path.resolve(options.stateRoot) : path.join(codexHome, "control-room", "projects");
     const projectKey = nodeCrypto.createHash("sha256").update(projectRoot).digest("hex").slice(0, 24);
     const projectDirectory = path.join(stateRoot, projectKey);
@@ -715,6 +780,61 @@ function initializeProject(options: IControlRoomOptions, controlRoomThreadId: st
     } finally {
         store.database.close();
     }
+}
+
+/**
+ * Install one idempotent ControlRoom rule in the project instruction file.
+ * @param options Project and optional state-root settings.
+ */
+function installProjectRouting(options: IControlRoomOptions): Record<string, unknown> {
+    const store = openStore(options);
+    let projectRoot: string;
+    try {
+        requireProject(store);
+        projectRoot = store.projectRoot;
+    } finally {
+        store.database.close();
+    }
+    const agentsPath = resolveProjectAgentsPath(projectRoot);
+    const existingContent = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, "utf8") : "";
+    const startMarker = "<!-- control-room:start -->";
+    const endMarker = "<!-- control-room:end -->";
+    const routingBlock = [
+        startMarker,
+        "# ControlRoom project routing",
+        "",
+        "- In every top-level task for this project, load and follow `$control-room` before handling each user message.",
+        "- Apply every ControlRoom task title update before replying.",
+        "- Do not apply ControlRoom to subagents or side chats.",
+        endMarker
+    ].join("\n");
+    const startIndex = existingContent.indexOf(startMarker);
+    const endIndex = existingContent.indexOf(endMarker);
+    assertCondition((startIndex < 0) === (endIndex < 0), `ControlRoom routing block is malformed in ${agentsPath}.`);
+    assertCondition(startIndex < 0 || existingContent.indexOf(startMarker, startIndex + startMarker.length) < 0, `ControlRoom routing block is duplicated in ${agentsPath}.`);
+    assertCondition(endIndex < 0 || existingContent.indexOf(endMarker, endIndex + endMarker.length) < 0, `ControlRoom routing block is duplicated in ${agentsPath}.`);
+    let updatedContent: string;
+    if (startIndex < 0) {
+        updatedContent = existingContent.length > 0 ? `${routingBlock}\n\n${existingContent}` : `${routingBlock}\n`;
+    } else {
+        assertCondition(startIndex < endIndex, `ControlRoom routing block is malformed in ${agentsPath}.`);
+        const blockEnd = endIndex + endMarker.length;
+        updatedContent = `${existingContent.slice(0, startIndex)}${routingBlock}${existingContent.slice(blockEnd)}`;
+        if (!updatedContent.endsWith("\n")) {
+            updatedContent += "\n";
+        }
+    }
+    assertCondition(Buffer.byteLength(updatedContent, "utf8") <= ROUTING_FILE_LIMIT_BYTES, `Codex instruction file exceeds ${ROUTING_FILE_LIMIT_BYTES} bytes after routing installation: ${agentsPath}`);
+    const updated = updatedContent !== existingContent;
+    if (updated) {
+        writeAgentsFileAtomically(agentsPath, updatedContent);
+    }
+    return {
+        installed: true,
+        updated,
+        projectRoot,
+        agentsPath
+    };
 }
 
 /**
@@ -1936,6 +2056,7 @@ module.exports = {
     getQueue,
     getStatus,
     initializeProject,
+    installProjectRouting,
     processPendingEvents,
     recoverCommit,
     registerTask,

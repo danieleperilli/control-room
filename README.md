@@ -35,13 +35,7 @@ Install or link this repository as the global `control-room` skill under:
 ${CODEX_HOME:-~/.codex}/skills/control-room
 ```
 
-Add this minimal routing rule to your global `AGENTS.md`:
-
-```markdown
-For every top-level Codex project task, load and follow `$control-room`. Do not apply it to subagents or side chats.
-```
-
-Keep the detailed workflow in the skill rather than copying it into `AGENTS.md`.
+Do not add a generic all-project rule. `$control-room init` installs one managed routing block in the active `AGENTS.md` or `AGENTS.override.md` at the initialized repository's Git root. Global Codex instructions are never modified.
 
 ### Allow ControlRoom operations without approval prompts
 
@@ -66,7 +60,7 @@ prefix_rule(
 
 Restart Codex after creating or changing the rule. If Codex invokes a different Node executable or skill path, copy the exact command prefix shown in the approval dialog. Do not use a broad rule such as `pattern = ["node"]`.
 
-This exception covers every ControlRoom subcommand, including the approval-only commit. It does not authorize unrelated Node scripts or commands. Because `commit-approved` can stage and commit the current working tree, use this rule only when you trust the ControlRoom workflow.
+This exception covers every ControlRoom subcommand, including project-specific routing installation and the approval-only commit. It does not authorize unrelated Node scripts or commands. Because `install-routing` updates the active project instruction file and `commit-approved` can stage and commit the current working tree, use this rule only when you trust the ControlRoom workflow.
 
 ## Use ControlRoom
 
@@ -78,15 +72,19 @@ $control-room init
 
 ControlRoom leaves the current task unchanged and creates a separate Local task named `⚫️ Control Room`. That task explains the available commands and acts only as an optional manual console. It does not process events in the background or receive routine notifications.
 
-The project records the current Local checkout and checked-out Git branch as its shared root and base branch. Running `$control-room init` again does not create a duplicate console or replace the registered one.
+The project records the current Local checkout and checked-out Git branch as its shared root and base branch. The deterministic `init` command also atomically prepends a managed block to the active instruction file in that Git root. The block forces new top-level tasks in this repository to load ControlRoom and apply all returned title updates; it explicitly excludes subagents and side chats. Running `$control-room init` again repairs or refreshes that block without creating a duplicate console.
 
-Initialization does not create a commit. In a new repository, the first activated task may start with files that are still untracked or otherwise uncommitted. They remain uncommitted through implementation and review; `Approve` creates the root commit, establishes the configured base branch, and removes the worker branch.
+If the local instruction file cannot be updated, initialization remains registered and reports a partial failure. Fix the reported permission or file-safety problem, then run `$control-room init` again. ControlRoom never changes the global `AGENTS.md`.
+
+Initialization does not create a commit. Its local instruction-file change remains uncommitted. In a new repository, the first activated task may also start with other files that are still untracked or otherwise uncommitted. They remain uncommitted through implementation and review; `Approve` creates the root commit, establishes the configured base branch, and removes the worker branch.
 
 The Control Room console does not receive a `T_ID` and must not be used for planning or implementation. You can open it manually to inspect or reorder the queue, manage dependencies with explicit task IDs, or perform recovery.
 
-Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, ControlRoom automatically registers it on its first substantive prompt, assigns a `T_ID`, derives its semantic name, and leaves it in planning. This scope comes from the project's SQLite state; no additional `AGENTS.md` change is required. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
+Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, the installed project-specific routing rule makes the task load ControlRoom on its first substantive prompt; ControlRoom assigns a `T_ID`, derives its semantic name, and leaves it in planning. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
 
 Automatic registration does not run for the manual Control Room console, subagents, side chats, `$control-room init`, `$control-room queue`, or `$control-room help`. Outside initialized projects it does nothing.
+
+Codex reads project instructions when a task run starts. Tasks opened before the routing block was installed may therefore still need `$control-room join`; newly started top-level tasks load the rule automatically.
 
 If automatic registration did not run, an existing top-level task can still join explicitly:
 

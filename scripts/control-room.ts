@@ -104,6 +104,7 @@ ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 
 Commands:
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
+  install-routing --project-root ROOT [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
   request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
@@ -138,14 +139,30 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     const core = require("./control-room-core.ts");
     if (parsed.command === "init") {
         validateOptions(values, ["project-root", "control-room-thread", "base-branch", "state-root"]);
+        const options = buildOptions(values);
+        const initialized = core.initializeProject(options, requireOption(values, "control-room-thread"), requireOption(values, "base-branch"));
+        let routing: Record<string, unknown>;
+        try {
+            routing = core.installProjectRouting(options);
+        } catch (error) {
+            routing = {
+                installed: false,
+                error: error instanceof Error ? error.message : String(error)
+            };
+        }
         return {
-            ...core.initializeProject(buildOptions(values), requireOption(values, "control-room-thread"), requireOption(values, "base-branch")),
+            ...initialized,
+            routing,
             userCommands: USER_COMMANDS
         };
     }
     if (parsed.command === "register") {
         validateOptions(values, ["project-root", "thread-id", "name", "state-root"]);
         return core.registerTask(buildOptions(values), requireOption(values, "thread-id"), requireOption(values, "name"));
+    }
+    if (parsed.command === "install-routing") {
+        validateOptions(values, ["project-root", "state-root"]);
+        return core.installProjectRouting(buildOptions(values));
     }
     if (parsed.command === "request-enqueue") {
         validateOptions(values, ["project-root", "task", "event-key", "after", "state-root"]);

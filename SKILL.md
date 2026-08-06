@@ -13,7 +13,7 @@ When the user sends `$control-room init` in a top-level project task:
 
 1. Require the Codex **Local** environment and the repository's primary checkout. Never create a worktree.
 2. Resolve the canonical Git root and current branch. Accept an unborn branch; initialization must not create a commit.
-3. Run `status`. If the project is already initialized, do not create another Control Room task or rename the caller. Return a concise acknowledgement with the existing `controlRoomThreadId`.
+3. Run `status`. If the project is already initialized, run `install-routing`, do not create another Control Room task or rename the caller, and return a concise acknowledgement with the existing `controlRoomThreadId`.
 4. Require the Codex app thread tools, list projects, and identify the saved project for the canonical root. Fail explicitly if it cannot be resolved.
 5. Create one top-level task in that project with the **Local** environment and the initial prompt `$control-room console`. The user's `init` command explicitly authorizes this task creation.
 6. Use the returned thread ID to run:
@@ -25,10 +25,11 @@ When the user sends `$control-room init` in a top-level project task:
        --base-branch <current-branch>
    ```
 
-7. Set the created task title to the returned `controlRoomTitle`, always `⚫️ Control Room`, wait for its initial turn, and emit the app's created-task directive in the caller.
-8. Leave the calling task unchanged and unregistered. Never assign the Control Room task a `T_ID`.
+7. Require `routing.installed: true` in the `init` result. If it is false, report `routing.error` as partial initialization; use the standalone `install-routing` command only to repair an existing project.
+8. Set the created task title to the returned `controlRoomTitle`, always `⚫️ Control Room`, wait for its initial turn, and emit the app's created-task directive in the caller.
+9. Leave the calling task unchanged and unregistered. Never assign the Control Room task a `T_ID`.
 
-If project initialization fails after task creation, archive the new task and surface the error. Never retain or silently replace a different registered Control Room task.
+If database initialization fails after task creation, archive the new task and surface the error. If routing installation fails after database initialization succeeds, keep the registered Control Room task, report the partial initialization, and tell the user to retry `$control-room init`; the retry repairs routing without creating another task. Never retain or silently replace a different registered Control Room task.
 
 When the created task receives the internal `$control-room console` prompt, do not run `init`, register it as a worker, or start background work. Explain that the task is an optional manual console: it does not process routine events or receive wake notifications, but the user can use it to inspect or reorder the queue, manage dependencies, and perform recovery. End that response with the same command list returned by CLI `help` under a concise `Commands` heading. Put nothing after the list.
 
@@ -48,7 +49,7 @@ At the start of the first substantive turn in a top-level Local task, or wheneve
 5. If the result role is `CONTROL_ROOM` or `WORKER`, keep the recorded identity unchanged.
 6. If it returns `UNREGISTERED`, derive a short semantic name from the substantive request, run `register`, apply its `PLANNING` title, and continue the complete original request in the same turn.
 
-Automatic registration never enqueues the task, creates a branch, or modifies files. Do not change global or project `AGENTS.md`; initialization state in SQLite is the scope switch. Keep `$control-room join` as an idempotent fallback for explicit adoption.
+Automatic registration never enqueues the task, creates a branch, or modifies project files. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
 
 ## Use global read commands
 

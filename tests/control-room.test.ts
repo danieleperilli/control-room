@@ -36,10 +36,12 @@ function runGit(repositoryRoot: string, argumentsList: string[]): string {
 /**
  * Run the deterministic ControlRoom CLI in a separate process.
  * @param argumentsList CLI command and options.
+ * @param environment Additional environment variables for the child process.
  */
-function runCli(argumentsList: string[]) {
+function runCli(argumentsList: string[], environment: Record<string, string> = {}) {
     return childProcess.spawnSync(process.execPath, [path.join(__dirname, "..", "scripts", "control-room.ts"), ...argumentsList], {
         encoding: "utf8",
+        env: { ...process.env, ...environment },
         shell: false
     });
 }
@@ -100,6 +102,7 @@ function initializeFixture(fixture: IFixture): string {
 
 test("initializes and completes the first task in a repository without commits", () => {
     const fixture = createUnbornFixture();
+    const codexHome = path.join(path.dirname(fixture.stateRoot), "codex-home");
     const initialized = runCli([
         "init",
         "--project-root",
@@ -110,12 +113,16 @@ test("initializes and completes the first task in a repository without commits",
         "control-room-thread",
         "--base-branch",
         "main"
-    ]);
+    ], { CODEX_HOME: codexHome });
     assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
     const initializationResult = JSON.parse(initialized.stdout);
     const databasePath = initializationResult.databasePath;
     assert.equal(initializationResult.controlRoomTitle, "⚫️ Control Room");
     assert.equal(initializationResult.baseCommit, null);
+    assert.equal(initializationResult.routing.installed, true);
+    assert.equal(initializationResult.routing.agentsPath, path.join(fs.realpathSync(fixture.repositoryRoot), "AGENTS.md"));
+    assert.match(fs.readFileSync(path.join(fixture.repositoryRoot, "AGENTS.md"), "utf8"), /\$control-room/);
+    assert.equal(fs.statSync(path.join(fixture.repositoryRoot, "AGENTS.md")).mode & 0o777, 0o644);
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     assert.equal(core.getStatus(options).baseBranch, "main");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "0");
@@ -143,6 +150,7 @@ test("initializes and completes the first task in a repository without commits",
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Initialize project files");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:existing.txt"]), "present before activation");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:created.txt"]), "created while running");
+    assert.match(runGit(fixture.repositoryRoot, ["show", "HEAD:AGENTS.md"]), /\$control-room/);
     assert.equal(fs.existsSync(databasePath), true);
 });
 
@@ -216,6 +224,7 @@ test("resolves Control Room, registered worker, and unregistered thread roles", 
 
 test("returns the user command list for the created Control Room console", () => {
     const fixture = createFixture();
+    const codexHome = path.join(path.dirname(fixture.stateRoot), "codex-home");
     const argumentsList = [
         "init",
         "--project-root",
@@ -227,10 +236,12 @@ test("returns the user command list for the created Control Room console", () =>
         "--base-branch",
         "main"
     ];
-    const initialized = runCli(argumentsList);
+    const initialized = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
     const result = JSON.parse(initialized.stdout);
     assert.equal(result.controlRoomTitle, "⚫️ Control Room");
+    assert.equal(result.routing.installed, true);
+    assert.equal(result.routing.updated, true);
     assert.deepEqual(result.userCommands, [
         "$control-room init",
         "$control-room join",
@@ -241,13 +252,132 @@ test("returns the user command list for the created Control Room console", () =>
         "Depends on T0002 | Remove dependency T0002",
         "Approve | Cancel | Status | Queue status"
     ]);
-    const retry = runCli(argumentsList);
+    const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
     assert.equal(JSON.parse(retry.stdout).created, false);
+    assert.equal(JSON.parse(retry.stdout).routing.installed, true);
+    assert.equal(JSON.parse(retry.stdout).routing.updated, false);
     assert.deepEqual(JSON.parse(retry.stdout).userCommands, result.userCommands);
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     assert.match(skillText, /End that response with the same command list returned by CLI `help`/);
     assert.match(skillText, /Put nothing after the list/);
+});
+
+test("repairs local routing for a project initialized before routing support", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const codexHome = path.join(path.dirname(fixture.stateRoot), "codex-home");
+    const globalAgentsPath = path.join(codexHome, "AGENTS.md");
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(globalAgentsPath, "# Global instructions\n");
+
+    const repaired = runCli([
+        "init",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--control-room-thread",
+        "control-room-thread",
+        "--base-branch",
+        "main"
+    ], { CODEX_HOME: codexHome });
+    assert.equal(repaired.status, 0, repaired.stderr || repaired.stdout);
+    const result = JSON.parse(repaired.stdout);
+    assert.equal(result.created, false);
+    assert.equal(result.routing.installed, true);
+    assert.equal(result.routing.updated, true);
+    assert.match(fs.readFileSync(path.join(fixture.repositoryRoot, "AGENTS.md"), "utf8"), /\$control-room/);
+    assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
+});
+
+test("reports partial initialization when project routing cannot be installed", () => {
+    const fixture = createFixture();
+    const externalPath = path.join(path.dirname(fixture.stateRoot), "external-agents.md");
+    fs.writeFileSync(externalPath, "# External\n");
+    fs.symlinkSync(externalPath, path.join(fixture.repositoryRoot, "AGENTS.md"));
+
+    const initialized = runCli([
+        "init",
+        "--project-root",
+        fixture.repositoryRoot,
+        "--state-root",
+        fixture.stateRoot,
+        "--control-room-thread",
+        "control-room-thread",
+        "--base-branch",
+        "main"
+    ]);
+    assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
+    const result = JSON.parse(initialized.stdout);
+    assert.equal(result.created, true);
+    assert.equal(result.routing.installed, false);
+    assert.match(result.routing.error, /cannot be a symbolic link/);
+    assert.equal(core.getStatus({ projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot }).controlRoomThreadId, "control-room-thread");
+    assert.equal(fs.readFileSync(externalPath, "utf8"), "# External\n");
+});
+
+test("installs ControlRoom routing in project instructions without changing global instructions", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const codexHome = path.join(path.dirname(fixture.stateRoot), "codex-home");
+    fs.mkdirSync(codexHome);
+    const globalAgentsPath = path.join(codexHome, "AGENTS.md");
+    const agentsPath = path.join(fixture.repositoryRoot, "AGENTS.md");
+    fs.writeFileSync(globalAgentsPath, "# Global instructions\n");
+    fs.writeFileSync(agentsPath, "# Existing instructions\n\n- Preserve this rule.\n");
+    const argumentsList = ["install-routing", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot];
+
+    const installed = runCli(argumentsList, { CODEX_HOME: codexHome });
+    assert.equal(installed.status, 0, installed.stderr || installed.stdout);
+    const result = JSON.parse(installed.stdout);
+    const agentsContent = fs.readFileSync(agentsPath, "utf8");
+    assert.equal(result.updated, true);
+    assert.equal(result.agentsPath, path.join(fs.realpathSync(fixture.repositoryRoot), "AGENTS.md"));
+    assert.equal(agentsContent.startsWith("<!-- control-room:start -->"), true);
+    assert.match(agentsContent, /# Existing instructions/);
+    assert.match(agentsContent, /load and follow `\$control-room` before handling each user message/);
+    assert.match(agentsContent, /Apply every ControlRoom task title update before replying/);
+    assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
+    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? AGENTS.md");
+
+    const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
+    assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+    assert.equal(JSON.parse(retry.stdout).updated, false);
+    assert.equal(fs.readFileSync(agentsPath, "utf8"), agentsContent);
+    assert.equal((agentsContent.match(/<!-- control-room:start -->/g) || []).length, 1);
+});
+
+test("uses the active project override and rejects project instruction symlinks", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const codexHome = path.join(path.dirname(fixture.stateRoot), "codex-home");
+    fs.mkdirSync(codexHome);
+    const globalAgentsPath = path.join(codexHome, "AGENTS.md");
+    const agentsPath = path.join(fixture.repositoryRoot, "AGENTS.md");
+    const overridePath = path.join(fixture.repositoryRoot, "AGENTS.override.md");
+    fs.writeFileSync(globalAgentsPath, "# Global instructions\n");
+    fs.writeFileSync(agentsPath, "# Base instructions\n");
+    fs.writeFileSync(overridePath, "# Active override\n");
+    const argumentsList = ["install-routing", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot];
+
+    const installed = runCli(argumentsList, { CODEX_HOME: codexHome });
+    assert.equal(installed.status, 0, installed.stderr || installed.stdout);
+    assert.equal(JSON.parse(installed.stdout).agentsPath, path.join(fs.realpathSync(fixture.repositoryRoot), "AGENTS.override.md"));
+    assert.equal(fs.readFileSync(agentsPath, "utf8"), "# Base instructions\n");
+    assert.match(fs.readFileSync(overridePath, "utf8"), /\$control-room/);
+    assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
+
+    const unsafeFixture = createFixture();
+    initializeFixture(unsafeFixture);
+    const externalPath = path.join(path.dirname(unsafeFixture.stateRoot), "external-agents.md");
+    fs.writeFileSync(externalPath, "# External\n");
+    fs.symlinkSync(externalPath, path.join(unsafeFixture.repositoryRoot, "AGENTS.md"));
+    const unsafeArguments = ["install-routing", "--project-root", unsafeFixture.repositoryRoot, "--state-root", unsafeFixture.stateRoot];
+    const rejected = runCli(unsafeArguments, { CODEX_HOME: codexHome });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /cannot be a symbolic link/);
+    assert.equal(fs.readFileSync(externalPath, "utf8"), "# External\n");
 });
 
 test("uses the failure icon for blocked and canceled task titles", () => {
@@ -1046,6 +1176,7 @@ test("documents init as creation of a silent manual Control Room task", () => {
     assert.match(skillText, /initial prompt `\$control-room console`/);
     assert.match(skillText, /Leave the calling task unchanged and unregistered/);
     assert.match(skillText, /does not process routine events or receive wake notifications/);
+    assert.match(skillText, /Require `routing\.installed: true` in the `init` result/);
     assert.match(skillText, /apply the title of every task in the returned final `queue`/);
 });
 
@@ -1054,7 +1185,8 @@ test("documents project-scoped automatic registration and mandatory title synchr
     assert.match(skillText, /status --project-root <canonical-root> --thread-id <current-thread-id>/);
     assert.match(skillText, /If it returns `UNREGISTERED`, derive a short semantic name/);
     assert.match(skillText, /If the project is not initialized, continue without registration or commentary/);
-    assert.match(skillText, /Do not change global or project `AGENTS\.md`/);
+    assert.match(skillText, /active `AGENTS\.md` or `AGENTS\.override\.md` at the project Git root/);
+    assert.match(skillText, /Never modify global Codex instructions/);
     assert.match(skillText, /Apply every `titleUpdates` entry with the Codex app title tool before sending the final response/);
     assert.match(skillText, /A `DONE` task must receive its returned `🟢` title/);
 });

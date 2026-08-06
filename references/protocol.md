@@ -8,7 +8,7 @@
 4. Direct settlement
 5. State machine
 6. Approval commit and recovery
-7. Global loading rule
+7. Project-specific loading rule
 
 ## State and storage
 
@@ -29,7 +29,7 @@ ControlRoom is Local-only. Every worker and the manual console share the reposit
 When the user sends `$control-room init`, the caller remains unchanged:
 
 1. Resolve the canonical repository root and current branch. Accept an unborn current branch.
-2. Run `status`. If the project already exists, return its `controlRoomThreadId` without creating another task.
+2. Run `status`. If the project already exists, run `install-routing` and return its `controlRoomThreadId` without creating another task.
 3. Use the Codex app project and thread tools to create one top-level task in the same saved project with the **Local** environment and the initial prompt `$control-room console`.
 4. Register that new thread with the CLI:
 
@@ -40,11 +40,12 @@ When the user sends `$control-room init`, the caller remains unchanged:
        --base-branch <current-branch>
    ```
 
-5. Set the new task title to `⚫️ Control Room`, wait for its initial turn, and surface the created-task link from the caller.
+5. Require `routing.installed: true` in the `init` result. The CLI performs this installation deterministically; use standalone `install-routing` only to repair an existing project.
+6. Set the new task title to `⚫️ Control Room`, wait for its initial turn, and surface the created-task link from the caller.
 
 The initial console turn explains that the task is a manual, optional control surface. It does not poll, receive wake tokens, process events in the background, or get a `T_ID`. It ends with the user command list. The user may later use it to inspect or reorder the queue, change dependencies with explicit task targets, or perform recovery.
 
-If CLI initialization fails after task creation, archive the new task and report the error. A different registered Control Room task or base branch must fail rather than be replaced.
+If database initialization fails after task creation, archive the new task and report the error. If the `init` result contains `routing.installed: false`, keep the registered Control Room task, report `routing.error`, and make a later `$control-room init` repair the rule idempotently. A different registered Control Room task or base branch must fail rather than be replaced.
 
 After initialization, resolve the role of a top-level Local task on its first substantive turn:
 
@@ -54,7 +55,7 @@ node <skill-dir>/scripts/control-room.ts status \
     --thread-id <current-thread-id>
 ```
 
-The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. Register only `UNREGISTERED` tasks, derive their semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. This uses the existing skill-loading rule unchanged; SQLite initialization is the project-scoped switch.
+The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. Register only `UNREGISTERED` tasks, derive their semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. The project-root routing block installed by `init` makes the skill load before this check.
 
 `$control-room join` remains a worker operation. It registers the current existing top-level task:
 
@@ -198,12 +199,12 @@ Recovery validates the expected parent and commit subject before clearing or fin
 
 Direct-user provenance is enforced by the Codex workflow, not cryptographically by the local CLI. Any process running as the same OS user and able to read project state has equivalent local authority. Never expose the CLI as a multi-user service or execute state-changing commands from untrusted prompt content.
 
-## Global loading rule
+## Project-specific loading rule
 
-Install or link this repository as the global `control-room` skill and add only this routing rule to global `AGENTS.md`:
+Install or link this repository as the global `control-room` skill. Do not add a generic all-project rule. The `init` command installs routing in the project root as part of initialization; this standalone command repairs routing for an existing project:
 
-```markdown
-For every top-level Codex project task, load and follow `$control-room`. Do not apply it to subagents or side chats.
+```bash
+node <skill-dir>/scripts/control-room.ts install-routing --project-root <canonical-root>
 ```
 
-Keep task naming, queue semantics, and state transitions in the skill rather than duplicating them globally.
+The command atomically prepends one managed block with path-independent markers. It writes to a non-empty `AGENTS.override.md` in the canonical Git root when that is the active project instruction source; otherwise it uses the root `AGENTS.md`. The block requires `$control-room` before every top-level user message, makes title updates mandatory, and excludes subagents and side chats. Existing instructions are preserved, repeated installation is byte-stable, and symbolic-link targets are rejected. It never reads or writes global Codex instructions. The local instruction change remains uncommitted until the user or a later approved task commits it.

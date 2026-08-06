@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, queueing, dependencies, queue reordering, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; for every top-level project task after initialization; or when the user says Enqueue, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
+description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; for every top-level project task after initialization; or when the user says Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
 ---
 
 # ControlRoom
@@ -111,6 +111,7 @@ Use English as the canonical command language and recognize equivalent intent in
 
 - `Enqueue`: submit `ENQUEUE_REQUESTED`. A new request for an already queued task moves it to the end.
 - `Enqueue after T0005`: submit the same event with `--after T0005`; this changes placement only.
+- `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no other task is `RUNNING`, `REVIEW`, or `APPROVED` and every dependency is `DONE`; otherwise reject without changing its state or queue position.
 - `Move first`, `Move to 3`, `Move before T0005`, or `Move after T0005`: submit `MOVE_REQUESTED` with the matching destination.
 - `Depends on T0005`: submit `DEPENDENCY_ADD_REQUESTED`.
 - `Remove dependency T0005`: submit `DEPENDENCY_REMOVE_REQUESTED`.
@@ -120,7 +121,7 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Queue status` or `$control-room queue`: read the project queue.
 - `$control-room help`: show commands without changing state.
 
-From a worker, move and dependency commands target that task. From the manual console, require an explicit target such as `Move T0003 before T0005` or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
+From a worker, run-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Run T0003 now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
 
 Generate one caller-stable event key for each user request and reuse it only for retries of that same request. A later direct command gets a new key.
 

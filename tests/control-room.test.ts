@@ -248,6 +248,7 @@ test("returns the user command list for the created Control Room console", () =>
         "$control-room queue",
         "$control-room help",
         "Enqueue [after T0002]",
+        "Run now | Run T0002 now",
         "Move first | Move to 3 | Move before T0002 | Move after T0002",
         "Depends on T0002 | Remove dependency T0002",
         "Approve | Cancel | Status | Queue status"
@@ -346,6 +347,27 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.equal(JSON.parse(retry.stdout).updated, false);
     assert.equal(fs.readFileSync(agentsPath, "utf8"), agentsContent);
     assert.equal((agentsContent.match(/<!-- control-room:start -->/g) || []).length, 1);
+});
+
+test("activates with uncommitted local routing without creating a commit", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    const routing = core.installProjectRouting(options);
+    assert.equal(routing.installed, true);
+    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? AGENTS.md");
+
+    core.registerTask(options, "thread-one", "First routed task");
+    core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    const activation = core.activateNextTask(options);
+
+    assert.equal(activation.activated, true);
+    assert.equal(activation.task.branchName, "control-room/T0001");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), "1");
+    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? AGENTS.md");
 });
 
 test("uses the active project override and rejects project instruction symlinks", () => {
@@ -493,12 +515,13 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 5);
+    assert.equal(version, 6);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.match(dependencySql, /BLOCKING/);
     assert.match(eventSql, /MOVE_REQUESTED/);
     assert.match(eventSql, /REWORK_REQUESTED/);
+    assert.match(eventSql, /RUN_NOW_REQUESTED/);
     assert.equal(migratedDependency.dependency_kind, "BLOCKING");
     assert.equal(migratedEvent.kind, "ENQUEUE_REQUESTED");
 });
@@ -576,6 +599,89 @@ test("settles worker events directly and returns the fully renumbered queue", ()
     assert.equal(retry.activation.activated, false);
     assert.equal(retry.activation.reason, "ACTIVE_TASK_PRESENT");
     assert.deepEqual(retry.queue.map((task: Record<string, unknown>) => task.title), settled.queue.map((task: Record<string, unknown>) => task.title));
+});
+
+test("runs an eligible planning task immediately ahead of queued work", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "Queued task");
+    core.registerTask(options, "thread-two", "Immediate task");
+    core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+
+    const requested = runCli(["request-run-now", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "run-now-2"]);
+    assert.equal(requested.status, 0, requested.stderr || requested.stdout);
+    assert.equal(JSON.parse(requested.stdout).created, true);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+
+    const settled = core.settleProject(options);
+    assert.equal(settled.processed.results[0].action, "RUN_NOW_ENQUEUED");
+    assert.equal(settled.activation.activated, true);
+    assert.equal(settled.activation.task.taskId, "T0002");
+    assert.equal(settled.activation.task.state, "RUNNING");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Immediate task", "⭕️ ① T0001 - Queued task"]);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
+
+    const retry = core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", {});
+    assert.equal(retry.created, false);
+    assert.equal(retry.processed, true);
+});
+
+test("prioritizes and runs an eligible queued task immediately", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "First queued task");
+    core.registerTask(options, "thread-two", "Second queued task");
+    core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
+    core.submitEvent(options, "enqueue-2", "T0002", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+
+    core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", {});
+    const settled = core.settleProject(options);
+    assert.equal(settled.processed.results[0].action, "RUN_NOW_PRIORITIZED");
+    assert.equal(settled.activation.task.taskId, "T0002");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Second queued task", "⭕️ ① T0001 - First queued task"]);
+});
+
+test("rejects run now without reordering when another task is active", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Active task", "enqueue-1");
+    core.registerTask(options, "thread-two", "Waiting task");
+    core.submitEvent(options, "enqueue-2", "T0002", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    const queueBefore = core.getQueue(options).queue.map((task: Record<string, unknown>) => `${task.taskId}:${task.state}:${task.queuePosition}`);
+
+    core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", {});
+    const rejected = core.processPendingEvents(options);
+    assert.equal(rejected.results[0].action, "REJECTED");
+    assert.match(rejected.results[0].error, /Cannot run T0002 now while T0001 is RUNNING/);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => `${task.taskId}:${task.state}:${task.queuePosition}`), queueBefore);
+
+    core.submitEvent(options, "run-now-1", "T0001", "RUN_NOW_REQUESTED", {});
+    const alreadyActive = core.processPendingEvents(options);
+    assert.equal(alreadyActive.results[0].action, "RUN_NOW_ALREADY_ACTIVE");
+    assert.equal(core.getStatus(options, "T0001").task.state, "RUNNING");
+});
+
+test("rejects run now without enqueueing when dependencies are pending", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "Prerequisite task");
+    core.registerTask(options, "thread-two", "Dependent task");
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+
+    core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", {});
+    const rejected = core.processPendingEvents(options);
+    assert.equal(rejected.results[0].action, "REJECTED");
+    assert.match(rejected.results[0].error, /until all dependencies are DONE/);
+    assert.equal(core.getStatus(options, "T0002").task.state, "PLANNING");
+    assert.deepEqual(core.getQueue(options).queue, []);
 });
 
 test("settlement commits an approved task and activates the next worker", () => {
@@ -1167,6 +1273,7 @@ test("documents queue and help as global read-only commands", () => {
     assert.match(cliResult.stdout, /^\s+Enqueue \[after T0002\]$/m);
     assert.doesNotMatch(cliResult.stdout, /^\s+Queue \[after T0002\]$/m);
     assert.match(cliResult.stdout, /Move first/);
+    assert.match(cliResult.stdout, /Run now/);
     assert.match(cliResult.stdout, /Depends on T0002/);
 });
 

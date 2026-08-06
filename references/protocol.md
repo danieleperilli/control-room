@@ -77,12 +77,13 @@ Enqueue or reposition a task:
 ```bash
 node <skill-dir>/scripts/control-room.ts request-enqueue --project-root <root> --task T0001 --event-key <key>
 node <skill-dir>/scripts/control-room.ts request-enqueue --project-root <root> --task T0001 --event-key <key> --after T0005
+node <skill-dir>/scripts/control-room.ts request-run-now --project-root <root> --task T0001 --event-key <key>
 node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --task T0001 --event-key <key> --position 1
 node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --task T0001 --event-key <key> --before T0005
 node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --task T0001 --event-key <key> --after T0005
 ```
 
-A new `Enqueue` request for an already queued task moves it to the end. `--after`, `--before`, and numeric move destinations affect placement only.
+A new `Enqueue` request for an already queued task moves it to the end. `Run now` prioritizes and activates a `PLANNING` or `QUEUED` task only when the project has no exclusive active task and every dependency is `DONE`; `RUNNING` is an idempotent no-op. An active task or unmet dependency rejects the request without changing the target state or queue position. `--after`, `--before`, and numeric move destinations affect placement only.
 
 Change blocking dependencies without changing order:
 

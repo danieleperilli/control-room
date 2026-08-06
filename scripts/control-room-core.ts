@@ -6,7 +6,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "ENQUEUE_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type EventKind = "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 
 interface IControlRoomOptions {
     projectRoot: string;
@@ -291,6 +291,9 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
             afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined
         };
     }
+    if (kind === "RUN_NOW_REQUESTED") {
+        return {};
+    }
     if (kind === "MOVE_REQUESTED") {
         const selectorCount = Number(Boolean(payload.beforeTaskId)) + Number(Boolean(payload.afterTaskId)) + Number(payload.position !== undefined);
         assertCondition(selectorCount === 1, "Move requires exactly one destination: before, after, or position.");
@@ -442,7 +445,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 5, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 6, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -484,7 +487,7 @@ function initializeSchema(database: any): void {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -544,14 +547,14 @@ function initializeSchema(database: any): void {
             `);
         }
         const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
-        if (eventTable && !eventTable.sql.includes("REWORK_REQUESTED")) {
+        if (eventTable && !eventTable.sql.includes("RUN_NOW_REQUESTED")) {
             database.exec(`
                 ALTER TABLE events RENAME TO events_legacy;
                 CREATE TABLE events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_key TEXT NOT NULL UNIQUE,
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     processed_at TEXT,
@@ -566,7 +569,7 @@ function initializeSchema(database: any): void {
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 5;
+            PRAGMA user_version = 6;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -915,6 +918,8 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
                 assertCondition(validPayload.afterTaskId !== task.task_id, "A task cannot be queued after itself.");
                 requireTask(store, validPayload.afterTaskId);
             }
+        } else if (kind === "RUN_NOW_REQUESTED") {
+            assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot run ${task.task_id} now from ${task.state}.`);
         } else if (kind === "MOVE_REQUESTED") {
             assertCondition(task.state === "QUEUED", `Cannot move ${task.task_id} from ${task.state}.`);
             const referenceTaskId = validPayload.beforeTaskId || validPayload.afterTaskId;
@@ -1153,6 +1158,29 @@ function applyMoveEvent(store: IStore, task: ITaskRow, payload: IEventPayload): 
 }
 
 /**
+ * Prioritize a task only when it can be activated immediately.
+ * @param store Open project store.
+ * @param task Current task row.
+ */
+function applyRunNowEvent(store: IStore, task: ITaskRow): Record<string, unknown> {
+    if (task.state === "RUNNING") {
+        return { action: "RUN_NOW_ALREADY_ACTIVE", task: serializeTask(task) };
+    }
+    assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot run ${task.task_id} now from ${task.state}.`);
+    const exclusiveTask = store.database.prepare("SELECT task_id, state FROM tasks WHERE state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as { task_id: string; state: TaskState } | undefined;
+    assertCondition(!exclusiveTask, `Cannot run ${task.task_id} now while ${exclusiveTask?.task_id} is ${exclusiveTask?.state}.`);
+    assertCondition(dependenciesAreDone(store, task.task_id), `Cannot run ${task.task_id} now until all dependencies are DONE.`);
+    if (task.state === "PLANNING") {
+        applyEnqueueEvent(store, task, {});
+    }
+    const moved = applyMoveEvent(store, requireTask(store, task.task_id), { position: 1 });
+    return {
+        ...moved,
+        action: task.state === "PLANNING" ? "RUN_NOW_ENQUEUED" : "RUN_NOW_PRIORITIZED"
+    };
+}
+
+/**
  * Add or remove one explicit blocking dependency.
  * @param store Open project store.
  * @param task Current task row.
@@ -1196,6 +1224,9 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     const payload = JSON.parse(event.payload_json) as IEventPayload;
     if (event.kind === "ENQUEUE_REQUESTED") {
         return applyEnqueueEvent(store, task, payload);
+    }
+    if (event.kind === "RUN_NOW_REQUESTED") {
+        return applyRunNowEvent(store, task);
     }
     if (event.kind === "MOVE_REQUESTED") {
         return applyMoveEvent(store, task, payload);
@@ -1391,7 +1422,6 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             requireGit(store.projectRoot, ["symbolic-ref", "HEAD", `refs/heads/${workerBranch}`], `Create unborn worker branch ${workerBranch}`);
             currentBaseCommit = null;
         } else if (currentBranch === project.base_branch) {
-            assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating a task.");
             currentBaseCommit = requireBaseCheckout(store.projectRoot, project.base_branch);
             const existingWorkerBranch = runGit(store.projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${workerBranch}`]);
             assertCondition(

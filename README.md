@@ -116,6 +116,7 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | `$control-room help` | Show the available user commands from any task. |
 | `Enqueue` | Add or update the current task at the end of the queue. |
 | `Enqueue after T0005` | Add the current task immediately after `T0005`, without creating a dependency. |
+| `Run now` | Start the current task immediately when the project is idle and all dependencies are done. |
 | `Move first` | Move the current queued task to the first waiting position. |
 | `Move to 3` | Move the current queued task to waiting position 3. |
 | `Move before T0005` | Move the current queued task immediately before `T0005`. |
@@ -130,6 +131,8 @@ English is the canonical command language. ControlRoom can still interpret equiv
 `$control-room queue` is the fast, read-only queue command. It works in the manual console, a registered worker, or an unregistered top-level task whose Local environment points to the initialized repository. It does not register or rename the caller. `$control-room help` is also read-only and does not require an initialized project.
 
 Queue order and dependencies are separate. `Enqueue after` and every `Move` command change only the order. `Depends on` and `Remove dependency` change only start eligibility and never move a task.
+
+`Run now` is stricter than `Move first`: it succeeds only when the task can start in the same settlement. If another task is running, in review, or approved, or if a dependency is not done, ControlRoom rejects the request without changing the task state or queue position. A task already running treats the command as an idempotent no-op. From `⚫️ Control Room`, use `Run T0003 now`.
 
 From a worker, `Move` and dependency commands apply to that task. From `⚫️ Control Room`, include the target ID, for example `Move T0003 before T0005` or `Make T0003 depend on T0005`.
 

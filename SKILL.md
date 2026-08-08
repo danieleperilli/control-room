@@ -97,11 +97,12 @@ Use every returned title exactly:
 - `REVIEW`: `💪 T0001 - Semantic name`
 - `APPROVED`: `🟢 T0001 - Semantic name`
 - `DONE`: `🟢 T0001 - Semantic name`
-- `BLOCKED` or `CANCELED`: `❌ T0001 - Semantic name`
+- `BLOCKED`: `❌ T0001 - Semantic name`
+- `CANCELED`: `Semantic name`, with every ControlRoom icon, queue marker, and task ID removed
 
 The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. Persist only numeric `queue_position` and the undecorated semantic name.
 
-After every settlement, apply the title of every task in the returned final `queue`, plus any completed or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A `DONE` task must receive its returned `🟢` title even though it is absent from the final queue. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that enqueueing, moving, activation, blocking, resumption, cancellation, and completion immediately renumber every remaining queued title.
+After every settlement, apply the title of every task in the returned final `queue`, plus any completed or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A `DONE` task must receive its returned `🟢` title even though it is absent from the final queue, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that enqueueing, moving, activation, blocking, resumption, cancellation, and completion immediately renumber every remaining queued title.
 
 When controlling Chrome for a worker, name the browser session or tab group `🤖 <T_ID>`, such as `🤖 T0001`.
 

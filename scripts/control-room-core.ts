@@ -674,6 +674,9 @@ function queuePositionMarker(position: number | null): string {
  * @param task Task record to title.
  */
 function titleForTask(task: ITaskRow): string {
+    if (task.state === "CANCELED") {
+        return task.semantic_name;
+    }
     let prefix = "";
     if (task.state === "PLANNING") {
         prefix = "⚪️ ";
@@ -688,7 +691,7 @@ function titleForTask(task: ITaskRow): string {
         prefix = "🟢 ";
     } else if (task.state === "DONE") {
         prefix = "🟢 ";
-    } else if (task.state === "BLOCKED" || task.state === "CANCELED") {
+    } else if (task.state === "BLOCKED") {
         prefix = "❌ ";
     }
     return `${prefix}${task.task_id} - ${task.semantic_name}`;

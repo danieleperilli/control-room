@@ -220,9 +220,9 @@ ControlRoom keeps task titles synchronized with their state:
 | Approved | `🟢 T0001 - Add audit log` |
 | Done | `🟢 T0001 - Add audit log` |
 | Blocked | `❌ T0001 - Add audit log` |
-| Canceled | `❌ T0001 - Add audit log` |
+| Canceled | `Add audit log` |
 
-Blocked and canceled tasks use the same `❌` status icon.
+Blocked tasks retain the `❌` status icon and task ID. Canceled tasks leave the active queue and return to their undecorated semantic title.
 
 The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` list. Codex applies the list before reporting success, including terminal tasks that no longer appear in the queue. Therefore activation, moving, blocking, resuming, cancellation, or completion renumbers every remaining queued task automatically and changes `DONE` to `🟢`.
 

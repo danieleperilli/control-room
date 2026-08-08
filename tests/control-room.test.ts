@@ -402,13 +402,28 @@ test("uses the active project override and rejects project instruction symlinks"
     assert.equal(fs.readFileSync(externalPath, "utf8"), "# External\n");
 });
 
-test("uses the failure icon for blocked and canceled task titles", () => {
+test("keeps the failure icon for blocked tasks and resets canceled titles", () => {
     const baseTask = {
         task_id: "T0001",
         semantic_name: "Handle failure"
     };
     assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Handle failure");
-    assert.equal(core.titleForTask({ ...baseTask, state: "CANCELED" }), "❌ T0001 - Handle failure");
+    assert.equal(core.titleForTask({ ...baseTask, state: "CANCELED" }), "Handle failure");
+});
+
+test("settlement returns the undecorated semantic title for a canceled task", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "Discard obsolete work");
+    core.submitEvent(options, "cancel-1", "T0001", "CANCEL_REQUESTED", { userRequestId: "cancel-message" });
+
+    const settled = core.settleProject(options);
+
+    assert.equal(settled.processed.results[0].action, "CANCELED");
+    assert.equal(settled.processed.results[0].task.title, "Discard obsolete work");
+    assert.deepEqual(settled.queue, []);
+    assert.deepEqual(settled.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "Discard obsolete work" }]);
 });
 
 test("uses the review marker and red when review rework starts", () => {

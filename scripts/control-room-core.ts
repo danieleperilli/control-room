@@ -810,6 +810,7 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "# ControlRoom project routing",
         "",
         "- In every top-level task for this project, load and follow `$control-room` before handling each user message.",
+        "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
         "- Apply every ControlRoom task title update before replying.",
         "- Do not apply ControlRoom to subagents or side chats.",
         endMarker

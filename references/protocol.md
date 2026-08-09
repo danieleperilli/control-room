@@ -47,7 +47,9 @@ The initial console turn explains that the task is a manual, optional control su
 
 If database initialization fails after task creation, archive the new task and report the error. If the `init` result contains `routing.installed: false`, keep the registered Control Room task, report `routing.error`, and make a later `$control-room init` repair the rule idempotently. A different registered Control Room task or base branch must fail rather than be replaced.
 
-After initialization, resolve the role of a top-level Local task on its first substantive turn:
+After initialization, first classify the requested outcome of a top-level Local task. Questions, explanations, inspections, diagnoses, audits, reviews, and reports are read-only when the complete request asks for no implementation or other project mutation. Fulfill a purely read-only request without registering the task, allocating a `T_ID`, or changing its title. A concrete plan, design, specification, or brief intended for later implementation counts as change work; a mixed request also counts as change work when any substantive part requests a project change.
+
+For change work, resolve the role on its first substantive turn:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts status \
@@ -55,7 +57,7 @@ node <skill-dir>/scripts/control-room.ts status \
     --thread-id <current-thread-id>
 ```
 
-The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. Register only `UNREGISTERED` tasks, derive their semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. The project-root routing block installed by `init` makes the skill load before this check.
+The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. Register only `UNREGISTERED` tasks, derive their semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. The read-only exemption applies only to an unregistered task: a registered worker retains its identity and state during read-only follow-ups, while an unregistered conversation is evaluated again if a later turn requests change work. Explicit `$control-room join` always registers. Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. The project-root routing block installed by `init` makes the skill load before this check.
 
 `$control-room join` remains a worker operation. It registers the current existing top-level task:
 
@@ -208,4 +210,4 @@ Install or link this repository as the global `control-room` skill. Do not add a
 node <skill-dir>/scripts/control-room.ts install-routing --project-root <canonical-root>
 ```
 
-The command atomically prepends one managed block with path-independent markers. It writes to a non-empty `AGENTS.override.md` in the canonical Git root when that is the active project instruction source; otherwise it uses the root `AGENTS.md`. The block requires `$control-room` before every top-level user message, makes title updates mandatory, and excludes subagents and side chats. Existing instructions are preserved, repeated installation is byte-stable, and symbolic-link targets are rejected. It never reads or writes global Codex instructions. The local instruction change remains uncommitted until the user or a later approved task commits it.
+The command atomically prepends one managed block with path-independent markers. It writes to a non-empty `AGENTS.override.md` in the canonical Git root when that is the active project instruction source; otherwise it uses the root `AGENTS.md`. The block requires `$control-room` before every top-level user message, prevents automatic registration for purely read-only requests, makes title updates mandatory, and excludes subagents and side chats. Existing instructions are preserved, repeated installation is byte-stable, and symbolic-link targets are rejected. It never reads or writes global Codex instructions. The local instruction change remains uncommitted until the user or a later approved task commits it.

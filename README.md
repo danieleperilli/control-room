@@ -80,9 +80,11 @@ Initialization does not create a commit. Its local instruction-file change remai
 
 The Control Room console does not receive a `T_ID` and must not be used for planning or implementation. You can open it manually to inspect or reorder the queue, manage dependencies with explicit task IDs, or perform recovery.
 
-Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, the installed project-specific routing rule makes the task load ControlRoom on its first substantive prompt; ControlRoom assigns a `T_ID`, derives its semantic name, and leaves it in planning. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
+Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, the installed project-specific routing rule makes the task load ControlRoom on its first substantive prompt. ControlRoom assigns a `T_ID`, derives its semantic name, and leaves it in planning only when the requested outcome is a project change or a concrete plan, design, specification, or brief intended for later implementation. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
 
-Automatic registration does not run for the manual Control Room console, subagents, side chats, `$control-room init`, `$control-room queue`, or `$control-room help`. Outside initialized projects it does nothing.
+Purely read-only requests do not become ControlRoom tasks. Questions, explanations, inspections, diagnoses, audits, reviews, and reports remain unregistered when they ask for no implementation or other project mutation; their title is left unchanged and no `T_ID` is allocated. If a later turn in that same conversation requests a change, ControlRoom registers it then. A mixed request is registered when any substantive part asks for a project change or its implementation plan. Explicit `$control-room join` still forces registration.
+
+Automatic registration also does not run for the manual Control Room console, subagents, side chats, `$control-room init`, `$control-room queue`, or `$control-room help`. Outside initialized projects it does nothing.
 
 Codex reads project instructions when a task run starts. Tasks opened before the routing block was installed may therefore still need `$control-room join`; newly started top-level tasks load the rule automatically.
 

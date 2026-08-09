@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; for every top-level project task after initialization; or when the user says Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
+description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only requests unregistered; or when the user says Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
 ---
 
 # ControlRoom
@@ -38,16 +38,20 @@ When the created task receives the internal `$control-room console` prompt, do n
 At the start of the first substantive turn in a top-level Local task, or whenever its ControlRoom identity is absent after compaction:
 
 1. Preserve the complete user message.
-2. Resolve the canonical Git root and trusted current thread ID. Skip subagents, side chats, linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`.
-3. Run:
+2. Classify the requested outcome before allocating an identity. If the complete request is purely read-only, fulfill it without running `register`, assigning a `T_ID`, or changing the title. Read-only requests include questions, explanations, inspections, diagnoses, audits, reviews, and reports that do not ask for implementation or another project mutation.
+3. Treat a concrete plan, design, specification, or brief intended for a later project change as change work, even when the current turn does not edit files. If any substantive part of a mixed request asks for a project change or its implementation plan, continue with registration.
+4. Resolve the canonical Git root and trusted current thread ID. Skip subagents, side chats, linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`.
+5. Run:
 
    ```bash
    node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> --thread-id <current-thread-id>
    ```
 
-4. If the project is not initialized, continue without registration or commentary. Mention initialization only when the user explicitly invokes a ControlRoom command.
-5. If the result role is `CONTROL_ROOM` or `WORKER`, keep the recorded identity unchanged.
-6. If it returns `UNREGISTERED`, derive a short semantic name from the substantive request, run `register`, apply its `PLANNING` title, and continue the complete original request in the same turn.
+6. If the project is not initialized, continue without registration or commentary. Mention initialization only when the user explicitly invokes a ControlRoom command.
+7. If the result role is `CONTROL_ROOM` or `WORKER`, keep the recorded identity unchanged.
+8. If it returns `UNREGISTERED`, derive a short semantic name from the substantive request, run `register`, apply its `PLANNING` title, and continue the complete original request in the same turn.
+
+The read-only exemption applies only while a top-level task is unregistered. A read-only follow-up in an existing worker keeps its identity and state unchanged. If a later message in an unregistered conversation requests change work, evaluate registration again on that turn. Explicit `$control-room join` always adopts the task regardless of whether its accompanying request is read-only.
 
 Automatic registration never enqueues the task, creates a branch, or modifies project files. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
 

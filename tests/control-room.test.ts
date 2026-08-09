@@ -338,6 +338,7 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.equal(agentsContent.startsWith("<!-- control-room:start -->"), true);
     assert.match(agentsContent, /# Existing instructions/);
     assert.match(agentsContent, /load and follow `\$control-room` before handling each user message/);
+    assert.match(agentsContent, /Do not automatically register a purely read-only request/);
     assert.match(agentsContent, /Apply every ControlRoom task title update before replying/);
     assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
     assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? AGENTS.md");
@@ -1305,6 +1306,10 @@ test("documents init as creation of a silent manual Control Room task", () => {
 test("documents project-scoped automatic registration and mandatory title synchronization", () => {
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     assert.match(skillText, /status --project-root <canonical-root> --thread-id <current-thread-id>/);
+    assert.match(skillText, /If the complete request is purely read-only, fulfill it without running `register`, assigning a `T_ID`, or changing the title/);
+    assert.match(skillText, /concrete plan, design, specification, or brief intended for a later project change as change work/);
+    assert.match(skillText, /If a later message in an unregistered conversation requests change work, evaluate registration again/);
+    assert.match(skillText, /Explicit `\$control-room join` always adopts the task/);
     assert.match(skillText, /If it returns `UNREGISTERED`, derive a short semantic name/);
     assert.match(skillText, /If the project is not initialized, continue without registration or commentary/);
     assert.match(skillText, /active `AGENTS\.md` or `AGENTS\.override\.md` at the project Git root/);

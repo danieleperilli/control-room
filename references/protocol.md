@@ -74,9 +74,10 @@ Registration allocates `T0001` through `T9999`, leaves the task in `PLANNING`, a
 
 Create one fresh caller-stable event key per user request and reuse it only on retries.
 
-Enqueue or reposition a task:
+Return a safely blocked waiting task to planning, enqueue it, or reposition a task:
 
 ```bash
+node <skill-dir>/scripts/control-room.ts request-planning --project-root <root> --task T0001 --event-key <key>
 node <skill-dir>/scripts/control-room.ts request-enqueue --project-root <root> --task T0001 --event-key <key>
 node <skill-dir>/scripts/control-room.ts request-enqueue --project-root <root> --task T0001 --event-key <key> --after T0005
 node <skill-dir>/scripts/control-room.ts request-run-now --project-root <root> --task T0001 --event-key <key>
@@ -85,7 +86,9 @@ node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --ta
 node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --task T0001 --event-key <key> --after T0005
 ```
 
-A new `Enqueue` request for an already queued task moves it to the end. `Run now` prioritizes and activates a `PLANNING` or `QUEUED` task only when the project has no exclusive active task and every dependency is `DONE`; `RUNNING` is an idempotent no-op. An active task or unmet dependency rejects the request without changing the target state or queue position. `--after`, `--before`, and numeric move destinations affect placement only.
+`Return to planning` accepts only a `BLOCKED` task whose `blocked_from_state` is `QUEUED`. It clears `blocked_from_state` and `queue_position`, compacts the active queue, preserves dependencies, and returns the task's `⚪️` title outside the final queue. `Enqueue` accepts that same safely blocked task and restores it to `QUEUED`; without `--after` it goes to the end. A new `Enqueue` request for an already queued task also moves it to the end. `Run now` prioritizes and activates a `PLANNING` or `QUEUED` task only when the project has no exclusive active task and every dependency is `DONE`; `RUNNING` is an idempotent no-op. An active task or unmet dependency rejects the request without changing the target state or queue position. `--after`, `--before`, and numeric move destinations affect placement only.
+
+A task blocked from `RUNNING` or `REVIEW` rejects both `PLANNING_REQUESTED` and `ENQUEUE_REQUESTED` without changing SQLite or Git. Restore its recorded state with `resume`; this prevents a dirty worker checkout from being mislabeled as read-only `PLANNING` or `QUEUED` work.
 
 Change blocking dependencies without changing order:
 
@@ -142,7 +145,7 @@ Settlement performs the normal operational sequence:
 3. If the project has no `RUNNING`, `REVIEW`, or `APPROVED` task, activate the first dependency-eligible queued task.
 4. Return the final active queue.
 
-Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so any enqueue, move, activation, block, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes completed and canceled tasks that are absent from the final queue: `DONE` keeps its returned `🟢` title, while `CANCELED` is reset to the semantic name with no icon, queue marker, or task ID. Retry one failed title operation once, then surface the exact failure.
+Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so any enqueue, move, activation, block, return-to-planning, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes returned-to-planning, completed, and canceled tasks that are absent from the final queue: `PLANNING` receives `⚪️`, `DONE` keeps its returned `🟢` title, and `CANCELED` is reset to the semantic name with no icon, queue marker, or task ID. Retry one failed title operation once, then surface the exact failure.
 
 When `activation.activated` is true, send `activation.executionBrief` directly to its worker. Do not route it through the manual console. If the activated worker is the caller, continue there without sending a background message.
 
@@ -172,17 +175,18 @@ node <skill-dir>/scripts/control-room.ts queue --project-root <root>
 
 ```text
 PLANNING -> QUEUED -> RUNNING <-> REVIEW -> APPROVED -> DONE
-                 \       |          |
-                  \------BLOCKED-----/
+QUEUED -> BLOCKED -> QUEUED or PLANNING
+RUNNING -> BLOCKED -> RUNNING
+REVIEW  -> BLOCKED -> REVIEW
 
 PLANNING, QUEUED, RUNNING, REVIEW, BLOCKED -> CANCELED
 ```
 
-- Processed events move tasks into `QUEUED`, `RUNNING` after rework, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`.
+- Processed events move tasks into `PLANNING` after a safe blocked-waiting demotion, `QUEUED`, `RUNNING` after rework, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`.
 - Activation inside settlement moves `QUEUED -> RUNNING`.
 - Approval completion inside settlement moves `APPROVED -> DONE`.
 - Dependencies are satisfied only by `DONE`.
-- `BLOCKED` remembers and can restore its prior state.
+- `BLOCKED` remembers and can restore its prior state. Only a task blocked from `QUEUED` may instead return to `PLANNING` or be enqueued again.
 - `RUNNING`, `REVIEW`, and `APPROVED` are exclusive project-wide.
 
 ## Approval commit and recovery

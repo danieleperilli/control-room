@@ -247,6 +247,7 @@ test("returns the user command list for the created Control Room console", () =>
         "$control-room join",
         "$control-room queue",
         "$control-room help",
+        "Return to planning | Return T0002 to planning",
         "Enqueue [after T0002]",
         "Run now | Run T0002 now",
         "Move first | Move to 3 | Move before T0002 | Move after T0002",
@@ -531,15 +532,51 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 6);
+    assert.equal(version, 7);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.match(dependencySql, /BLOCKING/);
     assert.match(eventSql, /MOVE_REQUESTED/);
     assert.match(eventSql, /REWORK_REQUESTED/);
     assert.match(eventSql, /RUN_NOW_REQUESTED/);
+    assert.match(eventSql, /PLANNING_REQUESTED/);
     assert.equal(migratedDependency.dependency_kind, "BLOCKING");
     assert.equal(migratedEvent.kind, "ENQUEUE_REQUESTED");
+});
+
+test("migrates version 6 events without losing pending requests", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "Preserve pending event");
+    const legacyDatabase = new DatabaseSync(databasePath);
+    legacyDatabase.exec(`
+        ALTER TABLE events RENAME TO events_current;
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            processed_at TEXT,
+            result_json TEXT
+        );
+        INSERT INTO events (event_key, task_id, kind, payload_json, created_at)
+        VALUES ('pending-v6-enqueue', 'T0001', 'ENQUEUE_REQUESTED', '{}', '2026-01-01T00:00:00.000Z');
+        DROP TABLE events_current;
+        PRAGMA user_version = 6;
+    `);
+    legacyDatabase.close();
+
+    assert.equal(core.getStatus(options, "T0001").task.state, "PLANNING");
+    const processed = core.processPendingEvents(options);
+    assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
+    assert.equal(processed.results[0].action, "ENQUEUED");
+    const migratedDatabase = new DatabaseSync(databasePath);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 7);
+    assert.match(migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql, /PLANNING_REQUESTED/);
+    migratedDatabase.close();
 });
 
 test("rejects a broken state database symbolic link", () => {
@@ -751,6 +788,114 @@ test("moves an already queued task to the end on a new enqueue request", () => {
     assert.equal(retry.created, false);
     assert.equal(core.processPendingEvents(options).processedCount, 0);
     assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002"]);
+});
+
+test("returns a blocked waiting task to planning and preserves its dependencies", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.processPendingEvents(options);
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    core.activateNextTask(options);
+    core.submitEvent(options, "block-2", "T0002", "BLOCKED_REPORTED", { reason: "Needs a revised plan" });
+    core.processPendingEvents(options);
+
+    const requested = runCli(["request-planning", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "planning-2"]);
+    assert.equal(requested.status, 0, requested.stderr || requested.stdout);
+    assert.equal(JSON.parse(requested.stdout).created, true);
+    assert.equal(core.getStatus(options, "T0002").task.state, "BLOCKED");
+
+    const settled = core.settleProject(options);
+    assert.equal(settled.processed.results[0].action, "RETURNED_TO_PLANNING");
+    assert.equal(settled.processed.results[0].task.state, "PLANNING");
+    assert.equal(settled.processed.results[0].task.queuePosition, null);
+    assert.equal(settled.processed.results[0].task.title, "⚪️ T0002 - Task 2");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
+    const database = new DatabaseSync(databasePath);
+    const dependency = database.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
+    database.close();
+    assert.equal(dependency.dependency_kind, "BLOCKING");
+
+    const retry = runCli(["request-planning", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "planning-2"]);
+    assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+    assert.deepEqual(JSON.parse(retry.stdout), { created: false, processed: true, eventKey: "planning-2" });
+    assert.equal(core.settleProject(options).processed.processedCount, 0);
+    assert.equal(core.getStatus(options, "T0002").task.state, "PLANNING");
+});
+
+test("enqueues a blocked waiting task at an explicit position or at the end", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 4; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.processPendingEvents(options);
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    core.activateNextTask(options);
+    core.submitEvent(options, "block-2-first", "T0002", "BLOCKED_REPORTED", { reason: "Waiting for placement" });
+    core.processPendingEvents(options);
+
+    const positionedRequest = runCli(["request-enqueue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "reenqueue-2-positioned", "--after", "T0003"]);
+    assert.equal(positionedRequest.status, 0, positionedRequest.stderr || positionedRequest.stdout);
+    const positioned = core.settleProject(options);
+    assert.equal(positioned.processed.results[0].action, "ENQUEUED");
+    assert.deepEqual(positioned.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002", "T0004"]);
+    assert.deepEqual(positioned.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3", "⭕️ ② T0002 - Task 2", "⭕️ ③ T0004 - Task 4"]);
+    assert.deepEqual(positioned.queue.find((task: Record<string, unknown>) => task.taskId === "T0002").dependencies, ["T0001"]);
+    assert.equal(positioned.titleUpdates.find((update: Record<string, unknown>) => update.taskId === "T0002").title, "⭕️ ② T0002 - Task 2");
+
+    const retry = runCli(["request-enqueue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "reenqueue-2-positioned", "--after", "T0003"]);
+    assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+    assert.deepEqual(JSON.parse(retry.stdout), { created: false, processed: true, eventKey: "reenqueue-2-positioned" });
+
+    core.submitEvent(options, "block-2-again", "T0002", "BLOCKED_REPORTED", { reason: "Move to the end" });
+    core.processPendingEvents(options);
+    const endRequest = runCli(["request-enqueue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "reenqueue-2-end"]);
+    assert.equal(endRequest.status, 0, endRequest.stderr || endRequest.stdout);
+    const ended = core.settleProject(options);
+    assert.deepEqual(ended.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0004", "T0002"]);
+    assert.equal(ended.queue[3].title, "⭕️ ③ T0002 - Task 2");
+});
+
+test("rejects planning and enqueue for blocked running or review work without changing Git", () => {
+    for (const blockedFromState of ["RUNNING", "REVIEW"]) {
+        const fixture = createFixture();
+        initializeFixture(fixture);
+        const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+        activateTask(options, "thread-one", `${blockedFromState} task`, "enqueue-1");
+        fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), `${blockedFromState}\n`);
+        if (blockedFromState === "REVIEW") {
+            core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Waiting in review" });
+            core.processPendingEvents(options);
+        }
+        core.submitEvent(options, "block-1", "T0001", "BLOCKED_REPORTED", { reason: "Needs user input" });
+        core.processPendingEvents(options);
+        const branchBeforeRequests = runGit(fixture.repositoryRoot, ["branch", "--show-current"]);
+        const statusBeforeRequests = runGit(fixture.repositoryRoot, ["status", "--porcelain"]);
+        const queueBeforeRequests = core.getQueue(options).queue.map((task: Record<string, unknown>) => `${task.taskId}:${task.state}:${task.queuePosition}`);
+
+        const planning = runCli(["request-planning", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", `planning-from-${blockedFromState.toLowerCase()}`]);
+        assert.notEqual(planning.status, 0);
+        assert.match(planning.stderr, new RegExp(`Cannot return T0001 to PLANNING after ${blockedFromState}`));
+        const enqueue = runCli(["request-enqueue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", `enqueue-from-${blockedFromState.toLowerCase()}`]);
+        assert.notEqual(enqueue.status, 0);
+        assert.match(enqueue.stderr, new RegExp(`Cannot enqueue T0001 after ${blockedFromState}`));
+        assert.equal(core.getStatus(options, "T0001").task.state, "BLOCKED");
+        assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => `${task.taskId}:${task.state}:${task.queuePosition}`), queueBeforeRequests);
+        assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), branchBeforeRequests);
+        assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), statusBeforeRequests);
+    }
 });
 
 test("reorders waiting tasks independently from blocking dependencies", () => {

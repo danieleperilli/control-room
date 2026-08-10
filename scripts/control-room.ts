@@ -10,6 +10,7 @@ const USER_COMMANDS = [
     "$control-room join",
     "$control-room queue",
     "$control-room help",
+    "Return to planning | Return T0002 to planning",
     "Enqueue [after T0002]",
     "Run now | Run T0002 now",
     "Move first | Move to 3 | Move before T0002 | Move after T0002",
@@ -107,6 +108,7 @@ Commands:
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   install-routing --project-root ROOT [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--state-root PATH]
+  request-planning --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
   request-run-now --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
@@ -165,6 +167,10 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     if (parsed.command === "install-routing") {
         validateOptions(values, ["project-root", "state-root"]);
         return core.installProjectRouting(buildOptions(values));
+    }
+    if (parsed.command === "request-planning") {
+        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "PLANNING_REQUESTED", {});
     }
     if (parsed.command === "request-enqueue") {
         validateOptions(values, ["project-root", "task", "event-key", "after", "state-root"]);

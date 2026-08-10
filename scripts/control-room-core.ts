@@ -6,7 +6,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 
 interface IControlRoomOptions {
     projectRoot: string;
@@ -286,6 +286,9 @@ function validateQueuePosition(position: number | undefined): number {
  * @param payload Caller-supplied event payload.
  */
 function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPayload {
+    if (kind === "PLANNING_REQUESTED") {
+        return {};
+    }
     if (kind === "ENQUEUE_REQUESTED") {
         return {
             afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined
@@ -445,7 +448,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 6, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 7, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -487,7 +490,7 @@ function initializeSchema(database: any): void {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -547,14 +550,14 @@ function initializeSchema(database: any): void {
             `);
         }
         const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
-        if (eventTable && !eventTable.sql.includes("RUN_NOW_REQUESTED")) {
+        if (eventTable && !eventTable.sql.includes("PLANNING_REQUESTED")) {
             database.exec(`
                 ALTER TABLE events RENAME TO events_legacy;
                 CREATE TABLE events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_key TEXT NOT NULL UNIQUE,
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     processed_at TEXT,
@@ -569,7 +572,7 @@ function initializeSchema(database: any): void {
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 6;
+            PRAGMA user_version = 7;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -916,8 +919,14 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
                 eventKey: validEventKey
             };
         }
-        if (kind === "ENQUEUE_REQUESTED") {
-            assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
+        if (kind === "PLANNING_REQUESTED") {
+            assertCondition(task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
+            assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+        } else if (kind === "ENQUEUE_REQUESTED") {
+            assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "BLOCKED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
+            if (task.state === "BLOCKED") {
+                assertCondition(task.blocked_from_state === "QUEUED", `Cannot enqueue ${task.task_id} after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+            }
             if (validPayload.afterTaskId) {
                 assertCondition(validPayload.afterTaskId !== task.task_id, "A task cannot be queued after itself.");
                 requireTask(store, validPayload.afterTaskId);
@@ -1057,13 +1066,34 @@ function assertDependencyIsAcyclic(store: IStore, taskId: string, dependsOnId: s
 }
 
 /**
+ * Return a safely blocked waiting task to planning.
+ * @param store Open project store.
+ * @param task Current blocked task row.
+ */
+function applyPlanningEvent(store: IStore, task: ITaskRow): Record<string, unknown> {
+    assertCondition(task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
+    assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+    store.database.prepare(`
+        UPDATE tasks
+        SET state = 'PLANNING', blocked_from_state = NULL, queue_position = NULL, updated_at = ?
+        WHERE task_id = ?
+    `).run(currentTimestamp(), task.task_id);
+    const titleUpdates = compactActiveQueue(store);
+    const refreshedTask = requireTask(store, task.task_id);
+    return { action: "RETURNED_TO_PLANNING", task: serializeTask(refreshedTask), titleUpdates };
+}
+
+/**
  * Place a task at the requested queue location without changing dependencies.
  * @param store Open project store.
  * @param task Current task row.
  * @param payload Enqueue request payload.
  */
 function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
-    assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot enqueue ${task.task_id} from ${task.state}.`);
+    assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "BLOCKED", `Cannot enqueue ${task.task_id} from ${task.state}.`);
+    if (task.state === "BLOCKED") {
+        assertCondition(task.blocked_from_state === "QUEUED", `Cannot enqueue ${task.task_id} after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+    }
     const wasAlreadyQueued = task.state === "QUEUED";
     let afterTaskId: string | undefined;
     if (payload.afterTaskId) {
@@ -1226,6 +1256,9 @@ function applyDependencyEvent(store: IStore, task: ITaskRow, payload: IEventPayl
 function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unknown> {
     const task = requireTask(store, event.task_id);
     const payload = JSON.parse(event.payload_json) as IEventPayload;
+    if (event.kind === "PLANNING_REQUESTED") {
+        return applyPlanningEvent(store, task);
+    }
     if (event.kind === "ENQUEUE_REQUESTED") {
         return applyEnqueueEvent(store, task, payload);
     }
@@ -1682,7 +1715,7 @@ function readApprovalCommitMessage(store: IStore, task: ITaskRow): string {
 }
 
 /**
- * Compact active queue positions after a terminal transition.
+ * Compact active queue positions after a task leaves the active queue.
  * @param store Open project store.
  */
 function compactActiveQueue(store: IStore): ITitleUpdate[] {

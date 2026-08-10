@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only requests unregistered; or when the user says Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
+description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only requests unregistered; or when the user says Return to planning, Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
 ---
 
 # ControlRoom
@@ -106,7 +106,7 @@ Use every returned title exactly:
 
 The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. Persist only numeric `queue_position` and the undecorated semantic name.
 
-After every settlement, apply the title of every task in the returned final `queue`, plus any completed or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A `DONE` task must receive its returned `🟢` title even though it is absent from the final queue, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that enqueueing, moving, activation, blocking, resumption, cancellation, and completion immediately renumber every remaining queued title.
+After every settlement, apply the title of every task in the returned final `queue`, plus any returned-to-planning, completed, or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A task returned to `PLANNING` must receive its `⚪️` title. A `DONE` task must receive its returned `🟢` title, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that enqueueing, moving, activation, blocking, return-to-planning, resumption, cancellation, and completion immediately renumber every remaining queued title.
 
 When controlling Chrome for a worker, name the browser session or tab group `🤖 <T_ID>`, such as `🤖 T0001`.
 
@@ -114,8 +114,9 @@ When controlling Chrome for a worker, name the browser session or tab group `�
 
 Use English as the canonical command language and recognize equivalent intent in other languages:
 
-- `Enqueue`: submit `ENQUEUE_REQUESTED`. A new request for an already queued task moves it to the end.
-- `Enqueue after T0005`: submit the same event with `--after T0005`; this changes placement only.
+- `Return to planning`: submit `PLANNING_REQUESTED`. Accept only a `BLOCKED` task whose recorded prior state is `QUEUED`; settlement removes its queue position, preserves dependencies, and returns the `⚪️` title.
+- `Enqueue`: submit `ENQUEUE_REQUESTED`. A new request for an already queued task moves it to the end. A `BLOCKED` task whose recorded prior state is `QUEUED` also returns to the end of the queue with its dependencies unchanged.
+- `Enqueue after T0005`: submit the same event with `--after T0005`; this changes placement only and also accepts a safely blocked waiting task.
 - `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no other task is `RUNNING`, `REVIEW`, or `APPROVED` and every dependency is `DONE`; otherwise reject without changing its state or queue position.
 - `Move first`, `Move to 3`, `Move before T0005`, or `Move after T0005`: submit `MOVE_REQUESTED` with the matching destination.
 - `Depends on T0005`: submit `DEPENDENCY_ADD_REQUESTED`.
@@ -126,7 +127,9 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Queue status` or `$control-room queue`: read the project queue.
 - `$control-room help`: show commands without changing state.
 
-From a worker, run-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Run T0003 now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
+From a worker, return-to-planning, run-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Return T0003 to planning`, `Run T0003 now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
+
+Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `REVIEW` as its prior state. Those tasks may own a worker branch and uncommitted changes, so use the lower-level `resume` operation to restore the recorded state instead of demoting them into a read-only state.
 
 Generate one caller-stable event key for each user request and reuse it only for retries of that same request. A later direct command gets a new key.
 

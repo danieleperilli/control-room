@@ -114,6 +114,8 @@ Commands:
   request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
   request-dependency-add --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
+  request-user-input --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
+  request-user-response --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-rework --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
@@ -205,6 +207,14 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "DEPENDENCY_REMOVE_REQUESTED", {
             dependencyTaskId: requireOption(values, "depends-on")
         });
+    }
+    if (parsed.command === "request-user-input") {
+        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_REQUESTED", {});
+    }
+    if (parsed.command === "request-user-response") {
+        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_RECEIVED", {});
     }
     if (parsed.command === "request-review") {
         validateOptions(values, ["project-root", "task", "event-key", "summary", "state-root"]);

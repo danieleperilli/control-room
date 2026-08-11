@@ -215,17 +215,20 @@ The older conversational form remains available when you want queue details:
 
 ControlRoom keeps task titles synchronized with their state:
 
-| State | Example title |
+| Status | Example title |
 | --- | --- |
 | Planning | `⚪️ T0001 - Add audit log` |
 | Queued | `⭕️ ① T0001 - Add audit log` |
 | Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
+| Awaiting your response | `👉 T0001 - Add audit log` |
 | Review | `💪 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
 | Done | `🟢 T0001 - Add audit log` |
 | Blocked | `❌ T0001 - Add audit log` |
 | Canceled | `Add audit log` |
+
+When a planning, running, or review task cannot continue without your direct answer, confirmation, choice, or approval, it temporarily switches to `👉`. The underlying state, queue order, branch, and files do not change. Your next direct message restores the normal state icon before the task continues; if it still needs an answer, it shows `👉` again. Ordinary review approval and optional questions do not use this marker.
 
 Blocked tasks retain the `❌` status icon and task ID. A task blocked from the waiting queue can return explicitly to planning or be enqueued again. Canceled tasks leave the active queue and return to their undecorated semantic title.
 
@@ -237,7 +240,7 @@ The queue marker is derived from SQLite's active order, but it counts only tasks
 2. Refine the plan without editing code.
 3. Say `Enqueue`; use `Move` to reprioritize it and `Depends on T0005` only when it truly depends on another task.
 4. The worker invokes settlement, which activates the first eligible task after its dependencies are done.
-5. Codex implements and verifies the change inside that dedicated task.
+5. Codex implements and verifies the change inside that dedicated task. If it needs a blocking confirmation, its title switches from `🔴` to `👉` until you respond.
 6. The task moves to review. Further implementation requests return it to running, then back to review when the changes are ready.
 7. Review the result and say `Approve` in the same task.
 8. Settlement completes the task: it either performs no Git operation for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.

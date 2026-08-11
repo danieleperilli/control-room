@@ -47,9 +47,7 @@ The initial console turn explains that the task is a manual, optional control su
 
 If database initialization fails after task creation, archive the new task and report the error. If the `init` result contains `routing.installed: false`, keep the registered Control Room task, report `routing.error`, and make a later `$control-room init` repair the rule idempotently. A different registered Control Room task or base branch must fail rather than be replaced.
 
-After initialization, first classify the requested outcome of a top-level Local task. Questions, explanations, inspections, diagnoses, audits, reviews, and reports are read-only when the complete request asks for no implementation or other project mutation. Fulfill a purely read-only request without registering the task, allocating a `T_ID`, or changing its title. A concrete plan, design, specification, or brief intended for later implementation counts as change work; a mixed request also counts as change work when any substantive part requests a project change.
-
-For change work, resolve the role on its first substantive turn:
+After initialization, resolve the role at the start of every direct user turn:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts status \
@@ -57,7 +55,11 @@ node <skill-dir>/scripts/control-room.ts status \
     --thread-id <current-thread-id>
 ```
 
-The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. Register only `UNREGISTERED` tasks, derive their semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. The read-only exemption applies only to an unregistered task: a registered worker retains its identity and state during read-only follow-ups, while an unregistered conversation is evaluated again if a later turn requests change work. Explicit `$control-room join` always registers. Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. The project-root routing block installed by `init` makes the skill load before this check.
+The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. When a direct user message reaches a `WORKER` with `awaitingUser: true`, record `USER_INPUT_RECEIVED` and settle before handling the complete message; do not clear the marker for agent messages or background activity. A registered worker otherwise retains its identity and state during read-only follow-ups.
+
+For `UNREGISTERED`, classify the requested outcome before allocating an identity. Questions, explanations, inspections, diagnoses, audits, reviews, and reports are read-only when the complete request asks for no implementation or other project mutation. Fulfill a purely read-only request without registering the task, allocating a `T_ID`, or changing its title. A concrete plan, design, specification, or brief intended for later implementation counts as change work; a mixed request also counts as change work when any substantive part requests a project change. Register change work, derive its semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. An unregistered conversation is evaluated again if a later turn requests change work. Explicit `$control-room join` always registers.
+
+Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. The project-root routing block installed by `init` makes the skill load before this check.
 
 `$control-room join` remains a worker operation. It registers the current existing top-level task:
 
@@ -98,6 +100,15 @@ node <skill-dir>/scripts/control-room.ts request-dependency-remove --project-roo
 ```
 
 Move requests are valid only for `QUEUED` tasks. Dependency changes are valid only in `PLANNING` or `QUEUED` and reject cycles.
+
+Temporarily request direct user attention without changing task state:
+
+```bash
+node <skill-dir>/scripts/control-room.ts request-user-input --project-root <root> --task T0001 --event-key <key>
+node <skill-dir>/scripts/control-room.ts request-user-response --project-root <root> --task T0001 --event-key <key>
+```
+
+`USER_INPUT_REQUESTED` is valid in `PLANNING`, `RUNNING`, or `REVIEW`, sets `awaiting_user`, and projects `👉 T0001 - Semantic name`. Use it only immediately before a blocking question, confirmation, choice, or tool approval. `USER_INPUT_RECEIVED` clears the flag on the next direct user message and restores the title for the unchanged underlying state. Both events preserve state, queue order, dependencies, branches, files, and Git history. Ordinary review approval, optional questions, progress updates, tool output, agent messages, and background activity do not set or clear the flag.
 
 Move between running and review:
 
@@ -145,7 +156,7 @@ Settlement performs the normal operational sequence:
 3. If the project has no `RUNNING`, `REVIEW`, or `APPROVED` task, activate the first dependency-eligible queued task.
 4. Return the final active queue.
 
-Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so any enqueue, move, activation, block, return-to-planning, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes returned-to-planning, completed, and canceled tasks that are absent from the final queue: `PLANNING` receives `⚪️`, `DONE` keeps its returned `🟢` title, and `CANCELED` is reset to the semantic name with no icon, queue marker, or task ID. Retry one failed title operation once, then surface the exact failure.
+Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so user-attention changes update `👉` without changing state, while enqueue, move, activation, block, return-to-planning, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes returned-to-planning, completed, and canceled tasks that are absent from the final queue: `PLANNING` receives `⚪️`, `DONE` keeps its returned `🟢` title, and `CANCELED` is reset to the semantic name with no icon, queue marker, or task ID. Retry one failed title operation once, then surface the exact failure.
 
 When `activation.activated` is true, send `activation.executionBrief` directly to its worker. Do not route it through the manual console. If the activated worker is the caller, continue there without sending a background message.
 
@@ -183,6 +194,7 @@ PLANNING, QUEUED, RUNNING, REVIEW, BLOCKED -> CANCELED
 ```
 
 - Processed events move tasks into `PLANNING` after a safe blocked-waiting demotion, `QUEUED`, `RUNNING` after rework, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`.
+- `awaiting_user` overlays `👉` on `PLANNING`, `RUNNING`, or `REVIEW` without changing the state machine and clears on the next direct user message.
 - Activation inside settlement moves `QUEUED -> RUNNING`.
 - Approval completion inside settlement moves `APPROVED -> DONE`.
 - Dependencies are satisfied only by `DONE`.

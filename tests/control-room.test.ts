@@ -437,6 +437,55 @@ test("uses the review marker and red when review rework starts", () => {
     assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🔴 T0001 - Refine review");
 });
 
+test("uses the pointing hand while a task awaits user input", () => {
+    const baseTask = {
+        task_id: "T0001",
+        semantic_name: "Confirm implementation",
+        awaiting_user: 1
+    };
+    assert.equal(core.titleForTask({ ...baseTask, state: "PLANNING" }), "👉 T0001 - Confirm implementation");
+    assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "👉 T0001 - Confirm implementation");
+    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "👉 T0001 - Confirm implementation");
+    assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Confirm implementation");
+});
+
+test("marks a running task for user attention and restores red after the response", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Confirm implementation", "enqueue-1");
+    const initialTask = core.getStatus(options, "T0001").task;
+    const initialHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+
+    const requested = runCli(["request-user-input", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", "user-input-1"]);
+    assert.equal(requested.status, 0, requested.stderr || requested.stdout);
+    const waiting = core.settleProject(options);
+    assert.equal(waiting.processed.results[0].action, "USER_INPUT_REQUESTED");
+    assert.equal(waiting.queue[0].state, "RUNNING");
+    assert.equal(waiting.queue[0].awaitingUser, true);
+    assert.equal(waiting.queue[0].title, "👉 T0001 - Confirm implementation");
+    assert.equal(waiting.queue[0].queuePosition, initialTask.queuePosition);
+    assert.equal(waiting.queue[0].branchName, initialTask.branchName);
+    assert.deepEqual(waiting.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "👉 T0001 - Confirm implementation" }]);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
+
+    const responded = runCli(["request-user-response", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", "user-response-1"]);
+    assert.equal(responded.status, 0, responded.stderr || responded.stdout);
+    const resumed = core.settleProject(options);
+    assert.equal(resumed.processed.results[0].action, "USER_INPUT_RECEIVED");
+    assert.equal(resumed.queue[0].state, "RUNNING");
+    assert.equal(resumed.queue[0].awaitingUser, false);
+    assert.equal(resumed.queue[0].title, "🔴 T0001 - Confirm implementation");
+    assert.equal(resumed.queue[0].queuePosition, initialTask.queuePosition);
+    assert.equal(resumed.queue[0].branchName, initialTask.branchName);
+    assert.deepEqual(resumed.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "🔴 T0001 - Confirm implementation" }]);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
+
+    const retry = core.submitEvent(options, "user-response-1", "T0001", "USER_INPUT_RECEIVED", {});
+    assert.equal(retry.created, false);
+    assert.equal(retry.processed, true);
+});
+
 test("derives queued position markers without storing them in the semantic name", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
@@ -532,14 +581,17 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 7);
+    assert.equal(version, 8);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
+    assert.ok(taskColumns.includes("awaiting_user"));
     assert.match(dependencySql, /BLOCKING/);
     assert.match(eventSql, /MOVE_REQUESTED/);
     assert.match(eventSql, /REWORK_REQUESTED/);
     assert.match(eventSql, /RUN_NOW_REQUESTED/);
     assert.match(eventSql, /PLANNING_REQUESTED/);
+    assert.match(eventSql, /USER_INPUT_REQUESTED/);
+    assert.match(eventSql, /USER_INPUT_RECEIVED/);
     assert.equal(migratedDependency.dependency_kind, "BLOCKING");
     assert.equal(migratedEvent.kind, "ENQUEUE_REQUESTED");
 });
@@ -574,8 +626,11 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 7);
-    assert.match(migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql, /PLANNING_REQUESTED/);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
+    const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
+    assert.match(migratedEventSql, /PLANNING_REQUESTED/);
+    assert.match(migratedEventSql, /USER_INPUT_REQUESTED/);
     migratedDatabase.close();
 });
 
@@ -1436,6 +1491,8 @@ test("documents queue and help as global read-only commands", () => {
     assert.match(cliResult.stdout, /Move first/);
     assert.match(cliResult.stdout, /Run now/);
     assert.match(cliResult.stdout, /Depends on T0002/);
+    assert.match(cliResult.stdout, /request-user-input --project-root/);
+    assert.match(cliResult.stdout, /request-user-response --project-root/);
 });
 
 test("documents init as creation of a silent manual Control Room task", () => {
@@ -1455,10 +1512,20 @@ test("documents project-scoped automatic registration and mandatory title synchr
     assert.match(skillText, /concrete plan, design, specification, or brief intended for a later project change as change work/);
     assert.match(skillText, /If a later message in an unregistered conversation requests change work, evaluate registration again/);
     assert.match(skillText, /Explicit `\$control-room join` always adopts the task/);
-    assert.match(skillText, /If it returns `UNREGISTERED`, derive a short semantic name/);
+    assert.match(skillText, /If it returns `UNREGISTERED`, classify the requested outcome/);
     assert.match(skillText, /If the project is not initialized, continue without registration or commentary/);
     assert.match(skillText, /active `AGENTS\.md` or `AGENTS\.override\.md` at the project Git root/);
     assert.match(skillText, /Never modify global Codex instructions/);
     assert.match(skillText, /Apply every `titleUpdates` entry with the Codex app title tool before sending the final response/);
     assert.match(skillText, /A `DONE` task must receive its returned `🟢` title/);
+});
+
+test("documents the temporary user-attention marker and direct-response reset", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
+    assert.match(skillText, /Awaiting direct user input from `PLANNING`, `RUNNING`, or `REVIEW`: `👉 T0001 - Semantic name`/);
+    assert.match(skillText, /does not change the underlying task state, queue order, branch, or Git behavior/);
+    assert.match(skillText, /Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`/);
+    assert.match(skillText, /Do not clear attention for agent messages, activation briefs, tool output, automatic continuations, or background activity/);
+    assert.match(protocolText, /`USER_INPUT_RECEIVED` clears the flag on the next direct user message/);
 });

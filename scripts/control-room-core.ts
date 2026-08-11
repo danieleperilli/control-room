@@ -6,7 +6,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 
 interface IControlRoomOptions {
     projectRoot: string;
@@ -49,6 +49,7 @@ interface ITaskRow {
     thread_id: string;
     state: TaskState;
     blocked_from_state: TaskState | null;
+    awaiting_user: number;
     queue_position: number | null;
     queued_display_position?: number | null;
     base_commit: string | null;
@@ -286,7 +287,7 @@ function validateQueuePosition(position: number | undefined): number {
  * @param payload Caller-supplied event payload.
  */
 function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPayload {
-    if (kind === "PLANNING_REQUESTED") {
+    if (kind === "PLANNING_REQUESTED" || kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
         return {};
     }
     if (kind === "ENQUEUE_REQUESTED") {
@@ -448,7 +449,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 7, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 8, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -471,6 +472,7 @@ function initializeSchema(database: any): void {
                 thread_id TEXT NOT NULL UNIQUE,
                 state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'DONE', 'BLOCKED', 'CANCELED')),
                 blocked_from_state TEXT CHECK (blocked_from_state IN ('QUEUED', 'RUNNING', 'REVIEW')),
+                awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1)),
                 queue_position INTEGER,
                 base_commit TEXT,
                 branch_name TEXT,
@@ -490,7 +492,7 @@ function initializeSchema(database: any): void {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -505,6 +507,9 @@ function initializeSchema(database: any): void {
         }
         if (!databaseHasColumn(database, "tasks", "reviewed_commit")) {
             database.exec("ALTER TABLE tasks ADD COLUMN reviewed_commit TEXT");
+        }
+        if (!databaseHasColumn(database, "tasks", "awaiting_user")) {
+            database.exec("ALTER TABLE tasks ADD COLUMN awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1))");
         }
         const projectTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'").get() as { sql: string } | undefined;
         if (projectTable && projectTable.sql.includes("local-ff-only")) {
@@ -550,14 +555,14 @@ function initializeSchema(database: any): void {
             `);
         }
         const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
-        if (eventTable && !eventTable.sql.includes("PLANNING_REQUESTED")) {
+        if (eventTable && (!eventTable.sql.includes("USER_INPUT_REQUESTED") || !eventTable.sql.includes("USER_INPUT_RECEIVED"))) {
             database.exec(`
                 ALTER TABLE events RENAME TO events_legacy;
                 CREATE TABLE events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_key TEXT NOT NULL UNIQUE,
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     processed_at TEXT,
@@ -572,7 +577,7 @@ function initializeSchema(database: any): void {
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 7;
+            PRAGMA user_version = 8;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -681,7 +686,9 @@ function titleForTask(task: ITaskRow): string {
         return task.semantic_name;
     }
     let prefix = "";
-    if (task.state === "PLANNING") {
+    if (task.awaiting_user && (task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW")) {
+        prefix = "👉 ";
+    } else if (task.state === "PLANNING") {
         prefix = "⚪️ ";
     } else if (task.state === "QUEUED") {
         const positionMarker = queuePositionMarker(task.queued_display_position ?? task.queue_position);
@@ -718,6 +725,7 @@ function serializeTask(task: ITaskRow): Record<string, unknown> {
         semanticName: task.semantic_name,
         threadId: task.thread_id,
         state: task.state,
+        awaitingUser: Boolean(task.awaiting_user),
         title: titleForTask(task),
         queuePosition: task.queue_position,
         queuedPosition: task.queued_display_position ?? null,
@@ -945,6 +953,8 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot change dependencies for ${task.task_id} from ${task.state}.`);
             assertCondition(validPayload.dependencyTaskId !== task.task_id, "A task cannot depend on itself.");
             requireTask(store, String(validPayload.dependencyTaskId));
+        } else if (kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
+            assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot update user-input attention for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REWORK_REQUESTED") {
@@ -1075,7 +1085,7 @@ function applyPlanningEvent(store: IStore, task: ITaskRow): Record<string, unkno
     assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
     store.database.prepare(`
         UPDATE tasks
-        SET state = 'PLANNING', blocked_from_state = NULL, queue_position = NULL, updated_at = ?
+        SET state = 'PLANNING', blocked_from_state = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ?
         WHERE task_id = ?
     `).run(currentTimestamp(), task.task_id);
     const titleUpdates = compactActiveQueue(store);
@@ -1123,7 +1133,7 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
     }
     store.database.prepare(`
         UPDATE tasks
-        SET state = 'QUEUED', blocked_from_state = NULL, base_commit = NULL,
+        SET state = 'QUEUED', blocked_from_state = NULL, awaiting_user = 0, base_commit = NULL,
             branch_name = NULL, reviewed_commit = NULL, updated_at = ?
         WHERE task_id = ?
     `).run(currentTimestamp(), task.task_id);
@@ -1274,6 +1284,21 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     if (event.kind === "DEPENDENCY_REMOVE_REQUESTED") {
         return applyDependencyEvent(store, task, payload, false);
     }
+    if (event.kind === "USER_INPUT_REQUESTED") {
+        assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot request user input for ${task.task_id} from ${task.state}.`);
+        if (task.awaiting_user) {
+            return { action: "USER_INPUT_ALREADY_REQUESTED", task: serializeTask(task) };
+        }
+        store.database.prepare("UPDATE tasks SET awaiting_user = 1, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        return { action: "USER_INPUT_REQUESTED", task: serializeTask(requireTask(store, task.task_id)) };
+    }
+    if (event.kind === "USER_INPUT_RECEIVED") {
+        if (!task.awaiting_user) {
+            return { action: "USER_INPUT_ALREADY_RECEIVED", task: serializeTask(task) };
+        }
+        store.database.prepare("UPDATE tasks SET awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        return { action: "USER_INPUT_RECEIVED", task: serializeTask(requireTask(store, task.task_id)) };
+    }
     if (event.kind === "REVIEW_REQUESTED") {
         if (task.state === "APPROVED" || task.state === "DONE") {
             return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null };
@@ -1282,7 +1307,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
             return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null };
         }
         assertCondition(task.state === "RUNNING", `Cannot request review for ${task.task_id} from ${task.state}.`);
-        store.database.prepare("UPDATE tasks SET state = 'REVIEW', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        store.database.prepare("UPDATE tasks SET state = 'REVIEW', awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "REVIEW_READY", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
@@ -1291,7 +1316,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
             return { action: "REWORK_ALREADY_STARTED", task: serializeTask(task), summary: payload.summary || null };
         }
         assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
-        store.database.prepare("UPDATE tasks SET state = 'RUNNING', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        store.database.prepare("UPDATE tasks SET state = 'RUNNING', awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "REWORK_STARTED", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
@@ -1303,7 +1328,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         assertCondition(task.state === "REVIEW", `Cannot approve ${task.task_id} from ${task.state}.`);
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Approval requires a direct user request ID.");
         const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
-        store.database.prepare("UPDATE tasks SET state = 'APPROVED', updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage };
     }
@@ -1313,7 +1338,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
             return { action: "CANCELLATION_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId };
         }
         assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
-        store.database.prepare("UPDATE tasks SET state = 'CANCELED', blocked_from_state = NULL, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        store.database.prepare("UPDATE tasks SET state = 'CANCELED', blocked_from_state = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const activeRows = store.database.prepare(`
             SELECT task_id FROM tasks
             WHERE state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
@@ -1333,7 +1358,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     }
     assertCondition(task.state === "QUEUED" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot block ${task.task_id} from ${task.state}.`);
     assertCondition(payload.reason && payload.reason.trim().length > 0, "A blocked event requires a reason.");
-    store.database.prepare("UPDATE tasks SET state = 'BLOCKED', blocked_from_state = ?, updated_at = ? WHERE task_id = ?").run(task.state, currentTimestamp(), task.task_id);
+    store.database.prepare("UPDATE tasks SET state = 'BLOCKED', blocked_from_state = ?, awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(task.state, currentTimestamp(), task.task_id);
     const titleUpdates = task.state === "QUEUED" ? readQueuedTitleUpdates(store, task.queue_position || 1) : [];
     const refreshedTask = requireTask(store, task.task_id);
     return { action: "BLOCKED", task: serializeTask(refreshedTask), reason: payload.reason, titleUpdates };
@@ -1476,7 +1501,7 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
         }
         store.database.prepare(`
             UPDATE tasks
-            SET state = 'RUNNING', base_commit = ?, branch_name = ?, reviewed_commit = NULL, updated_at = ?
+            SET state = 'RUNNING', awaiting_user = 0, base_commit = ?, branch_name = ?, reviewed_commit = NULL, updated_at = ?
             WHERE task_id = ?
         `).run(currentBaseCommit, workerBranch, currentTimestamp(), selectedTask.task_id);
         const runningTask = requireTask(store, selectedTask.task_id);
@@ -1525,7 +1550,7 @@ function resumeTask(options: IControlRoomOptions, taskId: string): Record<string
             assertCondition(!exclusiveTask, exclusiveTask ? `Another task is active: ${exclusiveTask.task_id}` : "Project is not idle.");
         }
         const resumedQueuePosition = task.blocked_from_state === "QUEUED" ? task.queue_position || 1 : null;
-        store.database.prepare("UPDATE tasks SET state = blocked_from_state, blocked_from_state = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        store.database.prepare("UPDATE tasks SET state = blocked_from_state, blocked_from_state = NULL, awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const resumedTask = requireTask(store, task.task_id);
         const titleUpdates = resumedQueuePosition ? readQueuedTitleUpdates(store, resumedQueuePosition) : [];
         commitTransaction(store.database);
@@ -1749,13 +1774,13 @@ function finalizeApprovedCommit(store: IStore, taskId: string, committedCommit: 
         if (branchDeleted) {
             store.database.prepare(`
                 UPDATE tasks
-                SET state = 'DONE', branch_name = NULL, integrated_commit = ?, queue_position = NULL, updated_at = ?
+                SET state = 'DONE', branch_name = NULL, awaiting_user = 0, integrated_commit = ?, queue_position = NULL, updated_at = ?
                 WHERE task_id = ?
             `).run(committedCommit, currentTimestamp(), task.task_id);
         } else {
             store.database.prepare(`
                 UPDATE tasks
-                SET state = 'DONE', integrated_commit = ?, queue_position = NULL, updated_at = ?
+                SET state = 'DONE', awaiting_user = 0, integrated_commit = ?, queue_position = NULL, updated_at = ?
                 WHERE task_id = ?
             `).run(committedCommit, currentTimestamp(), task.task_id);
         }
@@ -1797,7 +1822,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         assertCondition(!project.integration_task_id, `Commit lease is already held by ${project.integration_task_id}; use recover-commit only after confirming the prior process ended.`);
         const workingTreeStatus = readWorkingTreeStatus(store.projectRoot);
         if (workingTreeStatus.length === 0) {
-            store.database.prepare("UPDATE tasks SET state = 'DONE', queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+            store.database.prepare("UPDATE tasks SET state = 'DONE', awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
             const titleUpdates = compactActiveQueue(store);
             const completedTask = requireTask(store, task.task_id);
             commitTransaction(store.database);

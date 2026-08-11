@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, user-attention signaling, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only requests unregistered; or when the user says Return to planning, Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
+description: Coordinate top-level Codex project tasks through deterministic planning, queueing, immediate eligible execution, dependencies, queue reordering, running-task user-attention signaling, activation-time worker branches, iterative review, approval-only Git integration, cancellation, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only requests unregistered; or when the user says Return to planning, Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
 ---
 
 # ControlRoom
@@ -96,7 +96,7 @@ Read [references/protocol.md](references/protocol.md) before the first state-cha
 
 Use every returned title exactly:
 
-- Awaiting direct user input from `PLANNING`, `RUNNING`, or `REVIEW`: `👉 T0001 - Semantic name`
+- `RUNNING` while awaiting direct user input: `👉 T0001 - Semantic name`
 - `PLANNING`: `⚪️ T0001 - Semantic name`
 - `QUEUED`: concatenate one circled glyph per decimal digit, such as `⭕️ ① T0001 - Semantic name` or `⭕️ ①⓪ T0010 - Semantic name`
 - `RUNNING`: `🔴 T0001 - Semantic name`
@@ -106,7 +106,7 @@ Use every returned title exactly:
 - `BLOCKED`: `❌ T0001 - Semantic name`
 - `CANCELED`: `Semantic name`, with every ControlRoom icon, queue marker, and task ID removed
 
-The `👉` marker is a temporary presentation override backed by `awaiting_user`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. Persist only numeric `queue_position` and the undecorated semantic name.
+The `👉` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. Persist only numeric `queue_position` and the undecorated semantic name.
 
 After every settlement, apply the title of every task in the returned final `queue`, plus any returned-to-planning, completed, or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A task returned to `PLANNING` must receive its `⚪️` title. A `DONE` task must receive its returned `🟢` title, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that user-input signaling refreshes `👉` and that enqueueing, moving, activation, blocking, return-to-planning, resumption, cancellation, and completion immediately renumber every remaining queued title.
 
@@ -137,7 +137,7 @@ Generate one caller-stable event key for each user request and reuse it only for
 
 ## Signal blocking user input
 
-Use the attention marker only when a `PLANNING`, `RUNNING`, or `REVIEW` worker cannot make meaningful progress without a direct answer, confirmation, choice, or tool approval from the user. Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`.
+Use the attention marker only when a `RUNNING` worker cannot make meaningful progress without a direct answer, confirmation, choice, or tool approval from the user. Never set it in `PLANNING` or `REVIEW`; ask any question there without replacing the state icon. Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`.
 
 Before ending the turn with a blocking request, submit and settle:
 

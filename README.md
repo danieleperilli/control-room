@@ -221,14 +221,14 @@ ControlRoom keeps task titles synchronized with their state:
 | Queued | `⭕️ ① T0001 - Add audit log` |
 | Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
-| Awaiting your response | `👉 T0001 - Add audit log` |
+| Running, awaiting your response | `👉 T0001 - Add audit log` |
 | Review | `💪 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
 | Done | `🟢 T0001 - Add audit log` |
 | Blocked | `❌ T0001 - Add audit log` |
 | Canceled | `Add audit log` |
 
-When a planning, running, or review task cannot continue without your direct answer, confirmation, choice, or approval, it temporarily switches to `👉`. The underlying state, queue order, branch, and files do not change. Your next direct message restores the normal state icon before the task continues; if it still needs an answer, it shows `👉` again. Ordinary review approval and optional questions do not use this marker.
+When a running task cannot continue without your direct answer, confirmation, choice, or approval, it temporarily switches from `🔴` to `👉`. The underlying state, queue order, branch, and files do not change. Your next direct message restores `🔴` before the task continues; if it still needs an answer, it shows `👉` again. Planning and review tasks always retain their normal state icons, even when Codex asks a question. Ordinary review approval and optional questions do not use this marker.
 
 Blocked tasks retain the `❌` status icon and task ID. A task blocked from the waiting queue can return explicitly to planning or be enqueued again. Canceled tasks leave the active queue and return to their undecorated semantic title.
 

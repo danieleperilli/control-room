@@ -437,16 +437,29 @@ test("uses the review marker and red when review rework starts", () => {
     assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🔴 T0001 - Refine review");
 });
 
-test("uses the pointing hand while a task awaits user input", () => {
+test("uses the pointing hand only while a running task awaits user input", () => {
     const baseTask = {
         task_id: "T0001",
         semantic_name: "Confirm implementation",
         awaiting_user: 1
     };
-    assert.equal(core.titleForTask({ ...baseTask, state: "PLANNING" }), "👉 T0001 - Confirm implementation");
+    assert.equal(core.titleForTask({ ...baseTask, state: "PLANNING" }), "⚪️ T0001 - Confirm implementation");
     assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "👉 T0001 - Confirm implementation");
-    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "👉 T0001 - Confirm implementation");
+    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "💪 T0001 - Confirm implementation");
     assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Confirm implementation");
+});
+
+test("rejects user-attention requests while a task is planning", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.registerTask(options, "thread-one", "Confirm implementation");
+
+    assert.throws(
+        () => core.submitEvent(options, "user-input-planning", "T0001", "USER_INPUT_REQUESTED", {}),
+        /Cannot request user input for T0001 from PLANNING/
+    );
+    assert.equal(core.getStatus(options, "T0001").task.title, "⚪️ T0001 - Confirm implementation");
 });
 
 test("marks a running task for user attention and restores red after the response", () => {
@@ -1523,8 +1536,9 @@ test("documents project-scoped automatic registration and mandatory title synchr
 test("documents the temporary user-attention marker and direct-response reset", () => {
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
-    assert.match(skillText, /Awaiting direct user input from `PLANNING`, `RUNNING`, or `REVIEW`: `👉 T0001 - Semantic name`/);
+    assert.match(skillText, /`RUNNING` while awaiting direct user input: `👉 T0001 - Semantic name`/);
     assert.match(skillText, /does not change the underlying task state, queue order, branch, or Git behavior/);
+    assert.match(skillText, /Never set it in `PLANNING` or `REVIEW`/);
     assert.match(skillText, /Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`/);
     assert.match(skillText, /Do not clear attention for agent messages, activation briefs, tool output, automatic continuations, or background activity/);
     assert.match(protocolText, /`USER_INPUT_RECEIVED` clears the flag on the next direct user message/);

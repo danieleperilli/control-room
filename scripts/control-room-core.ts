@@ -686,7 +686,7 @@ function titleForTask(task: ITaskRow): string {
         return task.semantic_name;
     }
     let prefix = "";
-    if (task.awaiting_user && (task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW")) {
+    if (task.awaiting_user && task.state === "RUNNING") {
         prefix = "👉 ";
     } else if (task.state === "PLANNING") {
         prefix = "⚪️ ";
@@ -953,7 +953,9 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot change dependencies for ${task.task_id} from ${task.state}.`);
             assertCondition(validPayload.dependencyTaskId !== task.task_id, "A task cannot depend on itself.");
             requireTask(store, String(validPayload.dependencyTaskId));
-        } else if (kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
+        } else if (kind === "USER_INPUT_REQUESTED") {
+            assertCondition(task.state === "RUNNING", `Cannot request user input for ${task.task_id} from ${task.state}.`);
+        } else if (kind === "USER_INPUT_RECEIVED") {
             assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot update user-input attention for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
@@ -1285,7 +1287,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return applyDependencyEvent(store, task, payload, false);
     }
     if (event.kind === "USER_INPUT_REQUESTED") {
-        assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot request user input for ${task.task_id} from ${task.state}.`);
+        assertCondition(task.state === "RUNNING", `Cannot request user input for ${task.task_id} from ${task.state}.`);
         if (task.awaiting_user) {
             return { action: "USER_INPUT_ALREADY_REQUESTED", task: serializeTask(task) };
         }

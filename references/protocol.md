@@ -108,7 +108,7 @@ node <skill-dir>/scripts/control-room.ts request-user-input --project-root <root
 node <skill-dir>/scripts/control-room.ts request-user-response --project-root <root> --task T0001 --event-key <key>
 ```
 
-`USER_INPUT_REQUESTED` is valid in `PLANNING`, `RUNNING`, or `REVIEW`, sets `awaiting_user`, and projects `👉 T0001 - Semantic name`. Use it only immediately before a blocking question, confirmation, choice, or tool approval. `USER_INPUT_RECEIVED` clears the flag on the next direct user message and restores the title for the unchanged underlying state. Both events preserve state, queue order, dependencies, branches, files, and Git history. Ordinary review approval, optional questions, progress updates, tool output, agent messages, and background activity do not set or clear the flag.
+`USER_INPUT_REQUESTED` is valid only in `RUNNING`, sets `awaiting_user`, and projects `👉 T0001 - Semantic name`. Use it only immediately before a blocking question, confirmation, choice, or tool approval. Never set it in `PLANNING` or `REVIEW`; questions in those states retain their normal state icons. `USER_INPUT_RECEIVED` clears the flag on the next direct user message and restores the red running title. Both events preserve state, queue order, dependencies, branches, files, and Git history. Ordinary review approval, optional questions, progress updates, tool output, agent messages, and background activity do not set or clear the flag.
 
 Move between running and review:
 
@@ -194,7 +194,7 @@ PLANNING, QUEUED, RUNNING, REVIEW, BLOCKED -> CANCELED
 ```
 
 - Processed events move tasks into `PLANNING` after a safe blocked-waiting demotion, `QUEUED`, `RUNNING` after rework, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`.
-- `awaiting_user` overlays `👉` on `PLANNING`, `RUNNING`, or `REVIEW` without changing the state machine and clears on the next direct user message.
+- `awaiting_user` overlays `👉` only on `RUNNING` without changing the state machine and clears on the next direct user message.
 - Activation inside settlement moves `QUEUED -> RUNNING`.
 - Approval completion inside settlement moves `APPROVED -> DONE`.
 - Dependencies are satisfied only by `DONE`.

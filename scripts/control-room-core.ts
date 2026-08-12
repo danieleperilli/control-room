@@ -6,7 +6,11 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "MENTAL_MODEL_RECORDED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
+type DecisionConfidence = "low" | "medium" | "high";
+type DecisionImpact = "low" | "medium" | "high";
+type DecisionInputStatus = "active" | "unresolved";
+type DecisionStatus = DecisionInputStatus | "superseded";
 
 interface IControlRoomOptions {
     projectRoot: string;
@@ -15,13 +19,65 @@ interface IControlRoomOptions {
 
 interface IEventPayload {
     afterTaskId?: string;
+    affectedAreas?: string;
+    alternatives?: string;
+    approach?: string;
     beforeTaskId?: string;
+    cancelSource?: "cancel" | "exclude";
     commitMessage?: string;
+    confidence?: DecisionConfidence;
+    currentState?: string;
+    decision?: string;
     dependencyTaskId?: string;
+    desiredOutcome?: string;
+    evidence?: string;
+    exclusionReason?: string;
+    impact?: DecisionImpact;
+    invariants?: string;
+    nonGoals?: string;
     position?: number;
     reason?: string;
+    rationale?: string;
+    status?: DecisionInputStatus;
     summary?: string;
+    supersedesDecisionId?: string;
+    uncertainty?: string;
     userRequestId?: string;
+    verification?: string;
+}
+
+interface IMentalModel {
+    currentState: string;
+    desiredOutcome: string;
+    approach: string;
+    affectedAreas: string;
+    invariants: string;
+    nonGoals: string;
+    verification: string;
+}
+
+interface IDecision {
+    decisionId: string;
+    decision: string;
+    rationale: string;
+    confidence: DecisionConfidence;
+    impact: DecisionImpact;
+    evidence: string;
+    alternatives: string | null;
+    uncertainty: string | null;
+    supersedesDecisionId: string | null;
+    supersededByDecisionId: string | null;
+    status: DecisionStatus;
+}
+
+interface IReviewPacket {
+    taskId: string;
+    baseline: IMentalModel | null;
+    final: IMentalModel | null;
+    changedFields: string[];
+    decisionCount: number;
+    unresolvedDecisionIds: string[];
+    decisions: IDecision[];
 }
 
 interface IStore {
@@ -60,6 +116,12 @@ interface ITaskRow {
     updated_at: string;
 }
 
+interface ITaskExclusionRow {
+    thread_id: string;
+    reason: string;
+    created_at: string;
+}
+
 interface IEventRow {
     sequence: number;
     event_key: string;
@@ -81,6 +143,7 @@ interface ITitleUpdate {
 }
 
 const TASK_ID_PATTERN = /^T\d{4}$/;
+const DECISION_ID_PATTERN = /^D(?:00[1-9]|0[1-9]\d|[1-9]\d{2})$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const ACTIVE_STATES: TaskState[] = ["QUEUED", "RUNNING", "REVIEW", "APPROVED", "BLOCKED"];
 const QUEUE_POSITION_DIGITS = ["⓪", "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
@@ -105,6 +168,7 @@ const TASK_WITH_QUEUED_POSITION_SELECT = `
 `;
 const GIT_MODE = "local-approval-commit";
 const ROUTING_FILE_LIMIT_BYTES = 1024 * 1024;
+const MENTAL_MODEL_FIELDS: Array<keyof IMentalModel> = ["currentState", "desiredOutcome", "approach", "affectedAreas", "invariants", "nonGoals", "verification"];
 
 /**
  * Reject an invalid condition with a stable error message.
@@ -247,6 +311,52 @@ function validateCompactText(value: string | undefined, fieldName: string, maxim
 }
 
 /**
+ * Validate a stable task-local decision identifier.
+ * @param decisionId Decision identifier supplied by the caller.
+ */
+function validateDecisionId(decisionId: string): string {
+    assertCondition(typeof decisionId === "string" && DECISION_ID_PATTERN.test(decisionId), `Invalid decision ID: ${String(decisionId)}`);
+    return decisionId;
+}
+
+/**
+ * Validate and normalize one complete mental-model snapshot.
+ * @param payload Caller-supplied event payload.
+ */
+function validateMentalModelPayload(payload: IEventPayload): IMentalModel {
+    return {
+        currentState: String(validateCompactText(payload.currentState, "Current state", 2000, true)),
+        desiredOutcome: String(validateCompactText(payload.desiredOutcome, "Desired outcome", 2000, true)),
+        approach: String(validateCompactText(payload.approach, "Approach", 2000, true)),
+        affectedAreas: String(validateCompactText(payload.affectedAreas, "Affected areas", 2000, true)),
+        invariants: String(validateCompactText(payload.invariants, "Invariants", 2000, true)),
+        nonGoals: String(validateCompactText(payload.nonGoals, "Non-goals", 2000, true)),
+        verification: String(validateCompactText(payload.verification, "Verification", 2000, true))
+    };
+}
+
+/**
+ * Validate and normalize one task-local macro decision.
+ * @param payload Caller-supplied event payload.
+ */
+function validateDecisionPayload(payload: IEventPayload): IEventPayload {
+    assertCondition(payload.confidence === "low" || payload.confidence === "medium" || payload.confidence === "high", "Decision confidence must be low, medium, or high.");
+    assertCondition(payload.impact === "low" || payload.impact === "medium" || payload.impact === "high", "Decision impact must be low, medium, or high.");
+    assertCondition(payload.status === "active" || payload.status === "unresolved", "Decision status must be active or unresolved.");
+    return {
+        decision: validateCompactText(payload.decision, "Decision", 2000, true),
+        rationale: validateCompactText(payload.rationale, "Decision rationale", 2000, true),
+        confidence: payload.confidence,
+        impact: payload.impact,
+        evidence: validateCompactText(payload.evidence, "Decision evidence", 2000, true),
+        alternatives: validateCompactText(payload.alternatives, "Decision alternatives", 2000, false),
+        uncertainty: validateCompactText(payload.uncertainty, "Decision uncertainty", 2000, false),
+        supersedesDecisionId: payload.supersedesDecisionId ? validateDecisionId(payload.supersedesDecisionId) : undefined,
+        status: payload.status
+    };
+}
+
+/**
  * Validate a concise one-line Git commit subject.
  * @param commitMessage Commit subject supplied with direct approval.
  */
@@ -312,6 +422,12 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
             dependencyTaskId: validateTaskId(String(payload.dependencyTaskId || ""))
         };
     }
+    if (kind === "MENTAL_MODEL_RECORDED") {
+        return validateMentalModelPayload(payload);
+    }
+    if (kind === "DECISION_RECORDED") {
+        return validateDecisionPayload(payload);
+    }
     if (kind === "REVIEW_REQUESTED" || kind === "REWORK_REQUESTED") {
         return {
             summary: validateCompactText(payload.summary, kind === "REVIEW_REQUESTED" ? "Review summary" : "Rework summary", 2000, false)
@@ -324,7 +440,11 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
         };
     }
     if (kind === "CANCEL_REQUESTED") {
+        const cancelSource = payload.cancelSource || "cancel";
+        assertCondition(cancelSource === "cancel" || cancelSource === "exclude", "Cancellation source must be cancel or exclude.");
         return {
+            cancelSource,
+            exclusionReason: cancelSource === "exclude" ? validateCompactText(payload.exclusionReason, "Exclusion reason", 200, true) : undefined,
             userRequestId: validateCompactText(payload.userRequestId, "Direct user request ID", 200, true)
         };
     }
@@ -449,7 +569,7 @@ function databaseHasColumn(database: any, tableName: string, columnName: string)
 function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= 8, `Unsupported Control Room schema version: ${schemaVersion}`);
+    assertCondition(schemaVersion >= 0 && schemaVersion <= 10, `Unsupported Control Room schema version: ${schemaVersion}`);
     beginTransaction(database);
     try {
         database.exec(`
@@ -481,6 +601,11 @@ function initializeSchema(database: any): void {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS task_exclusions (
+                thread_id TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS dependencies (
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
                 depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
@@ -492,7 +617,7 @@ function initializeSchema(database: any): void {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
                 task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -555,14 +680,14 @@ function initializeSchema(database: any): void {
             `);
         }
         const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
-        if (eventTable && (!eventTable.sql.includes("USER_INPUT_REQUESTED") || !eventTable.sql.includes("USER_INPUT_RECEIVED"))) {
+        if (eventTable && (!eventTable.sql.includes("USER_INPUT_REQUESTED") || !eventTable.sql.includes("USER_INPUT_RECEIVED") || !eventTable.sql.includes("MENTAL_MODEL_RECORDED") || !eventTable.sql.includes("DECISION_RECORDED"))) {
             database.exec(`
                 ALTER TABLE events RENAME TO events_legacy;
                 CREATE TABLE events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_key TEXT NOT NULL UNIQUE,
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     processed_at TEXT,
@@ -577,7 +702,7 @@ function initializeSchema(database: any): void {
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = 8;
+            PRAGMA user_version = 10;
         `);
         commitTransaction(database);
     } catch (error) {
@@ -821,6 +946,9 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "# ControlRoom project routing",
         "",
         "- In every top-level task for this project, load and follow `$control-room` before handling each user message.",
+        "- Persistently exclude an unregistered task before automatic registration when it invokes or triggers `$brand-forge`, or when its message contains the exact standalone `$control-room exclude` directive.",
+        "- For a registered PLANNING or QUEUED task, route `$control-room exclude` through cancellation and settlement so it leaves the queue and regains its undecorated semantic title.",
+        "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
         "- Apply every ControlRoom task title update before replying.",
         "- Do not apply ControlRoom to subagents or side chats.",
@@ -856,20 +984,89 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
 }
 
 /**
+ * Persistently exclude one unregistered top-level task from Control Room.
+ * @param options Project and optional state-root settings.
+ * @param threadId Codex thread identifier to exclude.
+ * @param reason Compact reason for the exclusion.
+ */
+function excludeTask(options: IControlRoomOptions, threadId: string, reason: string): Record<string, unknown> {
+    const validThreadId = validateThreadId(threadId);
+    const validReason = String(validateCompactText(reason, "Exclusion reason", 200, true));
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        const project = requireProject(store);
+        assertCondition(project.coordinator_thread_id !== validThreadId, "The Control Room task cannot be excluded.");
+        const existingTask = store.database.prepare("SELECT task_id FROM tasks WHERE thread_id = ?").get(validThreadId) as { task_id: string } | undefined;
+        assertCondition(!existingTask, `Registered worker ${existingTask?.task_id || ""} must use request-exclude from PLANNING or QUEUED.`);
+        const existingExclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
+        if (existingExclusion) {
+            commitTransaction(store.database);
+            return {
+                created: false,
+                projectRoot: store.projectRoot,
+                controlRoomThreadId: project.coordinator_thread_id,
+                role: "EXCLUDED",
+                task: null,
+                exclusion: { reason: existingExclusion.reason, createdAt: existingExclusion.created_at }
+            };
+        }
+        const timestamp = currentTimestamp();
+        store.database.prepare("INSERT INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(validThreadId, validReason, timestamp);
+        commitTransaction(store.database);
+        return {
+            created: true,
+            projectRoot: store.projectRoot,
+            controlRoomThreadId: project.coordinator_thread_id,
+            role: "EXCLUDED",
+            task: null,
+            exclusion: { reason: validReason, createdAt: timestamp }
+        };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
  * Allocate or retrieve a stable top-level task ID.
  * @param options Project and optional state-root settings.
  * @param threadId Worker Codex thread identifier.
  * @param semanticName Short user-facing task name.
+ * @param adoptExcluded Whether an explicit join may remove a prior exclusion.
  */
-function registerTask(options: IControlRoomOptions, threadId: string, semanticName: string): Record<string, unknown> {
+function registerTask(options: IControlRoomOptions, threadId: string, semanticName: string, adoptExcluded = false): Record<string, unknown> {
     const validThreadId = validateThreadId(threadId);
     const validSemanticName = validateSemanticName(semanticName);
+    assertCondition(typeof adoptExcluded === "boolean", "Excluded-task adoption must be a boolean.");
     const store = openStore(options);
     try {
         beginTransaction(store.database);
         const project = requireProject(store);
         assertCondition(project.coordinator_thread_id !== validThreadId, "The Control Room task cannot be registered as a worker task.");
+        const exclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
         const existingTask = store.database.prepare("SELECT * FROM tasks WHERE thread_id = ?").get(validThreadId) as ITaskRow | undefined;
+        assertCondition(!exclusion || adoptExcluded, "This task is excluded from Control Room; use $control-room join to adopt it explicitly.");
+        if (exclusion && existingTask) {
+            assertCondition(existingTask.state === "CANCELED" && !existingTask.branch_name, `Excluded worker ${existingTask.task_id} cannot be safely restored from ${existingTask.state}.`);
+            const timestamp = currentTimestamp();
+            store.database.prepare(`
+                UPDATE tasks
+                SET semantic_name = ?, state = 'PLANNING', blocked_from_state = NULL, awaiting_user = 0,
+                    queue_position = NULL, base_commit = NULL, branch_name = NULL, reviewed_commit = NULL,
+                    integrated_commit = NULL, updated_at = ?
+                WHERE task_id = ?
+            `).run(validSemanticName, timestamp, existingTask.task_id);
+            store.database.prepare("DELETE FROM task_exclusions WHERE thread_id = ?").run(validThreadId);
+            const restoredTask = requireTask(store, existingTask.task_id);
+            commitTransaction(store.database);
+            return { created: false, adoptedExclusion: true, controlRoomThreadId: project.coordinator_thread_id, ...serializeTask(restoredTask) };
+        }
+        if (exclusion) {
+            store.database.prepare("DELETE FROM task_exclusions WHERE thread_id = ?").run(validThreadId);
+        }
         if (existingTask) {
             if (existingTask.semantic_name !== validSemanticName) {
                 assertCondition(existingTask.state === "PLANNING", "A semantic task name can change only during PLANNING.");
@@ -957,6 +1154,8 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             assertCondition(task.state === "RUNNING", `Cannot request user input for ${task.task_id} from ${task.state}.`);
         } else if (kind === "USER_INPUT_RECEIVED") {
             assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot update user-input attention for ${task.task_id} from ${task.state}.`);
+        } else if (kind === "MENTAL_MODEL_RECORDED" || kind === "DECISION_RECORDED") {
+            assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record review context for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REWORK_REQUESTED") {
@@ -965,7 +1164,11 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
         } else if (kind === "CANCEL_REQUESTED") {
-            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
+            if (validPayload.cancelSource === "exclude") {
+                assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request exclusion for ${task.task_id} from ${task.state}.`);
+            } else {
+                assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
+            }
         } else {
             assertCondition(["QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot report ${task.task_id} blocked from ${task.state}.`);
         }
@@ -1058,6 +1261,108 @@ function readTaskDependencies(store: IStore, taskId: string): string[] {
 }
 
 /**
+ * Reconstruct the task review packet from successfully processed append-only events.
+ * @param store Open project store.
+ * @param taskId Task whose review packet should be reconstructed.
+ */
+function readReviewPacketFromStore(store: IStore, taskId: string): IReviewPacket {
+    const validTaskId = validateTaskId(taskId);
+    const rows = store.database.prepare(`
+        SELECT kind, payload_json, result_json
+        FROM events
+        WHERE task_id = ?
+            AND processed_at IS NOT NULL
+            AND kind IN ('MENTAL_MODEL_RECORDED', 'DECISION_RECORDED')
+        ORDER BY sequence
+    `).all(validTaskId) as Array<{ kind: EventKind; payload_json: string; result_json: string | null }>;
+    const mentalModels: IMentalModel[] = [];
+    const decisions: IDecision[] = [];
+    const decisionsById = new Map<string, IDecision>();
+    for (const row of rows) {
+        const result = row.result_json ? JSON.parse(row.result_json) as Record<string, unknown> : {};
+        const payload = JSON.parse(row.payload_json) as IEventPayload;
+        if (row.kind === "MENTAL_MODEL_RECORDED" && result.action === "MENTAL_MODEL_RECORDED") {
+            mentalModels.push(validateMentalModelPayload(payload));
+            continue;
+        }
+        if (row.kind !== "DECISION_RECORDED" || result.action !== "DECISION_RECORDED") {
+            continue;
+        }
+        const decisionId = validateDecisionId(String(result.decisionId || ""));
+        const validPayload = validateDecisionPayload(payload);
+        if (validPayload.supersedesDecisionId) {
+            const supersededDecision = decisionsById.get(validPayload.supersedesDecisionId);
+            assertCondition(supersededDecision && supersededDecision.status !== "superseded", `${validPayload.supersedesDecisionId} is not a current decision for ${validTaskId}.`);
+            supersededDecision.status = "superseded";
+            supersededDecision.supersededByDecisionId = decisionId;
+        }
+        const decision: IDecision = {
+            decisionId,
+            decision: String(validPayload.decision),
+            rationale: String(validPayload.rationale),
+            confidence: validPayload.confidence as DecisionConfidence,
+            impact: validPayload.impact as DecisionImpact,
+            evidence: String(validPayload.evidence),
+            alternatives: validPayload.alternatives || null,
+            uncertainty: validPayload.uncertainty || null,
+            supersedesDecisionId: validPayload.supersedesDecisionId || null,
+            supersededByDecisionId: null,
+            status: validPayload.status as DecisionInputStatus
+        };
+        decisions.push(decision);
+        decisionsById.set(decisionId, decision);
+    }
+    const baseline = mentalModels[0] || null;
+    const final = mentalModels.length > 0 ? mentalModels[mentalModels.length - 1] : null;
+    const changedFields: string[] = [];
+    if (baseline && final) {
+        for (const fieldName of MENTAL_MODEL_FIELDS) {
+            if (baseline[fieldName] !== final[fieldName]) {
+                changedFields.push(fieldName);
+            }
+        }
+    }
+    const confidenceOrder: Record<DecisionConfidence, number> = { low: 0, medium: 1, high: 2 };
+    const impactOrder: Record<DecisionImpact, number> = { high: 0, medium: 1, low: 2 };
+    decisions.sort((left, right) => {
+        const leftSuperseded = left.status === "superseded" ? 1 : 0;
+        const rightSuperseded = right.status === "superseded" ? 1 : 0;
+        return leftSuperseded - rightSuperseded || confidenceOrder[left.confidence] - confidenceOrder[right.confidence] || impactOrder[left.impact] - impactOrder[right.impact] || left.decisionId.localeCompare(right.decisionId, "en-US");
+    });
+    return {
+        taskId: validTaskId,
+        baseline,
+        final,
+        changedFields,
+        decisionCount: decisions.length,
+        unresolvedDecisionIds: decisions.filter((decision) => decision.status === "unresolved").map((decision) => decision.decisionId),
+        decisions
+    };
+}
+
+/**
+ * Require the task to have one successfully processed mental-model snapshot.
+ * @param store Open project store.
+ * @param taskId Task whose review contract is required.
+ */
+function requireMentalModel(store: IStore, taskId: string): IReviewPacket {
+    const reviewPacket = readReviewPacketFromStore(store, taskId);
+    assertCondition(reviewPacket.baseline, `Review contract is missing for ${taskId}; record and process a mental model first.`);
+    return reviewPacket;
+}
+
+/**
+ * Require a decision supersession target to still be current.
+ * @param reviewPacket Reconstructed review packet.
+ * @param supersedesDecisionId Decision identifier that the new decision replaces.
+ */
+function requireCurrentDecision(reviewPacket: IReviewPacket, supersedesDecisionId: string): void {
+    const decision = reviewPacket.decisions.find((candidate) => candidate.decisionId === supersedesDecisionId);
+    assertCondition(decision, `Unknown decision for ${reviewPacket.taskId}: ${supersedesDecisionId}`);
+    assertCondition(decision.status !== "superseded", `${supersedesDecisionId} is already superseded for ${reviewPacket.taskId}.`);
+}
+
+/**
  * Reject a blocking dependency that would create a cycle.
  * @param store Open project store.
  * @param taskId Task receiving the new dependency.
@@ -1103,6 +1408,7 @@ function applyPlanningEvent(store: IStore, task: ITaskRow): Record<string, unkno
  */
 function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
     assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "BLOCKED", `Cannot enqueue ${task.task_id} from ${task.state}.`);
+    const reviewPacket = readReviewPacketFromStore(store, task.task_id);
     if (task.state === "BLOCKED") {
         assertCondition(task.blocked_from_state === "QUEUED", `Cannot enqueue ${task.task_id} after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
     }
@@ -1145,6 +1451,7 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
         action: wasAlreadyQueued ? "REENQUEUED" : "ENQUEUED",
         task: serializeTask(refreshedTask),
         afterTaskId: afterTaskId || null,
+        reviewPacket,
         titleUpdates,
         executionBrief: {
             taskId: refreshedTask.task_id,
@@ -1261,6 +1568,48 @@ function applyDependencyEvent(store: IStore, task: ITaskRow, payload: IEventPayl
 }
 
 /**
+ * Record one complete mental-model snapshot without mutating prior snapshots.
+ * @param store Open project store.
+ * @param task Current task row.
+ * @param payload Mental-model event payload.
+ */
+function applyMentalModelEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
+    assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record a mental model for ${task.task_id} from ${task.state}; request rework first when the task is in REVIEW.`);
+    const reviewPacket = readReviewPacketFromStore(store, task.task_id);
+    validateMentalModelPayload(payload);
+    store.database.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+    return {
+        action: "MENTAL_MODEL_RECORDED",
+        task: serializeTask(requireTask(store, task.task_id)),
+        baseline: reviewPacket.baseline === null
+    };
+}
+
+/**
+ * Record one stable task-local macro decision in the append-only event log.
+ * @param store Open project store.
+ * @param task Current task row.
+ * @param payload Decision event payload.
+ */
+function applyDecisionEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
+    assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record a decision for ${task.task_id} from ${task.state}; request rework first when the task is in REVIEW.`);
+    const reviewPacket = requireMentalModel(store, task.task_id);
+    const validPayload = validateDecisionPayload(payload);
+    if (validPayload.supersedesDecisionId) {
+        requireCurrentDecision(reviewPacket, validPayload.supersedesDecisionId);
+    }
+    const decisionNumber = reviewPacket.decisionCount + 1;
+    assertCondition(decisionNumber <= 999, `The task decision ID space D001-D999 is exhausted for ${task.task_id}.`);
+    const decisionId = `D${String(decisionNumber).padStart(3, "0")}`;
+    store.database.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+    return {
+        action: "DECISION_RECORDED",
+        task: serializeTask(requireTask(store, task.task_id)),
+        decisionId
+    };
+}
+
+/**
  * Apply a pending event to the state machine.
  * @param store Open project store.
  * @param event Pending event record.
@@ -1301,17 +1650,24 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         store.database.prepare("UPDATE tasks SET awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         return { action: "USER_INPUT_RECEIVED", task: serializeTask(requireTask(store, task.task_id)) };
     }
+    if (event.kind === "MENTAL_MODEL_RECORDED") {
+        return applyMentalModelEvent(store, task, payload);
+    }
+    if (event.kind === "DECISION_RECORDED") {
+        return applyDecisionEvent(store, task, payload);
+    }
     if (event.kind === "REVIEW_REQUESTED") {
         if (task.state === "APPROVED" || task.state === "DONE") {
-            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null };
+            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: requireMentalModel(store, task.task_id) };
         }
         if (task.state === "REVIEW") {
-            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null };
+            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: requireMentalModel(store, task.task_id) };
         }
         assertCondition(task.state === "RUNNING", `Cannot request review for ${task.task_id} from ${task.state}.`);
+        const reviewPacket = requireMentalModel(store, task.task_id);
         store.database.prepare("UPDATE tasks SET state = 'REVIEW', awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "REVIEW_READY", task: serializeTask(refreshedTask), summary: payload.summary || null };
+        return { action: "REVIEW_READY", task: serializeTask(refreshedTask), summary: payload.summary || null, reviewPacket };
     }
     if (event.kind === "REWORK_REQUESTED") {
         if (task.state === "RUNNING") {
@@ -1336,11 +1692,23 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     }
     if (event.kind === "CANCEL_REQUESTED") {
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Cancellation requires a direct user request ID.");
+        const exclusionRequested = payload.cancelSource === "exclude";
         if (task.state === "CANCELED") {
-            return { action: "CANCELLATION_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId };
+            if (exclusionRequested) {
+                store.database.prepare("INSERT OR IGNORE INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(task.thread_id, payload.exclusionReason, currentTimestamp());
+            }
+            return { action: "CANCELLATION_ALREADY_RECORDED", task: serializeTask(task), excluded: exclusionRequested, userRequestId: payload.userRequestId };
         }
-        assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
-        store.database.prepare("UPDATE tasks SET state = 'CANCELED', blocked_from_state = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        if (exclusionRequested) {
+            assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot exclude ${task.task_id} from ${task.state}.`);
+        } else {
+            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
+        }
+        const timestamp = currentTimestamp();
+        store.database.prepare("UPDATE tasks SET state = 'CANCELED', blocked_from_state = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(timestamp, task.task_id);
+        if (exclusionRequested) {
+            store.database.prepare("INSERT OR IGNORE INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(task.thread_id, payload.exclusionReason, timestamp);
+        }
         const activeRows = store.database.prepare(`
             SELECT task_id FROM tasks
             WHERE state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
@@ -1352,7 +1720,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         }
         const titleUpdates = writeQueueOrder(store, activeTaskIds);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "CANCELED", task: serializeTask(refreshedTask), titleUpdates, userRequestId: payload.userRequestId };
+        return { action: "CANCELED", task: serializeTask(refreshedTask), excluded: exclusionRequested, titleUpdates, userRequestId: payload.userRequestId };
     }
     assertCondition(event.kind === "BLOCKED_REPORTED", `Unsupported event kind: ${event.kind}`);
     if (task.state === "BLOCKED") {
@@ -1457,6 +1825,8 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             commitTransaction(store.database);
             return { activated: false, controlRoomTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
         }
+        const reviewPacket = readReviewPacketFromStore(store, selectedTask.task_id);
+        const mentalModelRequired = reviewPacket.baseline === null;
         const workerBranch = workerBranchForTask(selectedTask.task_id);
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
         const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
@@ -1509,6 +1879,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
         const runningTask = requireTask(store, selectedTask.task_id);
         const titleUpdates = readQueuedTitleUpdates(store, selectedTask.queue_position || 1);
         const controlRoomTitle = titleForControlRoom();
+        const instruction =
+            mentalModelRequired ? "Inspect the task context, record and settle a complete mental model before modifying project files, then implement on the active worker branch without staging or committing. Leave all changes uncommitted for review." :
+            "Implement on the active worker branch without staging or committing. Leave all changes uncommitted for review.";
         commitTransaction(store.database);
         return {
             activated: true,
@@ -1524,7 +1897,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
                 baseBranch: project.base_branch,
                 workerBranch: runningTask.branch_name,
                 dependencies: readTaskDependencies(store, runningTask.task_id),
-                instruction: "Implement on the active worker branch without staging or committing. Leave all changes uncommitted for review."
+                reviewPacket,
+                mentalModelRequired,
+                instruction
             }
         };
     } catch (error) {
@@ -1981,6 +2356,22 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
 }
 
 /**
+ * Read one task review packet without changing state.
+ * @param options Project and optional state-root settings.
+ * @param taskId Task identifier to read.
+ */
+function getReviewPacket(options: IControlRoomOptions, taskId: string): IReviewPacket {
+    const store = openStore(options);
+    try {
+        requireProject(store);
+        const task = requireTask(store, taskId);
+        return readReviewPacketFromStore(store, task.task_id);
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
  * Read the project snapshot, one task, or the role of one Codex thread without changing state.
  * @param options Project and optional state-root settings.
  * @param taskId Optional task identifier to select.
@@ -1993,19 +2384,31 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
     try {
         const project = requireProject(store);
         if (taskId) {
-            return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), task: serializeTask(requireTask(store, taskId)) };
+            const task = requireTask(store, taskId);
+            const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE";
+            return {
+                projectRoot: store.projectRoot,
+                controlRoomTitle: titleForControlRoom(),
+                task: serializeTask(task),
+                ...(includesReviewPacket ? { reviewPacket: readReviewPacketFromStore(store, task.task_id) } : {})
+            };
         }
         if (validThreadId) {
             if (validThreadId === project.coordinator_thread_id) {
                 return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
             }
             const task = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.thread_id = ?`).get(validThreadId) as ITaskRow | undefined;
+            const exclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
+            const isExcluded = Boolean(exclusion && (!task || task.state === "CANCELED"));
+            const includesReviewPacket = task && (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE");
             return {
                 projectRoot: store.projectRoot,
                 controlRoomTitle: titleForControlRoom(),
                 controlRoomThreadId: project.coordinator_thread_id,
-                role: task ? "WORKER" : "UNREGISTERED",
-                task: task ? serializeTask(task) : null
+                role: isExcluded ? "EXCLUDED" : task ? "WORKER" : "UNREGISTERED",
+                task: task && !isExcluded ? serializeTask(task) : null,
+                ...(isExcluded && exclusion ? { exclusion: { reason: exclusion.reason, createdAt: exclusion.created_at } } : {}),
+                ...(includesReviewPacket && task ? { reviewPacket: readReviewPacketFromStore(store, task.task_id) } : {})
             };
         }
         const counts = store.database.prepare("SELECT state, COUNT(*) AS count FROM tasks GROUP BY state ORDER BY state").all() as Array<{ state: TaskState; count: number }>;
@@ -2133,6 +2536,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
     }
     const queue = getQueue(options);
     const activeQueue = queue.queue as Record<string, unknown>[];
+    const reviewTask = activeQueue.find((task) => task.state === "RUNNING" || task.state === "REVIEW");
     return {
         settled: !status.commitTaskId,
         controlRoomTitle: titleForControlRoom(),
@@ -2140,6 +2544,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         completion,
         activation,
         queue: activeQueue,
+        reviewPacket: reviewTask ? getReviewPacket(options, String(reviewTask.taskId)) : null,
         titleUpdates: collectSettlementTitleUpdates(processed, activeQueue, completion)
     };
 }
@@ -2147,7 +2552,9 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
 module.exports = {
     activateNextTask,
     commitApprovedTask,
+    excludeTask,
     getQueue,
+    getReviewPacket,
     getStatus,
     initializeProject,
     installProjectRouting,

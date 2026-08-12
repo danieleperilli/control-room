@@ -1,4 +1,4 @@
 interface:
   display_name: "ControlRoom"
-  short_description: "Coordinate project queues and approvals"
-  default_prompt: "Use $control-room to coordinate this project task safely."
+  short_description: "Coordinate task queues, exclusions, and reviews"
+  default_prompt: "Use $control-room to coordinate or exclude this task with a review-ready mental model and decision log."

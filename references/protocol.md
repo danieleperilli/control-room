@@ -4,11 +4,12 @@
 
 1. State and storage
 2. Initialization and the manual console
-3. Worker requests
-4. Direct settlement
-5. State machine
-6. Approval commit and recovery
-7. Project-specific loading rule
+3. Task exclusions
+4. Worker requests
+5. Direct settlement
+6. State machine
+7. Approval commit and recovery
+8. Project-specific loading rule
 
 ## State and storage
 
@@ -55,11 +56,44 @@ node <skill-dir>/scripts/control-room.ts status \
     --thread-id <current-thread-id>
 ```
 
-The result is `CONTROL_ROOM`, `WORKER`, or `UNREGISTERED`. When a direct user message reaches a `WORKER` with `awaitingUser: true`, record `USER_INPUT_RECEIVED` and settle before handling the complete message; do not clear the marker for agent messages or background activity. A registered worker otherwise retains its identity and state during read-only follow-ups.
+The result is `CONTROL_ROOM`, `WORKER`, `EXCLUDED`, or `UNREGISTERED`. When a direct user message reaches a `WORKER` with `awaitingUser: true`, record `USER_INPUT_RECEIVED` and settle before handling the complete message; do not clear the marker for agent messages or background activity. A registered worker otherwise retains its identity and state during read-only follow-ups. `EXCLUDED` bypasses automatic registration and Control Room execution boundaries until an explicit join.
 
 For `UNREGISTERED`, classify the requested outcome before allocating an identity. Questions, explanations, inspections, diagnoses, audits, reviews, and reports are read-only when the complete request asks for no implementation or other project mutation. Fulfill a purely read-only request without registering the task, allocating a `T_ID`, or changing its title. A concrete plan, design, specification, or brief intended for later implementation counts as change work; a mixed request also counts as change work when any substantive part requests a project change. Register change work, derive its semantic name from the complete substantive prompt, apply the returned `PLANNING` title, and continue that prompt in the same turn. Do not enqueue automatically. An unregistered conversation is evaluated again if a later turn requests change work. Explicit `$control-room join` always registers.
 
 Skip the manual console, subagents, side chats, linked worktrees, the `init` workflow, and the read-only `queue` and `help` entry points. An uninitialized project is a silent no-op unless the user explicitly invokes a ControlRoom command. The project-root routing block installed by `init` makes the skill load before this check.
+
+## Task exclusions
+
+An unregistered top-level task can be excluded persistently by trusted thread ID:
+
+```bash
+node <skill-dir>/scripts/control-room.ts exclude \
+    --project-root <root> \
+    --thread-id <current-thread-id> \
+    --reason <compact-reason>
+```
+
+Unregistered exclusion allocates no `T_ID`, creates no task row, changes no title, and performs no Git operation. It records only the thread ID, the first compact reason, and a timestamp in the project-scoped `task_exclusions` table. Repeating the operation is idempotent and preserves the original reason. `status --thread-id` returns `EXCLUDED` with that reason on later turns, so automatic registration is skipped.
+
+A registered task in `PLANNING` or `QUEUED` can be excluded through the cancellation event path:
+
+```bash
+node <skill-dir>/scripts/control-room.ts request-exclude \
+    --project-root <root> \
+    --task T0001 \
+    --event-key <key> \
+    --user-request-id <direct-user-message-id> \
+    --reason <compact-reason>
+node <skill-dir>/scripts/control-room.ts settle --project-root <root>
+```
+
+`request-exclude` submits `CANCEL_REQUESTED` with the validated event source `exclude`. Submission accepts only `PLANNING` or `QUEUED`; settlement changes the task to `CANCELED`, removes its queue position, compacts every remaining active position, returns the excluded task's undecorated semantic title plus all affected queued titles, and writes the same persistent exclusion row. The task row, dependencies, and append-only event history remain available for audit. No branch exists in either accepted source state, so registered exclusion performs no Git operation.
+
+The default automatic skill-exclusion list contains only `brand-forge`. Use reason `brand-forge` whenever an eligible request invokes or triggers that skill. A user can opt out an unregistered, `PLANNING`, or `QUEUED` task with an exact standalone `$control-room exclude` directive; use reason `manual directive`, remove only the directive, and continue any remaining request outside Control Room in the same turn. Mentions in prose, quoted text, code, tool output, subagent messages, and side chats do not authorize exclusion. A message containing both standalone `exclude` and `join` directives is conflicting and must not mutate state until the user resolves it.
+
+Reject exclusion for the manual Control Room task and registered workers in `RUNNING`, `REVIEW`, `APPROVED`, `BLOCKED`, `DONE`, or ordinary `CANCELED`. Explicit `Cancel` keeps its existing broader lifecycle rules for states where cancellation is safe.
+
+Automatic `register` rejects an excluded thread. Explicit `$control-room join` calls the same command with `--adopt-excluded true`; for an excluded registered task, the transaction restores the same task from `CANCELED` to `PLANNING`, preserves its history and dependencies, removes the exclusion, and returns the planning title. For an excluded unregistered thread it allocates a new worker identity. No separate include command is needed.
 
 `$control-room join` remains a worker operation. It registers the current existing top-level task:
 
@@ -67,7 +101,8 @@ Skip the manual console, subagents, side chats, linked worktrees, the `init` wor
 node <skill-dir>/scripts/control-room.ts register \
     --project-root <canonical-root> \
     --thread-id <current-thread-id> \
-    --name "<short semantic name>"
+    --name "<short semantic name>" \
+    --adopt-excluded true
 ```
 
 Registration allocates `T0001` through `T9999`, leaves the task in `PLANNING`, and is idempotent. Preserve all substantive text accompanying `join` and process it in the same turn. Joining never queues or starts implementation.
@@ -119,6 +154,45 @@ node <skill-dir>/scripts/control-room.ts request-rework --project-root <root> --
 
 `REWORK_REQUESTED` moves `REVIEW -> RUNNING` before the worker edits files. It keeps the checkout and branch unchanged and performs no Git operation. Read-only questions during review do not request rework.
 
+## Review contract
+
+Record a complete mental-model snapshot during planning or just in time after activation:
+
+```bash
+node <skill-dir>/scripts/control-room.ts record-mental-model \
+    --project-root <root> --task T0001 --event-key <key> \
+    --current-state "<text>" --desired-outcome "<text>" \
+    --approach "<text>" --affected-areas "<text>" \
+    --invariants "<text>" --non-goals "<text>" --verification "<text>"
+```
+
+The first processed `MENTAL_MODEL_RECORDED` event is the baseline and the latest is the final model. Every snapshot is complete. A later snapshot does not mutate the baseline; the projection reports which fields changed. `ENQUEUE_REQUESTED`, `RUN_NOW_REQUESTED`, and activation accept a task without a processed baseline. Activation still creates the worker branch and moves the task to `RUNNING`, but returns `executionBrief.mentalModelRequired: true` with a null packet baseline. The target worker uses its own conversation context to record and settle the baseline before modifying project files. The deterministic core never fabricates generic mental-model content. `REVIEW_REQUESTED` remains the hard gate and rejects a task whose baseline is still missing.
+
+Record only macro implementation decisions:
+
+```bash
+node <skill-dir>/scripts/control-room.ts record-decision \
+    --project-root <root> --task T0001 --event-key <key> \
+    --decision "<text>" --rationale "<text>" \
+    --confidence <low|medium|high> --impact <low|medium|high> \
+    --evidence "<text>" --status <active|unresolved> \
+    [--alternatives "<text>"] [--uncertainty "<text>"] [--supersedes D001]
+```
+
+Processed `DECISION_RECORDED` events receive sequential task-local IDs (`D001` through `D999`). The log is append-only. `--supersedes` must identify a current decision; the projection derives the earlier record's `superseded` status and `supersededByDecisionId`. Current decisions are sorted by confidence `low`, `medium`, `high`, then impact `high`, `medium`, `low`, then ID. Superseded decisions follow current decisions. A task may have an empty decision log.
+
+Read the derived packet directly when needed:
+
+```bash
+node <skill-dir>/scripts/control-room.ts review-packet --project-root <root> --task T0001
+```
+
+`status`, active-task settlement output, activation briefs, and successful review transitions also include the packet where relevant. The queue remains compact and does not include it.
+
+On every transition to `REVIEW`, the worker presents the final mental model, its baseline delta, the ordered decisions, and unresolved uncertainty. It then asks whether the user wants one independent review from a second agent. The review is opt-in: declining it or approving directly starts no agent and adds no gate.
+
+When accepted, orchestration starts one fresh-context, read-only subagent and provides only the canonical request, acceptance criteria, repository location, changed-file scope, and verification commands. It withholds the implementer's conversation, mental model, decision log, conclusions, and reasoning. The returned verdict, findings, verification, and residual risks are advisory and are not stored in ControlRoom. The subagent never receives a task ID and cannot edit, stage, commit, or approve. Findings require an explicit user request before rework. If no fresh second agent is available, report that limitation instead of substituting a same-context reviewer.
+
 Submit direct user approval:
 
 ```bash
@@ -136,6 +210,7 @@ Cancel or block:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts request-cancel --project-root <root> --task T0001 --event-key <key> --user-request-id <direct-user-message-id>
+node <skill-dir>/scripts/control-room.ts request-exclude --project-root <root> --task T0001 --event-key <key> --user-request-id <direct-user-message-id> --reason <compact-reason>
 node <skill-dir>/scripts/control-room.ts request-block --project-root <root> --task T0001 --event-key <key> --reason "<reason>"
 ```
 
@@ -156,9 +231,9 @@ Settlement performs the normal operational sequence:
 3. If the project has no `RUNNING`, `REVIEW`, or `APPROVED` task, activate the first dependency-eligible queued task.
 4. Return the final active queue.
 
-Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so user-attention changes update `👉` without changing state, while enqueue, move, activation, block, return-to-planning, resume, cancellation, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes returned-to-planning, completed, and canceled tasks that are absent from the final queue: `PLANNING` receives `⚪️`, `DONE` keeps its returned `🟢` title, and `CANCELED` is reset to the semantic name with no icon, queue marker, or task ID. Retry one failed title operation once, then surface the exact failure.
+Settlement returns a deduplicated top-level `titleUpdates` list built from processed events, the final queue, and approval completion. The caller must apply every entry through the Codex app title tool before replying. This deliberately refreshes all active task titles, so user-attention changes update `👉` without changing state, while enqueue, move, activation, block, return-to-planning, resume, cancellation, exclusion, or completion renumbers every remaining `QUEUED` task from `①` without counting `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` tasks. It also includes returned-to-planning, completed, canceled, and registered-excluded tasks that are absent from the final queue: `PLANNING` receives `⚪️`, `DONE` keeps its returned `🟢` title, and `CANCELED` is reset to the semantic name with no icon, queue marker, or task ID. Retry one failed title operation once, then surface the exact failure.
 
-When `activation.activated` is true, send `activation.executionBrief` directly to its worker. Do not route it through the manual console. If the activated worker is the caller, continue there without sending a background message.
+When `activation.activated` is true, send `activation.executionBrief` directly to its worker. Do not route it through the manual console. If the activated worker is the caller, continue there without sending a background message. A brief with `mentalModelRequired: true` requires the worker to inspect its context read-only, submit and settle `MENTAL_MODEL_RECORDED`, verify that the packet now has a baseline, and only then modify project files. A brief with `mentalModelRequired: false` needs no bootstrap.
 
 `settle` is idempotent when there are no new events. A concurrent or repeated activation returns `ACTIVE_TASK_PRESENT` instead of creating another branch. If an approval lease exists, settlement returns `COMMIT_RECOVERY_REQUIRED`; never recover until the previous commit process is confirmed dead.
 
@@ -194,6 +269,7 @@ PLANNING, QUEUED, RUNNING, REVIEW, BLOCKED -> CANCELED
 ```
 
 - Processed events move tasks into `PLANNING` after a safe blocked-waiting demotion, `QUEUED`, `RUNNING` after rework, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`.
+- Registered exclusion uses `PLANNING -> CANCELED` or `QUEUED -> CANCELED`, adds the persistent exclusion record, and exposes the thread as `EXCLUDED` after settlement.
 - `awaiting_user` overlays `👉` only on `RUNNING` without changing the state machine and clears on the next direct user message.
 - Activation inside settlement moves `QUEUED -> RUNNING`.
 - Approval completion inside settlement moves `APPROVED -> DONE`.
@@ -226,4 +302,4 @@ Install or link this repository as the global `control-room` skill. Do not add a
 node <skill-dir>/scripts/control-room.ts install-routing --project-root <canonical-root>
 ```
 
-The command atomically prepends one managed block with path-independent markers. It writes to a non-empty `AGENTS.override.md` in the canonical Git root when that is the active project instruction source; otherwise it uses the root `AGENTS.md`. The block requires `$control-room` before every top-level user message, prevents automatic registration for purely read-only requests, makes title updates mandatory, and excludes subagents and side chats. Existing instructions are preserved, repeated installation is byte-stable, and symbolic-link targets are rejected. It never reads or writes global Codex instructions. The local instruction change remains uncommitted until the user or a later approved task commits it.
+The command atomically prepends one managed block with path-independent markers. It writes to a non-empty `AGENTS.override.md` in the canonical Git root when that is the active project instruction source; otherwise it uses the root `AGENTS.md`. The block requires `$control-room` before every top-level user message, persists the `brand-forge` and standalone-directive exclusions before automatic registration, routes registered `PLANNING` and `QUEUED` exclusions through cancellation and settlement, keeps excluded tasks outside Control Room until an explicit join, prevents automatic registration for purely read-only requests, makes title updates mandatory, and excludes subagents and side chats. Existing instructions are preserved, repeated installation is byte-stable, and symbolic-link targets are rejected. It never reads or writes global Codex instructions. The local instruction change remains uncommitted until the user or a later approved task commits it.

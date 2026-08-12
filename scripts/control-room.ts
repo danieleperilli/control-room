@@ -8,6 +8,7 @@ interface IParsedArguments {
 const USER_COMMANDS = [
     "$control-room init",
     "$control-room join",
+    "$control-room exclude",
     "$control-room queue",
     "$control-room help",
     "Return to planning | Return T0002 to planning",
@@ -107,7 +108,8 @@ ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 Commands:
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   install-routing --project-root ROOT [--state-root PATH]
-  register --project-root ROOT --thread-id ID --name NAME [--state-root PATH]
+  exclude --project-root ROOT --thread-id ID --reason TEXT [--state-root PATH]
+  register --project-root ROOT --thread-id ID --name NAME [--adopt-excluded true] [--state-root PATH]
   request-planning --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
   request-run-now --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
@@ -116,10 +118,13 @@ Commands:
   request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-user-input --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-user-response --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
+  record-mental-model --project-root ROOT --task T0001 --event-key KEY --current-state TEXT --desired-outcome TEXT --approach TEXT --affected-areas TEXT --invariants TEXT --non-goals TEXT --verification TEXT [--state-root PATH]
+  record-decision --project-root ROOT --task T0001 --event-key KEY --decision TEXT --rationale TEXT --confidence (low|medium|high) --impact (low|medium|high) --evidence TEXT --status (active|unresolved) [--alternatives TEXT] [--uncertainty TEXT] [--supersedes D001] [--state-root PATH]
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-rework --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
+  request-exclude --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --reason TEXT [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
   settle --project-root ROOT [--state-root PATH]
   process --project-root ROOT [--state-root PATH]
@@ -129,6 +134,7 @@ Commands:
   commit-approved --project-root ROOT --task T0001 [--state-root PATH]
   status --project-root ROOT [--task T0001 | --thread-id ID] [--state-root PATH]
   queue --project-root ROOT [--state-root PATH]
+  review-packet --project-root ROOT --task T0001 [--state-root PATH]
 `);
 }
 
@@ -162,9 +168,16 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
             userCommands: USER_COMMANDS
         };
     }
+    if (parsed.command === "exclude") {
+        validateOptions(values, ["project-root", "thread-id", "reason", "state-root"]);
+        return core.excludeTask(buildOptions(values), requireOption(values, "thread-id"), requireOption(values, "reason"));
+    }
     if (parsed.command === "register") {
-        validateOptions(values, ["project-root", "thread-id", "name", "state-root"]);
-        return core.registerTask(buildOptions(values), requireOption(values, "thread-id"), requireOption(values, "name"));
+        validateOptions(values, ["project-root", "thread-id", "name", "adopt-excluded", "state-root"]);
+        if (values["adopt-excluded"] && values["adopt-excluded"] !== "true") {
+            throw new Error("--adopt-excluded accepts only true.");
+        }
+        return core.registerTask(buildOptions(values), requireOption(values, "thread-id"), requireOption(values, "name"), values["adopt-excluded"] === "true");
     }
     if (parsed.command === "install-routing") {
         validateOptions(values, ["project-root", "state-root"]);
@@ -216,6 +229,32 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_RECEIVED", {});
     }
+    if (parsed.command === "record-mental-model") {
+        validateOptions(values, ["project-root", "task", "event-key", "current-state", "desired-outcome", "approach", "affected-areas", "invariants", "non-goals", "verification", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "MENTAL_MODEL_RECORDED", {
+            currentState: requireOption(values, "current-state"),
+            desiredOutcome: requireOption(values, "desired-outcome"),
+            approach: requireOption(values, "approach"),
+            affectedAreas: requireOption(values, "affected-areas"),
+            invariants: requireOption(values, "invariants"),
+            nonGoals: requireOption(values, "non-goals"),
+            verification: requireOption(values, "verification")
+        });
+    }
+    if (parsed.command === "record-decision") {
+        validateOptions(values, ["project-root", "task", "event-key", "decision", "rationale", "confidence", "impact", "evidence", "status", "alternatives", "uncertainty", "supersedes", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "DECISION_RECORDED", {
+            decision: requireOption(values, "decision"),
+            rationale: requireOption(values, "rationale"),
+            confidence: requireOption(values, "confidence"),
+            impact: requireOption(values, "impact"),
+            evidence: requireOption(values, "evidence"),
+            status: requireOption(values, "status"),
+            alternatives: values.alternatives,
+            uncertainty: values.uncertainty,
+            supersedesDecisionId: values.supersedes
+        });
+    }
     if (parsed.command === "request-review") {
         validateOptions(values, ["project-root", "task", "event-key", "summary", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "REVIEW_REQUESTED", {
@@ -238,6 +277,14 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     if (parsed.command === "request-cancel") {
         validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "CANCEL_REQUESTED", {
+            userRequestId: requireOption(values, "user-request-id")
+        });
+    }
+    if (parsed.command === "request-exclude") {
+        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "reason", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "CANCEL_REQUESTED", {
+            cancelSource: "exclude",
+            exclusionReason: requireOption(values, "reason"),
             userRequestId: requireOption(values, "user-request-id")
         });
     }
@@ -281,6 +328,10 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     if (parsed.command === "queue") {
         validateOptions(values, ["project-root", "state-root"]);
         return core.getQueue(buildOptions(values));
+    }
+    if (parsed.command === "review-packet") {
+        validateOptions(values, ["project-root", "task", "state-root"]);
+        return core.getReviewPacket(buildOptions(values), requireOption(values, "task"));
     }
     throw new Error(`Unknown command: ${parsed.command}`);
 }

@@ -786,7 +786,7 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 10);
+    assert.equal(version, 12);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
@@ -840,12 +840,55 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 12);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
     assert.match(migratedEventSql, /USER_INPUT_REQUESTED/);
     assert.match(migratedEventSql, /MENTAL_MODEL_RECORDED/);
+    migratedDatabase.close();
+});
+
+test("migrates version 11 state without discarding legacy review data", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    registerTask(options, "thread-one", "Preserve version 11 state");
+    const legacyDatabase = new DatabaseSync(databasePath);
+    legacyDatabase.exec(`
+        ALTER TABLE tasks ADD COLUMN reviewed_tree TEXT;
+        UPDATE tasks SET reviewed_tree = '{"legacy":true}' WHERE task_id = 'T0001';
+        ALTER TABLE events RENAME TO events_current;
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'REVIEW_BLIND_RECORDED', 'REVIEW_AUDIT_RECORDED', 'APPROVAL_REQUESTED', 'APPROVAL_INVALIDATED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            processed_at TEXT,
+            result_json TEXT
+        );
+        INSERT INTO events (sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
+        SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
+        FROM events_current;
+        DROP TABLE events_current;
+        INSERT INTO events (event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
+        VALUES ('legacy-review-audit', 'T0001', 'REVIEW_AUDIT_RECORDED', '{}', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '{}');
+        DROP TABLE task_exclusions;
+        PRAGMA user_version = 11;
+    `);
+    legacyDatabase.close();
+
+    assert.equal(core.getStatus(options, undefined, "thread-one").role, "WORKER");
+    const migratedDatabase = new DatabaseSync(databasePath);
+    const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
+    const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
+    const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(task.reviewed_tree, '{"legacy":true}');
+    assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
+    assert.equal(exclusionTable.name, "task_exclusions");
     migratedDatabase.close();
 });
 

@@ -9,11 +9,12 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Persistently excludes `brand-forge` tasks and tasks with an explicit opt-out directive.
 - Keeps planned work separate from active implementation.
 - Queues tasks in a deterministic order with optional dependencies.
-- Allows only one task at a time to run, wait for review, or await its approval commit.
+- Runs tasks serially in the shared checkout by default, with explicit concurrent isolation when requested.
 - Leaves changes uncommitted during implementation and review.
 - Creates a worker branch only when a queued task starts running.
 - Creates a commit only after direct user approval and only when uncommitted changes exist.
-- Deletes the merged worker branch, but never pushes, creates a pull request, or rewrites Git history.
+- Creates isolated worktrees only on demand below the repository-local `.control-room/worktrees/` directory.
+- Deletes successfully integrated worker branches and isolated worktrees, but never pushes, creates a pull request, or rewrites Git history.
 - Settles queue changes directly from the task issuing the command, without waking the Control Room task.
 - Creates one optional manual `⚫️ Control Room` console for project-wide commands and recovery.
 - Persists project state locally in SQLite.
@@ -73,15 +74,15 @@ $control-room init
 
 ControlRoom leaves the current task unchanged and creates a separate Local task named `⚫️ Control Room`. That task explains the available commands and acts only as an optional manual console. It does not process events in the background or receive routine notifications.
 
-The project records the current Local checkout and checked-out Git branch as its shared root and base branch. The deterministic `init` command also atomically prepends a managed block to the active instruction file in that Git root. The block forces new top-level tasks in this repository to load ControlRoom, apply task exclusions before registration or while planning/waiting, and apply all returned title updates; it explicitly excludes subagents and side chats. Running `$control-room init` again repairs or refreshes that block without creating a duplicate console.
+The project records the current Local checkout and checked-out Git branch as its shared root and base branch. The deterministic `init` command atomically prepends a managed block to the active instruction file and adds the exact `.control-room/` line to the root `.gitignore`. Because the pattern has no leading slash, Git ignores `.control-room` directories at every repository level. The routing block forces new top-level tasks in this repository to load ControlRoom, apply task exclusions before registration or while planning/waiting, and apply all returned title updates; it explicitly excludes subagents and side chats. Running `$control-room init` again repairs both files without creating a duplicate console.
 
-If the local instruction file cannot be updated, initialization remains registered and reports a partial failure. Fix the reported permission or file-safety problem, then run `$control-room init` again. ControlRoom never changes the global `AGENTS.md`.
+If the local instruction file or root `.gitignore` cannot be updated, initialization remains registered and reports a partial failure. Fix the reported permission or file-safety problem, then run `$control-room init` again. ControlRoom never changes the global `AGENTS.md`.
 
-Initialization does not create a commit. Its local instruction-file change remains uncommitted. In a new repository, the first activated task may also start with other files that are still untracked or otherwise uncommitted. They remain uncommitted through implementation and review; `Approve` creates the root commit, establishes the configured base branch, and removes the worker branch.
+Initialization does not create a worktree or commit. Its project-local instruction and `.gitignore` changes remain uncommitted. In a new repository, the first activated shared task may also start with other files that are still untracked or otherwise uncommitted. They remain uncommitted through implementation and review; `Approve` creates the root commit, establishes the configured base branch, and removes the worker branch. Isolated execution becomes available after that first base commit exists.
 
 The Control Room console does not receive a `T_ID` and must not be used for planning or implementation. You can open it manually to inspect or reorder the queue, manage dependencies with explicit task IDs, or perform recovery.
 
-Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, the installed project-specific routing rule makes the task load ControlRoom on its first substantive prompt. ControlRoom assigns a `T_ID`, derives its semantic name, and leaves it in planning only when the requested outcome is a project change or a concrete plan, design, specification, or brief intended for later implementation. ControlRoom serializes implementation, so the tasks share one checkout without requiring worktrees. Planning and queueing do not modify code or create branches. When the plan is ready, use one of the commands below in that task.
+Use a separate top-level Codex task in **Local** mode to discuss and plan each change. After initialization, the installed project-specific routing rule makes the task load ControlRoom on its first substantive prompt. ControlRoom assigns a `T_ID`, derives its semantic name, and leaves it in planning only when the requested outcome is a project change or a concrete plan, design, specification, or brief intended for later implementation. Normal implementation remains serialized in one shared checkout. Planning and queueing do not modify code or create branches. When a genuinely independent component must proceed immediately, `Run isolated now` explicitly gives only that task a dedicated repository-local worktree.
 
 Purely read-only requests do not become ControlRoom tasks. Questions, explanations, inspections, diagnoses, audits, reviews, and reports remain unregistered when they ask for no implementation or other project mutation; their title is left unchanged and no `T_ID` is allocated. If a later turn in that same conversation requests a change, ControlRoom registers it then. A mixed request is registered when any substantive part asks for a project change or its implementation plan. Explicit `$control-room join` still forces registration.
 
@@ -131,7 +132,8 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | `Return to planning` | Return a blocked waiting task to planning while preserving its dependencies. |
 | `Enqueue` | Add or update the current task at the end of the queue, including a blocked waiting task. |
 | `Enqueue after T0005` | Add the current task immediately after `T0005`, without creating a dependency, including a blocked waiting task. |
-| `Run now` | Start the current task immediately when the project is idle and all dependencies are done. |
+| `Run now` | Start the current task immediately when the shared checkout is idle and all dependencies are done. |
+| `Run isolated now` | Start the current task immediately in `.control-room/worktrees/<T_ID>` when its dependencies are done. |
 | `Move first` | Move the current queued task to the first waiting position. |
 | `Move to 3` | Move the current queued task to waiting position 3. |
 | `Move before T0005` | Move the current queued task immediately before `T0005`. |
@@ -148,7 +150,9 @@ English is the canonical command language. ControlRoom can still interpret equiv
 
 Queue order and dependencies are separate. `Enqueue after` and every `Move` command change only the order. `Depends on` and `Remove dependency` change only start eligibility and never move a task.
 
-`Run now` is stricter than `Move first`: it succeeds only when the task can start in the same settlement. If another task is running, in review, or approved, or if a dependency is not done, ControlRoom rejects the request without changing the task state or queue position. A task already running treats the command as an idempotent no-op. From `⚫️ Control Room`, use `Run T0003 now`.
+`Run now` is stricter than `Move first`: it succeeds only when the task can start in the shared checkout during the same settlement. If another shared task is running, in review, or approved, or if a dependency is not done, ControlRoom rejects the request without changing the task state or queue position. Explicit isolated workers do not occupy the shared checkout. A task already running treats the command as an idempotent no-op. From `⚫️ Control Room`, use `Run T0003 now`.
+
+`Run isolated now` is the explicit concurrency switch. It accepts a planning or queued task whose dependencies are all `DONE`, creates `control-room/T0003` at `<project-root>/.control-room/worktrees/T0003`, and starts it without switching or cleaning the shared checkout. This is especially useful when a long shared task is already dirty and the new task touches an independent monorepo component. ControlRoom does not infer independence from paths, and it does not fall back to the shared checkout if worktree creation fails. From `⚫️ Control Room`, use `Run T0003 isolated now`.
 
 From a worker, `Move` and dependency commands apply to that task. From `⚫️ Control Room`, include the target ID, for example `Move T0003 before T0005` or `Make T0003 depend on T0005`.
 
@@ -168,7 +172,8 @@ At approval time, Codex generates a concise English commit subject that describe
 
 - If the working tree is clean, ControlRoom only marks the current task done and removes it from the queue. It performs no Git write and does not interpret or merge existing commits.
 - If uncommitted changes are already on the configured base branch, ControlRoom commits them directly there without a merge.
-- If uncommitted changes are on the task's worker branch, ControlRoom commits, fast-forward merges into the base branch, and deletes the worker branch.
+- If uncommitted changes are on a task worker branch, ControlRoom commits them there and integrates the result linearly into the latest base branch.
+- After successful isolated integration, ControlRoom removes the isolated worktree and worker branch. A conflict instead blocks the task and preserves both so it can be resumed and reworked.
 
 ## Quiet coordination
 
@@ -180,7 +185,7 @@ ControlRoom uses task titles as the normal status display and keeps routine orch
 - Additional operational messages appear only when an error, blocker, recovery step, or user action needs attention.
 - `Status` and `Queue status` show details only when requested.
 
-The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, completes an approved task, activates the next eligible worker, and returns one mandatory `titleUpdates` list in the same turn. Codex applies every entry before replying, including the green title for a completed task and the renumbered titles of all remaining queued tasks. No wake or routine message is sent to `⚫️ Control Room`.
+The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, serially integrates approved tasks, activates requested isolated workers, activates the next eligible shared worker when that checkout is idle, and returns one mandatory `titleUpdates` list in the same turn. Codex applies every entry before replying, including the green title for a completed task and the renumbered titles of all remaining queued tasks. No wake or routine message is sent to `⚫️ Control Room`.
 
 ## Example usage
 
@@ -217,6 +222,12 @@ If `T0003` cannot start until `T0005` is completed, add that constraint separate
 You can check progress from the same task:
 
 > $control-room queue
+
+If `T0001` is already a long-running dirty shared task and a new `T0002` concerns an independent monorepo component, send this from `T0002`:
+
+> Run isolated now
+
+ControlRoom creates `<project-root>/.control-room/worktrees/T0002` and starts `T0002` there immediately. `T0001` stays checked out and dirty exactly as it was. When you approve `T0002`, ControlRoom commits in that worktree, serially integrates the result into the latest base branch, then removes the worktree and `control-room/T0002`. `T0001` can continue in its existing shared workspace. If integration conflicts, `T0002` becomes blocked and its worktree is preserved for rework.
 
 To see the available commands at any time:
 
@@ -267,22 +278,27 @@ The queue marker is derived from SQLite's active order, but it counts only tasks
 
 Dependencies must be `DONE` before a dependent task can run. A clean approval can satisfy this state without ControlRoom creating a commit.
 
+For the opt-in concurrent path, replace step 3 with `Run isolated now`. The task receives its own `workspacePath` and may proceed while the shared worker remains dirty. Approval still enters the same serialized integration sequence; success removes the isolated workspace, while a conflict preserves it and marks the task `BLOCKED` until it is resumed and reworked.
+
 ## Git behavior
 
-The only supported mode uses an activation-time worker branch and approval-time integration:
+ControlRoom uses one shared mode by default and one explicit isolated mode:
 
-- Every task uses the same Local checkout.
-- ControlRoom never creates a worktree.
+- Every Codex task remains in the **Local** environment.
+- Normal tasks use the same primary checkout and remain mutually exclusive there.
+- `Run isolated now` creates `<project-root>/.control-room/worktrees/<T_ID>` on `control-room/<T_ID>` from the latest configured base branch. The root `.gitignore` pattern `.control-room/` excludes this directory name at every level.
 - Planning and queued tasks do not modify files or create branches.
-- When a queued task starts, ControlRoom creates and checks out `control-room/T0001` from the configured base branch.
-- The worker changes files while running, without staging or committing them. Review feedback that requires edits first returns the task to running on the same branch.
+- When a normal queued task starts, ControlRoom creates and checks out `control-room/T0001` from the configured base branch in the primary checkout.
+- The worker changes files only in the `workspacePath` from its activation brief, without staging or committing them. Review feedback that requires edits first returns the task to running in the same workspace and branch.
 - Review does not require dirty files and does not freeze the working tree; manual or external changes may still continue until `Approve`.
-- A clean approval performs no Git write, does not interpret existing commits, and only removes the task from the active queue.
+- A clean shared approval performs no Git write and only removes the task from the active queue. A clean isolated approval also removes its unused worktree and branch.
 - When dirty changes are already on the configured base branch, approval commits them there using the meaningful English subject captured by the approval event.
 - When dirty changes are on the worker branch, approval creates that commit on the worker branch.
 - The commit contains the current uncommitted changes at approval time.
-- For a worker-branch commit, ControlRoom checks out the configured base branch, merges with `--ff-only`, and deletes the worker branch after a successful merge.
-- If commit or merge fails, the worker branch is retained for recovery.
+- Worker commits are integrated one at a time into the latest base. If the base is already an ancestor, it advances directly; otherwise ControlRoom creates a linear single-parent integration commit with the combined tree, without a merge commit or rebase.
+- A dirty shared task can remain checked out while an isolated approval advances the base branch reference; its `HEAD`, index, and working files are untouched.
+- After successful isolated integration, ControlRoom removes the worktree and branch. If integration conflicts, it clears the lease, keeps both, and marks the task `BLOCKED` from `RUNNING`; resume it before reworking and requesting review again.
+- Canceling an unchanged isolated task removes its workspace and branch. Canceling a task with uncommitted changes or task-local commits preserves them and reports the path for recovery.
 - ControlRoom does not push or open a pull request.
 
 ControlRoom itself does not create commits before approval and does not reject approval based on commits made outside its workflow.

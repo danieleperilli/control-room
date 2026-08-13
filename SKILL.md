@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, queueing, execution, task-local mental models and decision logs, user-controlled independent review, approval-only Git integration, cancellation, exclusion, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room exclude, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only and persistently excluded requests unregistered; or when the user says Return to planning, Enqueue, Run now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
+description: Coordinate top-level Codex project tasks through deterministic planning, serial queueing, explicit repository-local isolated execution, task-local mental models and decision logs, user-controlled independent review, approval-only Git integration, cancellation, exclusion, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room exclude, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only and persistently excluded requests unregistered; or when the user says Return to planning, Enqueue, Run now, Run isolated now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
 ---
 
 # ControlRoom
@@ -11,9 +11,9 @@ Keep project state in SQLite and run every mutation through the deterministic CL
 
 When the user sends `$control-room init` in a top-level project task:
 
-1. Require the Codex **Local** environment and the repository's primary checkout. Never create a worktree.
+1. Require the Codex **Local** environment and the repository's primary checkout. Initialization never creates a worktree.
 2. Resolve the canonical Git root and current branch. Accept an unborn branch; initialization must not create a commit.
-3. Run `status`. If the project is already initialized, run `install-routing`, do not create another Control Room task or rename the caller, and return a concise acknowledgement with the existing `controlRoomThreadId`.
+3. Run `status`. If the project is already initialized, run `install-routing` to repair both project routing and the worktree ignore rule, do not create another Control Room task or rename the caller, and return a concise acknowledgement with the existing `controlRoomThreadId`.
 4. Require the Codex app thread tools, list projects, and identify the saved project for the canonical root. Fail explicitly if it cannot be resolved.
 5. Create one top-level task in that project with the **Local** environment and the initial prompt `$control-room console`. The user's `init` command explicitly authorizes this task creation.
 6. Use the returned thread ID to run:
@@ -25,11 +25,11 @@ When the user sends `$control-room init` in a top-level project task:
        --base-branch <current-branch>
    ```
 
-7. Require `routing.installed: true` in the `init` result. If it is false, report `routing.error` as partial initialization; use the standalone `install-routing` command only to repair an existing project.
+7. Require both `routing.installed: true` and `worktreeIgnore.installed: true` in the `init` result. The latter atomically adds the exact `.control-room/` line to the root `.gitignore`; without a leading slash it excludes `.control-room` directories at every repository level. If either result is false, report its error as partial initialization; use the standalone `install-routing` command only to repair an existing project.
 8. Set the created task title to the returned `controlRoomTitle`, always `⚫️ Control Room`, wait for its initial turn, and emit the app's created-task directive in the caller.
 9. Leave the calling task unchanged and unregistered. Never assign the Control Room task a `T_ID`.
 
-If database initialization fails after task creation, archive the new task and surface the error. If routing installation fails after database initialization succeeds, keep the registered Control Room task, report the partial initialization, and tell the user to retry `$control-room init`; the retry repairs routing without creating another task. Never retain or silently replace a different registered Control Room task.
+If database initialization fails after task creation, archive the new task and surface the error. If routing or `.gitignore` installation fails after database initialization succeeds, keep the registered Control Room task, report the partial initialization, and tell the user to retry `$control-room init`; the retry repairs both artifacts without creating another task. Never retain or silently replace a different registered Control Room task.
 
 When the created task receives the internal `$control-room console` prompt, do not run `init`, register it as a worker, or start background work. Explain that the task is an optional manual console: it does not process routine events or receive wake notifications, but the user can use it to inspect or reorder the queue, manage dependencies, and perform recovery. End that response with the same command list returned by CLI `help` under a concise `Commands` heading. Put nothing after the list.
 
@@ -38,7 +38,7 @@ When the created task receives the internal `$control-room console` prompt, do n
 At the start of every direct user turn in a top-level Local task:
 
 1. Preserve the complete user message.
-2. Resolve the canonical Git root and trusted current thread ID. Skip subagents, side chats, linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`.
+2. Resolve the canonical Git root and trusted current thread ID. Skip subagents, side chats, unmanaged linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`. A managed isolated worker remains registered against the canonical root from its execution brief even though its file operations use a dedicated worktree.
 3. Run:
 
    ```bash
@@ -56,7 +56,7 @@ At the start of every direct user turn in a top-level Local task:
 
 The read-only exemption applies only while a top-level task is unregistered. A read-only follow-up in an existing worker keeps its identity and state unchanged. If a later message in an unregistered conversation requests change work, evaluate registration again on that turn. Explicit `$control-room join` always adopts the task regardless of whether its accompanying request is read-only.
 
-Automatic registration never enqueues the task, creates a branch, or modifies project files. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
+Automatic registration never enqueues the task, creates a branch, or modifies project files. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root and one idempotent `.control-room/` entry in the root `.gitignore`. It does not create the `.control-room` directory until isolated execution is explicitly requested. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
 
 ## Exclude tasks from Control Room
 
@@ -133,8 +133,9 @@ Apply the same request-preservation rule when automatically registering a new to
 - Let any worker or the manual console submit a valid event, then invoke the deterministic `settle` command in that same turn.
 - Treat the ControlRoom engine as the only queue and state writer. A task triggers the engine but does not edit SQLite directly.
 - Keep `PLANNING` and `QUEUED` read-only on the configured base branch.
-- Allow only the active `RUNNING` or `REVIEW` task to modify files.
-- Create and switch to a worker branch only when settlement activates a queued task.
+- Allow only a `RUNNING` or `REVIEW` task to modify files, and only inside the `workspacePath` returned by its activation brief.
+- Keep normal tasks exclusive in the shared checkout. Allow additional tasks to run concurrently only after the user explicitly requests isolated execution for each one.
+- Create a worker branch only when settlement activates a task. Normal activation switches the shared checkout; isolated activation creates `<project-root>/.control-room/worktrees/<T_ID>` on the same `control-room/<T_ID>` branch without touching the shared checkout.
 - Require a complete task-local mental model before the active worker modifies project files or requests review.
 - Record macro implementation decisions append-only while the task is in `PLANNING`, `QUEUED`, or `RUNNING`.
 - Scope all state to the canonical local repository root.
@@ -200,7 +201,8 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Return to planning`: submit `PLANNING_REQUESTED`. Accept only a `BLOCKED` task whose recorded prior state is `QUEUED`; settlement removes its queue position, preserves dependencies, and returns the `⚪️` title.
 - `Enqueue`: submit `ENQUEUE_REQUESTED`. A mental model is not required to wait in the queue. A new request for an already queued task moves it to the end. A `BLOCKED` task whose recorded prior state is `QUEUED` also returns to the end of the queue with its dependencies unchanged.
 - `Enqueue after T0005`: submit the same event with `--after T0005`; this changes placement only and also accepts a safely blocked waiting task.
-- `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no other task is `RUNNING`, `REVIEW`, or `APPROVED` and every dependency is `DONE`; otherwise reject without changing its state or queue position. A missing mental model is bootstrapped by the activated worker before implementation.
+- `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no shared task is `RUNNING`, `REVIEW`, or `APPROVED` and every dependency is `DONE`; otherwise reject without changing its state or queue position. Explicit isolated workers do not occupy the shared checkout. A missing mental model is bootstrapped by the activated worker before implementation.
+- `Run isolated now`: submit `RUN_ISOLATED_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent already-isolated `RUNNING` no-op. Require every dependency to be `DONE` and an existing first commit on the configured base branch. Settlement creates `<project-root>/.control-room/worktrees/<T_ID>` and activates the task there immediately even while shared or other isolated tasks are active. Never infer this mode from component paths and never fall back to the shared checkout if worktree creation fails.
 - `Move first`, `Move to 3`, `Move before T0005`, or `Move after T0005`: submit `MOVE_REQUESTED` with the matching destination.
 - `Depends on T0005`: submit `DEPENDENCY_ADD_REQUESTED`.
 - `Remove dependency T0005`: submit `DEPENDENCY_REMOVE_REQUESTED`.
@@ -212,7 +214,7 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Queue status` or `$control-room queue`: read the project queue.
 - `$control-room help`: show commands without changing state.
 
-From a worker, return-to-planning, run-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Return T0003 to planning`, `Run T0003 now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
+From a worker, return-to-planning, run-now, run-isolated-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Return T0003 to planning`, `Run T0003 now`, `Run T0003 isolated now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
 
 Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `REVIEW` as its prior state. Those tasks may own a worker branch and uncommitted changes, so use the lower-level `resume` operation to restore the recorded state instead of demoting them into a read-only state.
 
@@ -239,9 +241,9 @@ After each successful state-changing request, immediately run:
 node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 ```
 
-Do not message or wake the Control Room task. Settlement processes every pending event, completes an approved task, activates the next eligible task when the project is idle, and returns the final active queue.
+Do not message or wake the Control Room task. Settlement processes every pending event, serially completes all approved tasks, activates every explicitly requested isolated task, activates the next eligible shared task when the shared checkout is idle, and returns the final active queue.
 
-Apply all returned `titleUpdates` silently before sending any activation brief or final response. If `activation.activated` is true, send its `executionBrief` directly to the target worker; if that worker is the caller, continue locally without a background message. When the brief has `mentalModelRequired: true`, the worker must inspect context, submit and settle `MENTAL_MODEL_RECORDED`, and verify the baseline before its first project-file write. Surface rejected events, blockers, commit recovery, title synchronization failures, and user-action requirements. Routine success needs at most one concise acknowledgement.
+Apply all returned `titleUpdates` silently before sending any activation brief or final response. Send the ordinary `activation.executionBrief` and every `isolatedActivations[].executionBrief` directly to their target workers; if a target worker is the caller, continue locally without a background message. An isolated worker must use its returned `workspacePath` for every file read, edit, command, and verification while continuing to address ControlRoom state through the canonical `projectRoot`. When a brief has `mentalModelRequired: true`, the worker must inspect context, submit and settle `MENTAL_MODEL_RECORDED`, and verify the baseline before its first project-file write. Surface rejected events, blockers, commit recovery, title synchronization failures, and user-action requirements. Routine success needs at most one concise acknowledgement.
 
 When a task in `REVIEW` receives a direct request for additional implementation or file changes, submit `REWORK_REQUESTED` and settle before editing. Continue on the existing checkout and branch after the returned state is `RUNNING`. Questions, explanations, status requests, and read-only inspections do not restart the task. Submit and settle `REVIEW_REQUESTED` again when the revision is ready.
 
@@ -267,8 +269,10 @@ Do not call `process`, `activate-next`, or `commit-approved` separately during n
 - Never stage or commit during `RUNNING` or `REVIEW`.
 - Approval with a clean working tree only marks the task `DONE` and dequeues it.
 - Approval with changes on the base branch commits there without a merge.
-- Approval with changes on the worker branch commits, fast-forward merges into the base branch, and deletes the worker branch.
-- Never push, open a pull request, rebase, force-update, rewrite history, or create a worktree.
+- Approval with changes on a worker branch commits there and integrates the result linearly into the latest base branch. Successful isolated integration removes its worktree and worker branch.
+- If isolated integration conflicts, keep the worktree and branch, clear the approval lease, and move the task to `BLOCKED` from `RUNNING`. Resume it, rework against the latest base inside the preserved workspace, then request review and approval again.
+- Canceling an unchanged isolated task removes its worktree and branch. Canceling one with uncommitted changes or task-local commits preserves both and reports their path for manual recovery.
+- Never push, open a pull request, rebase, force-update, or rewrite published history. Create worktrees only for explicit isolated execution and only below the repository-local `.control-room/worktrees/` directory.
 - Do not reject approval because Git history or working-tree content changed outside ControlRoom.
 
 ## Keep state private

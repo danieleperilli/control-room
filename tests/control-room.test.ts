@@ -155,8 +155,11 @@ test("initializes and completes the first task in a repository without commits",
     assert.equal(initializationResult.controlRoomTitle, "⚫️ Control Room");
     assert.equal(initializationResult.baseCommit, null);
     assert.equal(initializationResult.routing.installed, true);
+    assert.equal(initializationResult.worktreeIgnore.installed, true);
+    assert.equal(initializationResult.worktreeIgnore.pattern, ".control-room/");
     assert.equal(initializationResult.routing.agentsPath, path.join(fs.realpathSync(fixture.repositoryRoot), "AGENTS.md"));
     assert.match(fs.readFileSync(path.join(fixture.repositoryRoot, "AGENTS.md"), "utf8"), /\$control-room/);
+    assert.equal(fs.readFileSync(path.join(fixture.repositoryRoot, ".gitignore"), "utf8"), ".control-room/\n");
     assert.equal(fs.statSync(path.join(fixture.repositoryRoot, "AGENTS.md")).mode & 0o777, 0o644);
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     assert.equal(core.getStatus(options).baseBranch, "main");
@@ -434,6 +437,7 @@ test("returns the user command list for the created Control Room console", () =>
         "Return to planning | Return T0002 to planning",
         "Enqueue [after T0002]",
         "Run now | Run T0002 now",
+        "Run isolated now | Run T0002 isolated now",
         "Move first | Move to 3 | Move before T0002 | Move after T0002",
         "Depends on T0002 | Remove dependency T0002",
         "Approve | Cancel | Status | Queue status"
@@ -443,6 +447,7 @@ test("returns the user command list for the created Control Room console", () =>
     assert.equal(JSON.parse(retry.stdout).created, false);
     assert.equal(JSON.parse(retry.stdout).routing.installed, true);
     assert.equal(JSON.parse(retry.stdout).routing.updated, false);
+    assert.equal(JSON.parse(retry.stdout).worktreeIgnore.updated, false);
     assert.deepEqual(JSON.parse(retry.stdout).userCommands, result.userCommands);
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     assert.match(skillText, /End that response with the same command list returned by CLI `help`/);
@@ -531,13 +536,41 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.match(agentsContent, /Do not automatically register a purely read-only request/);
     assert.match(agentsContent, /Apply every ControlRoom task title update before replying/);
     assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
-    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? AGENTS.md");
+    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? .gitignore\n?? AGENTS.md");
 
     const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
     assert.equal(JSON.parse(retry.stdout).updated, false);
     assert.equal(fs.readFileSync(agentsPath, "utf8"), agentsContent);
     assert.equal((agentsContent.match(/<!-- control-room:start -->/g) || []).length, 1);
+});
+
+test("installs the all-level ControlRoom ignore pattern idempotently", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    const ignorePath = path.join(fixture.repositoryRoot, ".gitignore");
+    fs.writeFileSync(ignorePath, "dist/\n .control-room/ \n");
+
+    const installed = core.installWorktreeIgnore(options);
+    const retry = core.installWorktreeIgnore(options);
+
+    assert.equal(installed.updated, true);
+    assert.equal(retry.updated, false);
+    assert.equal(fs.readFileSync(ignorePath, "utf8"), "dist/\n .control-room/ \n.control-room/\n");
+    assert.equal(runGit(fixture.repositoryRoot, ["check-ignore", "--no-index", "packages/example/.control-room/worktrees/T0002"]), "packages/example/.control-room/worktrees/T0002");
+});
+
+test("rejects a symbolic root gitignore without changing its target", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    const externalIgnorePath = path.join(path.dirname(fixture.stateRoot), "external.gitignore");
+    fs.writeFileSync(externalIgnorePath, "external-only/\n");
+    fs.symlinkSync(externalIgnorePath, path.join(fixture.repositoryRoot, ".gitignore"));
+
+    assert.throws(() => core.installWorktreeIgnore(options), /cannot be a symbolic link/);
+    assert.equal(fs.readFileSync(externalIgnorePath, "utf8"), "external-only/\n");
 });
 
 test("activates with uncommitted local routing without creating a commit", () => {
@@ -786,14 +819,18 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 12);
+    assert.equal(version, 14);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
+    assert.ok(taskColumns.includes("workspace_mode"));
+    assert.ok(taskColumns.includes("worktree_path"));
+    assert.ok(taskColumns.includes("approved_commit"));
     assert.match(dependencySql, /BLOCKING/);
     assert.match(eventSql, /MOVE_REQUESTED/);
     assert.match(eventSql, /REWORK_REQUESTED/);
     assert.match(eventSql, /RUN_NOW_REQUESTED/);
+    assert.match(eventSql, /RUN_ISOLATED_NOW_REQUESTED/);
     assert.match(eventSql, /PLANNING_REQUESTED/);
     assert.match(eventSql, /USER_INPUT_REQUESTED/);
     assert.match(eventSql, /USER_INPUT_RECEIVED/);
@@ -840,7 +877,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -885,7 +922,7 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 12);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 14);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
@@ -1050,6 +1087,161 @@ test("rejects run now without enqueueing when dependencies are pending", () => {
     assert.match(rejected.results[0].error, /until all dependencies are DONE/);
     assert.equal(core.getStatus(options, "T0002").task.state, "PLANNING");
     assert.deepEqual(core.getQueue(options).queue, []);
+});
+
+test("runs and approves an isolated task while the shared worker remains dirty", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.installWorktreeIgnore(options);
+    registerTask(options, "thread-one", "Long shared task");
+    registerTask(options, "thread-two", "Independent isolated task");
+    core.submitEvent(options, "enqueue-shared", "T0001", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    core.activateNextTask(options);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "shared.txt"), "shared work remains dirty\n");
+
+    const isolatedRequest = runCli(["request-run-isolated-now", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "run-isolated"]);
+    assert.equal(isolatedRequest.status, 0, isolatedRequest.stderr || isolatedRequest.stdout);
+    const isolatedSettlement = core.settleProject(options);
+    const isolatedActivation = isolatedSettlement.isolatedActivations[0];
+    const worktreePath = path.join(fs.realpathSync(fixture.repositoryRoot), ".control-room", "worktrees", "T0002");
+    assert.equal(isolatedActivation.activated, true);
+    assert.equal(isolatedActivation.executionBrief.workspacePath, worktreePath);
+    assert.equal(core.getStatus(options, "T0001").task.state, "RUNNING");
+    assert.equal(core.getStatus(options, "T0002").task.workspaceMode, "isolated");
+    assert.equal(core.getStatus(options, "T0002").task.worktreePath, worktreePath);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
+    assert.match(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), /shared\.txt/);
+
+    fs.writeFileSync(path.join(worktreePath, "isolated.txt"), "isolated change\n");
+    approveTask(options, "T0002", "isolated", "Add isolated component change");
+    const isolatedApproval = core.settleProject(options);
+    assert.equal(isolatedApproval.completion.task.state, "DONE");
+    assert.equal(isolatedApproval.completion.task.workspaceMode, "isolated");
+    assert.equal(isolatedApproval.completion.task.worktreePath, null);
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "main:isolated.txt"]), "isolated change");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
+    assert.match(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), /shared\.txt/);
+
+    approveTask(options, "T0001", "shared", "Complete long shared task");
+    const sharedApproval = core.settleProject(options);
+    assert.equal(sharedApproval.completion.task.state, "DONE");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:isolated.txt"]), "isolated change");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:shared.txt"]), "shared work remains dirty");
+    assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "");
+});
+
+test("preserves an isolated worktree and blocks it after an integration conflict", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.installWorktreeIgnore(options);
+    registerTask(options, "thread-one", "Shared conflicting task");
+    registerTask(options, "thread-two", "Isolated conflicting task");
+    core.submitEvent(options, "enqueue-shared-conflict", "T0001", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    core.activateNextTask(options);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "base.txt"), "shared version\n");
+    core.submitEvent(options, "run-isolated-conflict", "T0002", "RUN_ISOLATED_NOW_REQUESTED", {});
+    const isolatedSettlement = core.settleProject(options);
+    const worktreePath = isolatedSettlement.isolatedActivations[0].executionBrief.workspacePath;
+    fs.writeFileSync(path.join(worktreePath, "base.txt"), "isolated version\n");
+
+    approveTask(options, "T0001", "shared-conflict", "Apply shared conflicting change");
+    assert.equal(core.settleProject(options).completion.task.state, "DONE");
+    approveTask(options, "T0002", "isolated-conflict", "Apply isolated conflicting change");
+    const conflictSettlement = core.settleProject(options);
+    const conflict = conflictSettlement.completion;
+
+    assert.equal(conflict.integrationConflict, true);
+    assert.equal(conflict.task.state, "BLOCKED");
+    assert.equal(conflict.task.blockedFromState, "RUNNING");
+    assert.equal(conflict.task.worktreePath, worktreePath);
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(runGit(worktreePath, ["branch", "--show-current"]), "control-room/T0002");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "main:base.txt"]), "shared version");
+    assert.equal(core.getStatus(options).commitTaskId, null);
+});
+
+test("recovers isolated activation after its event was processed separately", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.installWorktreeIgnore(options);
+    registerTask(options, "thread-one", "Recover isolated activation");
+    core.submitEvent(options, "run-isolated-recovery", "T0001", "RUN_ISOLATED_NOW_REQUESTED", {});
+    assert.equal(core.processPendingEvents(options).results[0].action, "RUN_ISOLATED_REQUESTED");
+
+    const settled = core.settleProject(options);
+
+    assert.equal(settled.processed.processedCount, 0);
+    assert.equal(settled.isolatedActivations[0].activated, true);
+    assert.equal(core.getStatus(options, "T0001").task.state, "RUNNING");
+    const worktreePath = settled.isolatedActivations[0].executionBrief.workspacePath;
+    fs.writeFileSync(path.join(worktreePath, "recovered.txt"), "recovered isolated work\n");
+    approveTask(options, "T0001", "recovered-isolated", "Add recovered isolated work");
+    const approved = core.settleProject(options);
+    assert.equal(approved.completion.task.state, "DONE");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "main:recovered.txt"]), "recovered isolated work");
+    assert.match(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), /\.gitignore/);
+});
+
+test("adopts an unchanged worktree left by interrupted isolated activation", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.installWorktreeIgnore(options);
+    registerTask(options, "thread-one", "Adopt interrupted worktree");
+    core.submitEvent(options, "run-isolated-interrupted", "T0001", "RUN_ISOLATED_NOW_REQUESTED", {});
+    core.processPendingEvents(options);
+    const worktreePath = path.join(fs.realpathSync(fixture.repositoryRoot), ".control-room", "worktrees", "T0001");
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    runGit(fixture.repositoryRoot, ["worktree", "add", "-b", "control-room/T0001", worktreePath, "main"]);
+
+    const settled = core.settleProject(options);
+
+    assert.equal(settled.isolatedActivations[0].activated, true);
+    assert.equal(settled.isolatedActivations[0].recoveredActivation, true);
+    assert.equal(settled.isolatedActivations[0].executionBrief.workspacePath, worktreePath);
+    assert.equal(core.getStatus(options, "T0001").task.state, "RUNNING");
+});
+
+test("removes only unchanged canceled isolated worktrees", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.installWorktreeIgnore(options);
+    for (let index = 1; index <= 3; index += 1) {
+        registerTask(options, `thread-${index}`, `Canceled isolated task ${index}`);
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        core.submitEvent(options, `run-isolated-cancel-${index}`, taskId, "RUN_ISOLATED_NOW_REQUESTED", {});
+        const worktreePath = core.settleProject(options).isolatedActivations[0].executionBrief.workspacePath;
+        if (index === 2) {
+            fs.writeFileSync(path.join(worktreePath, "dirty.txt"), "preserve uncommitted work\n");
+        }
+        if (index === 3) {
+            fs.writeFileSync(path.join(worktreePath, "committed.txt"), "preserve committed work\n");
+            runGit(worktreePath, ["add", "committed.txt"]);
+            runGit(worktreePath, ["commit", "-m", "Preserve task commit"]);
+        }
+        core.submitEvent(options, `cancel-isolated-${index}`, taskId, "CANCEL_REQUESTED", { userRequestId: `cancel-message-${index}` });
+        const canceled = core.settleProject(options);
+        const cleanup = canceled.isolatedCancellations.find((result: Record<string, unknown>) => result.taskId === taskId);
+        assert.ok(cleanup);
+        if (index === 1) {
+            assert.equal(cleanup.removed, true);
+            assert.equal(fs.existsSync(worktreePath), false);
+            assert.equal(core.getStatus(options, taskId).task.worktreePath, null);
+        } else {
+            assert.equal(cleanup.preserved, true);
+            assert.equal(cleanup.reason, index === 2 ? "DIRTY_WORKSPACE" : "TASK_COMMITS_PRESENT");
+            assert.equal(fs.existsSync(worktreePath), true);
+            assert.equal(core.getStatus(options, taskId).task.worktreePath, worktreePath);
+        }
+    }
 });
 
 test("settlement commits an approved task and activates the next worker", () => {
@@ -1910,7 +2102,8 @@ test("documents init as creation of a silent manual Control Room task", () => {
     assert.match(skillText, /initial prompt `\$control-room console`/);
     assert.match(skillText, /Leave the calling task unchanged and unregistered/);
     assert.match(skillText, /does not process routine events or receive wake notifications/);
-    assert.match(skillText, /Require `routing\.installed: true` in the `init` result/);
+    assert.match(skillText, /Require both `routing\.installed: true` and `worktreeIgnore\.installed: true` in the `init` result/);
+    assert.match(skillText, /exact `\.control-room\/` line to the root `\.gitignore`/);
     assert.match(skillText, /apply the title of every task in the returned final `queue`/);
 });
 

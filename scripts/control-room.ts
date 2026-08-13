@@ -14,6 +14,7 @@ const USER_COMMANDS = [
     "Return to planning | Return T0002 to planning",
     "Enqueue [after T0002]",
     "Run now | Run T0002 now",
+    "Run isolated now | Run T0002 isolated now",
     "Move first | Move to 3 | Move before T0002 | Move after T0002",
     "Depends on T0002 | Remove dependency T0002",
     "Approve | Cancel | Status | Queue status"
@@ -113,6 +114,7 @@ Commands:
   request-planning --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
   request-run-now --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
+  request-run-isolated-now --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
   request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
   request-dependency-add --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
@@ -154,6 +156,7 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         const options = buildOptions(values);
         const initialized = core.initializeProject(options, requireOption(values, "control-room-thread"), requireOption(values, "base-branch"));
         let routing: Record<string, unknown>;
+        let worktreeIgnore: Record<string, unknown>;
         try {
             routing = core.installProjectRouting(options);
         } catch (error) {
@@ -162,9 +165,18 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
                 error: error instanceof Error ? error.message : String(error)
             };
         }
+        try {
+            worktreeIgnore = core.installWorktreeIgnore(options);
+        } catch (error) {
+            worktreeIgnore = {
+                installed: false,
+                error: error instanceof Error ? error.message : String(error)
+            };
+        }
         return {
             ...initialized,
             routing,
+            worktreeIgnore,
             userCommands: USER_COMMANDS
         };
     }
@@ -181,7 +193,8 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     }
     if (parsed.command === "install-routing") {
         validateOptions(values, ["project-root", "state-root"]);
-        return core.installProjectRouting(buildOptions(values));
+        const options = buildOptions(values);
+        return { ...core.installProjectRouting(options), worktreeIgnore: core.installWorktreeIgnore(options) };
     }
     if (parsed.command === "request-planning") {
         validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
@@ -196,6 +209,10 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     if (parsed.command === "request-run-now") {
         validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "RUN_NOW_REQUESTED", {});
+    }
+    if (parsed.command === "request-run-isolated-now") {
+        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "RUN_ISOLATED_NOW_REQUESTED", {});
     }
     if (parsed.command === "request-move") {
         validateOptions(values, ["project-root", "task", "event-key", "position", "before", "after", "state-root"]);

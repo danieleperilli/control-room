@@ -974,7 +974,8 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
         "- Apply every ControlRoom task title update before replying.",
-        "- Do not apply ControlRoom to subagents or side chats.",
+        "- Never register subagents or side chats as ControlRoom workers, allocate task IDs for them, or let them submit queue or lifecycle mutations on their own behalf.",
+        "- A side chat may create a new top-level task in this saved project with the Local environment only when the user explicitly requests it; remove only the task-creation wrapper, preserve the delegated prompt and lifecycle intent, and let the created task register and mutate its own state.",
         endMarker
     ].join("\n");
     const startIndex = existingContent.indexOf(startMarker);

@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, serial queueing, explicit repository-local isolated execution, task-local mental models and decision logs, user-controlled independent review, approval-only Git integration, cancellation, exclusion, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room exclude, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only and persistently excluded requests unregistered; or when the user says Return to planning, Enqueue, Run now, Run isolated now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Do not apply task IDs to subagents or side chats.
+description: Coordinate top-level Codex project tasks through deterministic planning, serial queueing, explicit repository-local isolated execution, task-local mental models and decision logs, user-controlled independent review, approval-only Git integration, cancellation, exclusion, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room exclude, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only and persistently excluded requests unregistered; when a side chat is explicitly asked to create a new top-level Local task for the project; or when the user says Return to planning, Enqueue, Run now, Run isolated now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Never assign task IDs to subagents or side chats; a top-level task created from a side chat registers itself.
 ---
 
 # ControlRoom
@@ -38,7 +38,7 @@ When the created task receives the internal `$control-room console` prompt, do n
 At the start of every direct user turn in a top-level Local task:
 
 1. Preserve the complete user message.
-2. Resolve the canonical Git root and trusted current thread ID. Skip subagents, side chats, unmanaged linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`. A managed isolated worker remains registered against the canonical root from its execution brief even though its file operations use a dedicated worktree.
+2. Resolve the canonical Git root and trusted current thread ID. Skip automatic registration for subagents, side chats, unmanaged linked worktrees, `$control-room init`, `$control-room console`, `$control-room queue`, and `$control-room help`. A managed isolated worker remains registered against the canonical root from its execution brief even though its file operations use a dedicated worktree.
 3. Run:
 
    ```bash
@@ -57,6 +57,19 @@ At the start of every direct user turn in a top-level Local task:
 The read-only exemption applies only while a top-level task is unregistered. A read-only follow-up in an existing worker keeps its identity and state unchanged. If a later message in an unregistered conversation requests change work, evaluate registration again on that turn. Explicit `$control-room join` always adopts the task regardless of whether its accompanying request is read-only.
 
 Automatic registration never enqueues the task, creates a branch, or modifies project files. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root and one idempotent `.control-room/` entry in the root `.gitignore`. It does not create the `.control-room` directory until isolated execution is explicitly requested. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
+
+## Create top-level tasks from side chats
+
+A side chat is not a ControlRoom worker: never register it, allocate a `T_ID` for it, or submit queue or lifecycle events on its behalf. This boundary does not prevent app-level task creation.
+
+When the user explicitly asks a side chat to create a new project task:
+
+1. Resolve the saved Codex project for the canonical Git root and require the Codex app task tools.
+2. Create one new top-level task in that project with the **Local** environment, never the app's Worktree environment. Remove only the side-chat task-creation wrapper from the initial prompt; preserve the complete delegated request and any explicit ControlRoom lifecycle intent such as enqueueing so the new task does not recursively create another task.
+3. Do not call `register`, submit a ControlRoom event, or call `settle` from the side chat, and do not predict a `T_ID`. The new top-level task loads the project routing, registers itself when appropriate, and submits any requested lifecycle event from its own trusted thread context.
+4. Wait for the created task's initial turn and surface the app's created-task link or directive. If the project or task tools cannot be resolved, report that exact failure instead of mutating ControlRoom state directly.
+
+Create no task proactively. This exception applies only to an explicit user request to create a separate top-level task; ordinary side-chat discussion remains outside ControlRoom.
 
 ## Exclude tasks from Control Room
 
@@ -125,7 +138,7 @@ When the user sends `$control-room join` in an existing top-level task:
 
 Joining is idempotent and never consumes the substantive request. If the message contains only `$control-room join`, return one concise acknowledgement. Store only the semantic name and thread ID, never the transcript.
 
-Apply the same request-preservation rule when automatically registering a new top-level worker after project initialization. Do not register subagents or side chats.
+Apply the same request-preservation rule when automatically registering a new top-level worker after project initialization. Do not register subagents or side chats; a top-level task explicitly created from a side chat performs its own registration.
 
 ## Identify roles and boundaries
 

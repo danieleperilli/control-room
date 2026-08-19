@@ -535,6 +535,10 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.match(agentsContent, /only an explicit `\$control-room join` adopts one/);
     assert.match(agentsContent, /Do not automatically register a purely read-only request/);
     assert.match(agentsContent, /Apply every ControlRoom task title update before replying/);
+    assert.match(agentsContent, /Never register subagents or side chats as ControlRoom workers/);
+    assert.match(agentsContent, /A side chat may create a new top-level task in this saved project with the Local environment only when the user explicitly requests it/);
+    assert.match(agentsContent, /remove only the task-creation wrapper, preserve the delegated prompt and lifecycle intent/);
+    assert.match(agentsContent, /let the created task register and mutate its own state/);
     assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
     assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? .gitignore\n?? AGENTS.md");
 
@@ -2153,6 +2157,24 @@ test("documents project-scoped automatic registration and mandatory title synchr
     assert.match(skillText, /Never modify global Codex instructions/);
     assert.match(skillText, /Apply every `titleUpdates` entry with the Codex app title tool before sending the final response/);
     assert.match(skillText, /A `DONE` task must receive its returned `🟢` title/);
+});
+
+test("documents explicit side-chat creation without side-chat registration or queue mutation", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
+    const readmeText = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+
+    assert.match(skillText, /A side chat is not a ControlRoom worker/);
+    assert.match(skillText, /When the user explicitly asks a side chat to create a new project task/);
+    assert.match(skillText, /Create one new top-level task in that project with the \*\*Local\*\* environment/);
+    assert.match(skillText, /Remove only the side-chat task-creation wrapper from the initial prompt/);
+    assert.match(skillText, /so the new task does not recursively create another task/);
+    assert.match(skillText, /Do not call `register`, submit a ControlRoom event, or call `settle` from the side chat/);
+    assert.match(skillText, /new top-level task loads the project routing, registers itself when appropriate/);
+    assert.match(protocolText, /A side chat never receives a task ID or submits queue or lifecycle events on its own behalf/);
+    assert.match(protocolText, /create one top-level task in the same saved project with the Local environment/);
+    assert.match(readmeText, /This does not prevent it from using the Codex app task tools when you explicitly ask it to create a separate task/);
+    assert.match(readmeText, /The new task loads the project routing and performs its own registration and lifecycle operations/);
 });
 
 test("documents persistent task exclusions and the brand-forge default", () => {

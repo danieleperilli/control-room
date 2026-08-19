@@ -198,7 +198,7 @@ Do not record routine edits or low-level coding steps. Decision events are appen
 
 Use English as the canonical command language and recognize equivalent intent in other languages:
 
-- `Return to planning`: submit `PLANNING_REQUESTED`. Accept only a `BLOCKED` task whose recorded prior state is `QUEUED`; settlement removes its queue position, preserves dependencies, and returns the `⚪️` title.
+- `Return to planning`: submit `PLANNING_REQUESTED`. Accept a `QUEUED` task or a `BLOCKED` task whose recorded prior state is `QUEUED`; settlement removes its queue position, preserves dependencies, and returns the `⚪️` title.
 - `Enqueue`: submit `ENQUEUE_REQUESTED`. A mental model is not required to wait in the queue. A new request for an already queued task moves it to the end. A `BLOCKED` task whose recorded prior state is `QUEUED` also returns to the end of the queue with its dependencies unchanged.
 - `Enqueue after T0005`: submit the same event with `--after T0005`; this changes placement only and also accepts a safely blocked waiting task.
 - `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no shared task is `RUNNING`, `REVIEW`, or `APPROVED` and every dependency is `DONE`; otherwise reject without changing its state or queue position. Explicit isolated workers do not occupy the shared checkout. A missing mental model is bootstrapped by the activated worker before implementation.

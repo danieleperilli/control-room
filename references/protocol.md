@@ -111,7 +111,7 @@ Registration allocates `T0001` through `T9999`, leaves the task in `PLANNING`, a
 
 Create one fresh caller-stable event key per user request and reuse it only on retries.
 
-Return a safely blocked waiting task to planning, enqueue it, or reposition a task:
+Return a queued or safely blocked waiting task to planning, enqueue it, or reposition a task:
 
 ```bash
 node <skill-dir>/scripts/control-room.ts request-planning --project-root <root> --task T0001 --event-key <key>
@@ -124,7 +124,7 @@ node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --ta
 node <skill-dir>/scripts/control-room.ts request-move --project-root <root> --task T0001 --event-key <key> --after T0005
 ```
 
-`Return to planning` accepts only a `BLOCKED` task whose `blocked_from_state` is `QUEUED`. It clears `blocked_from_state` and `queue_position`, compacts the active queue, preserves dependencies, and returns the task's `⚪️` title outside the final queue. `Enqueue` accepts that same safely blocked task and restores it to `QUEUED`; without `--after` it goes to the end. A new `Enqueue` request for an already queued task also moves it to the end. `Run now` prioritizes and activates a `PLANNING` or `QUEUED` task only when the shared checkout has no exclusive active task and every dependency is `DONE`; `RUNNING` is an idempotent no-op. An active shared task or unmet dependency rejects the request without changing the target state or queue position. `--after`, `--before`, and numeric move destinations affect placement only.
+`Return to planning` accepts a `QUEUED` task or a `BLOCKED` task whose `blocked_from_state` is `QUEUED`. It clears `blocked_from_state` and `queue_position`, compacts the active queue, preserves dependencies, and returns the task's `⚪️` title outside the final queue. `Enqueue` accepts that same safely blocked task and restores it to `QUEUED`; without `--after` it goes to the end. A new `Enqueue` request for an already queued task also moves it to the end. `Run now` prioritizes and activates a `PLANNING` or `QUEUED` task only when the shared checkout has no exclusive active task and every dependency is `DONE`; `RUNNING` is an idempotent no-op. An active shared task or unmet dependency rejects the request without changing the target state or queue position. `--after`, `--before`, and numeric move destinations affect placement only.
 
 `Run isolated now` accepts `PLANNING` or `QUEUED`, or acts as an idempotent no-op for the already running isolated task. Every dependency must be `DONE`, and the configured base branch must already have its first commit. Settlement creates `control-room/<T_ID>` in `<project-root>/.control-room/worktrees/<T_ID>` from the latest base branch and returns that absolute path as `executionBrief.workspacePath`. The task may run alongside the shared worker and other explicitly isolated workers. Creation fails closed when the root `.gitignore` rule is missing, a conflicting path or branch already exists, a relevant path is symbolic, or Git cannot create the worktree; it never falls back to the shared checkout.
 
@@ -267,6 +267,7 @@ node <skill-dir>/scripts/control-room.ts queue --project-root <root>
 
 ```text
 PLANNING -> QUEUED -> RUNNING <-> REVIEW -> APPROVED -> DONE
+QUEUED -> PLANNING
 QUEUED -> BLOCKED -> QUEUED or PLANNING
 RUNNING -> BLOCKED -> RUNNING
 REVIEW  -> BLOCKED -> REVIEW

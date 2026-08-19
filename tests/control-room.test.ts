@@ -1297,6 +1297,38 @@ test("moves an already queued task to the end on a new enqueue request", () => {
     assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002"]);
 });
 
+test("returns a queued task to planning and preserves its dependencies", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.processPendingEvents(options);
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    core.activateNextTask(options);
+
+    const requested = runCli(["request-planning", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "planning-2"]);
+    assert.equal(requested.status, 0, requested.stderr || requested.stdout);
+    assert.equal(JSON.parse(requested.stdout).created, true);
+    assert.equal(core.getStatus(options, "T0002").task.state, "QUEUED");
+
+    const settled = core.settleProject(options);
+    assert.equal(settled.processed.results[0].action, "RETURNED_TO_PLANNING");
+    assert.equal(settled.processed.results[0].task.state, "PLANNING");
+    assert.equal(settled.processed.results[0].task.queuePosition, null);
+    assert.equal(settled.processed.results[0].task.title, "⚪️ T0002 - Task 2");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
+    const database = new DatabaseSync(databasePath);
+    const dependency = database.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
+    database.close();
+    assert.equal(dependency.dependency_kind, "BLOCKING");
+});
+
 test("returns a blocked waiting task to planning and preserves its dependencies", () => {
     const fixture = createFixture();
     const databasePath = initializeFixture(fixture);

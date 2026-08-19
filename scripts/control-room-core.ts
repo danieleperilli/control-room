@@ -1181,8 +1181,10 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             };
         }
         if (kind === "PLANNING_REQUESTED") {
-            assertCondition(task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
-            assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+            assertCondition(task.state === "QUEUED" || task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
+            if (task.state === "BLOCKED") {
+                assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+            }
         } else if (kind === "ENQUEUE_REQUESTED") {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "BLOCKED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
             if (task.state === "BLOCKED") {
@@ -1441,13 +1443,15 @@ function assertDependencyIsAcyclic(store: IStore, taskId: string, dependsOnId: s
 }
 
 /**
- * Return a safely blocked waiting task to planning.
+ * Return a queued or safely blocked waiting task to planning.
  * @param store Open project store.
- * @param task Current blocked task row.
+ * @param task Current waiting task row.
  */
 function applyPlanningEvent(store: IStore, task: ITaskRow): Record<string, unknown> {
-    assertCondition(task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
-    assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+    assertCondition(task.state === "QUEUED" || task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
+    if (task.state === "BLOCKED") {
+        assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+    }
     store.database.prepare(`
         UPDATE tasks
         SET state = 'PLANNING', blocked_from_state = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ?

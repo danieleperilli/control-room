@@ -129,7 +129,7 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | `$control-room exclude` | Exclude an unregistered task, or cancel and remove a planning/queued task while restoring its semantic title. |
 | `$control-room queue` | Show the current ordered queue from any task in the initialized Local project. |
 | `$control-room help` | Show the available user commands from any task. |
-| `Return to planning` | Return a blocked waiting task to planning while preserving its dependencies. |
+| `Return to planning` | Return a queued or blocked waiting task to planning while preserving its dependencies. |
 | `Enqueue` | Add or update the current task at the end of the queue, including a blocked waiting task. |
 | `Enqueue after T0005` | Add the current task immediately after `T0005`, without creating a dependency, including a blocked waiting task. |
 | `Run now` | Start the current task immediately when the shared checkout is idle and all dependencies are done. |
@@ -158,7 +158,7 @@ From a worker, `Move` and dependency commands apply to that task. From `⚫️ C
 
 If the current task is already queued, sending `Enqueue` again moves it from its current position to the end. Retrying the same request is still idempotent; a later explicit `Enqueue` is treated as a new request and performs the move.
 
-A task blocked while it was waiting can use `Return to planning` to leave the queue or `Enqueue` to re-enter it at the end; `Enqueue after T0005` chooses an explicit position. Both transitions preserve dependencies, and returning to planning clears the old queue position. A task blocked from `RUNNING` or `REVIEW` rejects these transitions because its worker branch may contain uncommitted changes; resume it to its recorded prior state instead.
+A queued task can use `Return to planning` to leave the queue. A task blocked while it was waiting can also return to planning or use `Enqueue` to re-enter at the end; `Enqueue after T0005` chooses an explicit position. These transitions preserve dependencies, and returning to planning clears the old queue position. A task blocked from `RUNNING` or `REVIEW` rejects them because its worker branch may contain uncommitted changes; resume it to its recorded prior state instead.
 
 `Approve` is accepted only from your direct message in the task currently in review. Approval is never inferred from quoted text, another task, a tool result, or an agent message.
 
@@ -260,7 +260,7 @@ ControlRoom keeps task titles synchronized with their state:
 
 When a running task cannot continue without your direct answer, confirmation, choice, or approval, it temporarily switches from `🔴` to `👉`. The underlying state, queue order, branch, and files do not change. Your next direct message restores `🔴` before the task continues; if it still needs an answer, it shows `👉` again. Planning and review tasks always retain their normal state icons, even when Codex asks a question. Ordinary review approval and optional questions do not use this marker.
 
-Blocked tasks retain the `❌` status icon and task ID. A task blocked from the waiting queue can return explicitly to planning or be enqueued again. Canceled and registered-excluded tasks leave the active queue and return to their undecorated semantic title.
+Blocked tasks retain the `❌` status icon and task ID. A queued task or one blocked from the waiting queue can return explicitly to planning; the blocked task can also be enqueued again. Canceled and registered-excluded tasks leave the active queue and return to their undecorated semantic title.
 
 The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` list. Codex applies the list before reporting success, including returned-to-planning and terminal tasks that no longer appear in the queue. Therefore activation, moving, blocking, return-to-planning, resuming, cancellation, exclusion, or completion renumbers every remaining queued task automatically, returns `PLANNING` to `⚪️`, and changes `DONE` to `🟢`.
 

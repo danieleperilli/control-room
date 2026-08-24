@@ -5,11 +5,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
-const CURRENT_SCHEMA_VERSION = 14;
+const CURRENT_SCHEMA_VERSION = 15;
 
-type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "DONE" | "BLOCKED" | "CANCELED";
+type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
 type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "RUN_ISOLATED_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "MENTAL_MODEL_RECORDED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 type WorkspaceMode = "shared" | "isolated";
+type ApprovalTarget = "DONE" | "PAUSED";
 type DecisionConfidence = "low" | "medium" | "high";
 type DecisionImpact = "low" | "medium" | "high";
 type DecisionInputStatus = "active" | "unresolved";
@@ -23,6 +24,7 @@ interface IControlRoomOptions {
 interface IEventPayload {
     afterTaskId?: string;
     affectedAreas?: string;
+    approvalTarget?: ApprovalTarget;
     alternatives?: string;
     approach?: string;
     beforeTaskId?: string;
@@ -117,6 +119,8 @@ interface ITaskRow {
     worktree_path: string | null;
     reviewed_commit: string | null;
     approved_commit: string | null;
+    approval_event_key: string | null;
+    approval_target: ApprovalTarget;
     integrated_commit: string | null;
     created_at: string;
     updated_at: string;
@@ -441,7 +445,10 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
         };
     }
     if (kind === "APPROVAL_REQUESTED") {
+        const approvalTarget = payload.approvalTarget || "DONE";
+        assertCondition(approvalTarget === "DONE" || approvalTarget === "PAUSED", "Approval target must be DONE or PAUSED.");
         return {
+            approvalTarget,
             commitMessage: validateCommitMessage(payload.commitMessage),
             userRequestId: validateCompactText(payload.userRequestId, "Direct user request ID", 200, true)
         };
@@ -597,7 +604,7 @@ function initializeSchema(database: any): void {
                 task_number INTEGER NOT NULL UNIQUE CHECK (task_number BETWEEN 1 AND 9999),
                 semantic_name TEXT NOT NULL,
                 thread_id TEXT NOT NULL UNIQUE,
-                state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'DONE', 'BLOCKED', 'CANCELED')),
+                state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'PAUSED', 'DONE', 'BLOCKED', 'CANCELED')),
                 blocked_from_state TEXT CHECK (blocked_from_state IN ('QUEUED', 'RUNNING', 'REVIEW')),
                 awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1)),
                 queue_position INTEGER,
@@ -607,6 +614,8 @@ function initializeSchema(database: any): void {
                 worktree_path TEXT,
                 reviewed_commit TEXT,
                 approved_commit TEXT,
+                approval_event_key TEXT,
+                approval_target TEXT NOT NULL DEFAULT 'DONE' CHECK (approval_target IN ('DONE', 'PAUSED')),
                 integrated_commit TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -716,6 +725,78 @@ function initializeSchema(database: any): void {
                 SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
                 FROM events_legacy;
                 DROP TABLE events_legacy;
+            `);
+        }
+        const taskTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get() as { sql: string } | undefined;
+        if (taskTable && (!taskTable.sql.includes("'PAUSED'") || !databaseHasColumn(database, "tasks", "approval_event_key") || !databaseHasColumn(database, "tasks", "approval_target"))) {
+            const hasLegacyReviewedTree = databaseHasColumn(database, "tasks", "reviewed_tree");
+            const reviewedTreeDefinition = hasLegacyReviewedTree ? "reviewed_tree TEXT," : "";
+            const reviewedTreeInsertColumn = hasLegacyReviewedTree ? "reviewed_tree," : "";
+            const reviewedTreeSelectColumn = hasLegacyReviewedTree ? "reviewed_tree," : "";
+            database.exec(`
+                PRAGMA defer_foreign_keys = ON;
+                ALTER TABLE dependencies RENAME TO dependencies_before_paused;
+                ALTER TABLE events RENAME TO events_before_paused;
+                ALTER TABLE tasks RENAME TO tasks_before_paused;
+                CREATE TABLE tasks (
+                    task_id TEXT PRIMARY KEY,
+                    task_number INTEGER NOT NULL UNIQUE CHECK (task_number BETWEEN 1 AND 9999),
+                    semantic_name TEXT NOT NULL,
+                    thread_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'PAUSED', 'DONE', 'BLOCKED', 'CANCELED')),
+                    blocked_from_state TEXT CHECK (blocked_from_state IN ('QUEUED', 'RUNNING', 'REVIEW')),
+                    awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1)),
+                    queue_position INTEGER,
+                    base_commit TEXT,
+                    branch_name TEXT,
+                    workspace_mode TEXT NOT NULL DEFAULT 'shared' CHECK (workspace_mode IN ('shared', 'isolated')),
+                    worktree_path TEXT,
+                    reviewed_commit TEXT,
+                    approved_commit TEXT,
+                    ${reviewedTreeDefinition}
+                    approval_event_key TEXT,
+                    approval_target TEXT NOT NULL DEFAULT 'DONE' CHECK (approval_target IN ('DONE', 'PAUSED')),
+                    integrated_commit TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO tasks (
+                    task_id, task_number, semantic_name, thread_id, state, blocked_from_state,
+                    awaiting_user, queue_position, base_commit, branch_name, workspace_mode,
+                    worktree_path, reviewed_commit, approved_commit, ${reviewedTreeInsertColumn} approval_event_key,
+                    approval_target, integrated_commit, created_at, updated_at
+                )
+                SELECT
+                    task_id, task_number, semantic_name, thread_id, state, blocked_from_state,
+                    awaiting_user, queue_position, base_commit, branch_name, workspace_mode,
+                    worktree_path, reviewed_commit, approved_commit, ${reviewedTreeSelectColumn} NULL,
+                    'DONE', integrated_commit, created_at, updated_at
+                FROM tasks_before_paused;
+                CREATE TABLE dependencies (
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+                    dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
+                    PRIMARY KEY (task_id, depends_on_id, dependency_kind),
+                    CHECK (task_id <> depends_on_id)
+                );
+                INSERT INTO dependencies (task_id, depends_on_id, dependency_kind)
+                SELECT task_id, depends_on_id, dependency_kind FROM dependencies_before_paused;
+                CREATE TABLE events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'RUN_ISOLATED_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'REVIEW_BLIND_RECORDED', 'REVIEW_AUDIT_RECORDED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT,
+                    result_json TEXT
+                );
+                INSERT INTO events (sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
+                SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
+                FROM events_before_paused;
+                DROP TABLE dependencies_before_paused;
+                DROP TABLE events_before_paused;
+                DROP TABLE tasks_before_paused;
             `);
         }
         database.exec(`
@@ -843,6 +924,8 @@ function titleForTask(task: ITaskRow): string {
         prefix = "💪 ";
     } else if (task.state === "APPROVED") {
         prefix = "🟢 ";
+    } else if (task.state === "PAUSED") {
+        prefix = "⏸️ ";
     } else if (task.state === "DONE") {
         prefix = "🟢 ";
     } else if (task.state === "BLOCKED") {
@@ -879,6 +962,7 @@ function serializeTask(task: ITaskRow): Record<string, unknown> {
         workspaceMode: task.workspace_mode,
         worktreePath: task.worktree_path,
         approvedCommit: task.approved_commit,
+        approvalTarget: task.approval_target,
         committedCommit: task.integrated_commit
     };
 }
@@ -1113,7 +1197,7 @@ function registerTask(options: IControlRoomOptions, threadId: string, semanticNa
                 SET semantic_name = ?, state = 'PLANNING', blocked_from_state = NULL, awaiting_user = 0,
                     queue_position = NULL, base_commit = NULL, branch_name = NULL, workspace_mode = 'shared',
                     worktree_path = NULL, reviewed_commit = NULL, approved_commit = NULL,
-                    integrated_commit = NULL, updated_at = ?
+                    approval_event_key = NULL, approval_target = 'DONE', integrated_commit = NULL, updated_at = ?
                 WHERE task_id = ?
             `).run(validSemanticName, timestamp, existingTask.task_id);
             store.database.prepare("DELETE FROM task_exclusions WHERE thread_id = ?").run(validThreadId);
@@ -1222,13 +1306,13 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
         } else if (kind === "REWORK_REQUESTED") {
             assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
-            assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
+            assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
         } else if (kind === "CANCEL_REQUESTED") {
             if (validPayload.cancelSource === "exclude") {
                 assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request exclusion for ${task.task_id} from ${task.state}.`);
             } else {
-                assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
+                assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "PAUSED", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
             }
         } else {
             assertCondition(["QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot report ${task.task_id} blocked from ${task.state}.`);
@@ -1769,16 +1853,17 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return { action: "REWORK_STARTED", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
     if (event.kind === "APPROVAL_REQUESTED") {
-        if (task.state === "APPROVED" || task.state === "DONE") {
+        if (task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE") {
             const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
-            return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId, commitMessage };
+            return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId, commitMessage, approvalTarget: task.approval_target };
         }
         assertCondition(task.state === "REVIEW", `Cannot approve ${task.task_id} from ${task.state}.`);
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Approval requires a direct user request ID.");
         const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
-        store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+        const approvalTarget = payload.approvalTarget || "DONE";
+        store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, approval_event_key = ?, approval_target = ?, updated_at = ? WHERE task_id = ?").run(event.event_key, approvalTarget, currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage };
+        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage, approvalTarget };
     }
     if (event.kind === "CANCEL_REQUESTED") {
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Cancellation requires a direct user request ID.");
@@ -1792,7 +1877,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         if (exclusionRequested) {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot exclude ${task.task_id} from ${task.state}.`);
         } else {
-            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
+            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "PAUSED", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
         }
         const timestamp = currentTimestamp();
         store.database.prepare(`
@@ -2152,9 +2237,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
 }
 
 /**
- * Resume a blocked task to its recorded prior state.
+ * Resume a paused task to planning or a blocked task to its recorded prior state.
  * @param options Project and optional state-root settings.
- * @param taskId Blocked task identifier.
+ * @param taskId Paused or blocked task identifier.
  */
 function resumeTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
     const store = openStore(options);
@@ -2162,6 +2247,21 @@ function resumeTask(options: IControlRoomOptions, taskId: string): Record<string
         beginTransaction(store.database);
         requireProject(store);
         const task = requireTask(store, taskId);
+        if (task.state === "PAUSED") {
+            assertCondition(!task.branch_name && !task.worktree_path, `${task.task_id} still owns a workspace and cannot return to PLANNING safely.`);
+            store.database.prepare(`
+                UPDATE tasks
+                SET state = 'PLANNING', blocked_from_state = NULL, awaiting_user = 0,
+                    queue_position = NULL, base_commit = NULL, branch_name = NULL,
+                    workspace_mode = 'shared', worktree_path = NULL, reviewed_commit = NULL,
+                    approved_commit = NULL, approval_event_key = NULL, approval_target = 'DONE',
+                    integrated_commit = NULL, updated_at = ?
+                WHERE task_id = ?
+            `).run(currentTimestamp(), task.task_id);
+            const resumedTask = requireTask(store, task.task_id);
+            commitTransaction(store.database);
+            return { resumed: true, resumedFrom: "PAUSED", task: serializeTask(resumedTask), titleUpdates: [{ taskId: resumedTask.task_id, threadId: resumedTask.thread_id, title: titleForTask(resumedTask) }] };
+        }
         assertCondition(task.state === "BLOCKED" && task.blocked_from_state, `${task.task_id} is not resumable.`);
         if (task.workspace_mode === "shared" && (task.blocked_from_state === "RUNNING" || task.blocked_from_state === "REVIEW")) {
             const exclusiveTask = store.database.prepare("SELECT task_id FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED') AND task_id <> ? LIMIT 1").get(task.task_id) as Record<string, unknown> | undefined;
@@ -2335,12 +2435,19 @@ function createInitialBaseBranch(projectRoot: string, baseBranch: string, commit
  * @param task Approved task whose commit subject is required.
  */
 function readApprovalCommitMessage(store: IStore, task: ITaskRow): string {
-    const approvalEvents = store.database.prepare(`
-        SELECT payload_json, result_json
-        FROM events
-        WHERE task_id = ? AND kind = 'APPROVAL_REQUESTED' AND processed_at IS NOT NULL
-        ORDER BY sequence
-    `).all(task.task_id) as Array<{ payload_json: string; result_json: string | null }>;
+    const approvalEvents = task.approval_event_key ?
+        store.database.prepare(`
+            SELECT payload_json, result_json
+            FROM events
+            WHERE task_id = ? AND event_key = ? AND kind = 'APPROVAL_REQUESTED' AND processed_at IS NOT NULL
+            ORDER BY sequence
+        `).all(task.task_id, task.approval_event_key) as Array<{ payload_json: string; result_json: string | null }> :
+        store.database.prepare(`
+            SELECT payload_json, result_json
+            FROM events
+            WHERE task_id = ? AND kind = 'APPROVAL_REQUESTED' AND processed_at IS NOT NULL
+            ORDER BY sequence
+        `).all(task.task_id) as Array<{ payload_json: string; result_json: string | null }>;
     for (const approvalEvent of approvalEvents) {
         if (!approvalEvent.result_json) {
             continue;
@@ -2411,6 +2518,34 @@ function removeIsolatedWorkspace(store: IStore, task: ITaskRow, workerCommit: st
     assertCondition(resolveLocalBranchHead(store.projectRoot, task.branch_name) === validateCommitId(workerCommit), `Worker branch moved before cleanup for ${task.task_id}.`);
     requireGit(store.projectRoot, ["worktree", "remove", task.worktree_path], `Remove isolated worktree for ${task.task_id}`);
     requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete worker branch ${task.branch_name}`);
+}
+
+/**
+ * Release the shared worker branch before a task enters PAUSED.
+ * @param store Open project store.
+ * @param project Initialized project record.
+ * @param task Approved shared task being paused.
+ */
+function releasePausedSharedWorkspace(store: IStore, project: IProjectRow, task: ITaskRow): boolean {
+    if (task.workspace_mode !== "shared" || !task.branch_name || task.branch_name === project.base_branch) {
+        return false;
+    }
+    const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch before pausing");
+    assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Cannot pause ${task.task_id} while the primary checkout is on unrelated branch ${currentBranch || "detached HEAD"}.`);
+    const workerCommit = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
+    if (!workerCommit) {
+        assertCondition(task.base_commit === null && currentBranch === task.branch_name, `Worker branch ${task.branch_name} disappeared before ${task.task_id} was paused.`);
+        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} while pausing ${task.task_id}.`);
+        requireGit(store.projectRoot, ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], `Restore unborn base branch ${project.base_branch}`);
+        return true;
+    }
+    assertCondition(workerCommit === task.base_commit, `Worker branch ${task.branch_name} contains commits that were not integrated for ${task.task_id}.`);
+    if (currentBranch === task.branch_name) {
+        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} while pausing ${task.task_id}.`);
+        requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
+    }
+    requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete paused worker branch ${task.branch_name}`);
+    return true;
 }
 
 /**
@@ -2594,25 +2729,26 @@ function finalizeApprovedCommit(store: IStore, taskId: string, committedCommit: 
         const task = requireTask(store, taskId);
         assertCondition(project.integration_task_id === task.task_id, `Commit lease for ${task.task_id} was lost.`);
         assertCondition(task.state === "APPROVED", `Cannot finalize ${task.task_id} from ${task.state}.`);
-        if (branchDeleted) {
+        const finalState = task.approval_target;
+        if (branchDeleted || finalState === "PAUSED") {
             store.database.prepare(`
                 UPDATE tasks
-                SET state = 'DONE', branch_name = NULL, worktree_path = NULL, awaiting_user = 0,
+                SET state = ?, branch_name = NULL, worktree_path = NULL, awaiting_user = 0,
                     integrated_commit = ?, queue_position = NULL, updated_at = ?
                 WHERE task_id = ?
-            `).run(committedCommit, currentTimestamp(), task.task_id);
+            `).run(finalState, committedCommit, currentTimestamp(), task.task_id);
         } else {
             store.database.prepare(`
                 UPDATE tasks
-                SET state = 'DONE', awaiting_user = 0, integrated_commit = ?, queue_position = NULL, updated_at = ?
+                SET state = ?, awaiting_user = 0, integrated_commit = ?, queue_position = NULL, updated_at = ?
                 WHERE task_id = ?
-            `).run(committedCommit, currentTimestamp(), task.task_id);
+            `).run(finalState, committedCommit, currentTimestamp(), task.task_id);
         }
         store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
         const titleUpdates = compactActiveQueue(store);
         const completedTask = requireTask(store, task.task_id);
         commitTransaction(store.database);
-        return { committed: true, merged, branchDeleted, controlRoomTitle: titleForControlRoom(), gitMode: GIT_MODE, task: serializeTask(completedTask), titleUpdates };
+        return { committed: true, merged, branchDeleted, approvalTarget: finalState, controlRoomTitle: titleForControlRoom(), gitMode: GIT_MODE, task: serializeTask(completedTask), titleUpdates };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -2631,11 +2767,12 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         beginTransaction(store.database);
         const project = requireProject(store);
         const task = requireTask(store, taskId);
-        if (task.state === "DONE") {
+        if (task.state === "DONE" || task.state === "PAUSED") {
             commitTransaction(store.database);
             return {
                 committed: false,
-                alreadyCompleted: true,
+                alreadyFinalized: true,
+                alreadyCompleted: task.state === "DONE",
                 alreadyCommitted: Boolean(task.integrated_commit),
                 controlRoomTitle: titleForControlRoom(),
                 gitMode: GIT_MODE,
@@ -2652,8 +2789,11 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
             if (task.workspace_mode === "isolated") {
                 assertCondition(currentHead, `${task.task_id} has no worktree commit.`);
                 removeIsolatedWorkspace(store, task, currentHead);
+            } else if (task.approval_target === "PAUSED") {
+                releasePausedSharedWorkspace(store, project, task);
             }
-            store.database.prepare("UPDATE tasks SET state = 'DONE', branch_name = CASE WHEN workspace_mode = 'isolated' THEN NULL ELSE branch_name END, worktree_path = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+            const releaseWorkspace = task.workspace_mode === "isolated" || task.approval_target === "PAUSED";
+            store.database.prepare("UPDATE tasks SET state = ?, branch_name = CASE WHEN ? THEN NULL ELSE branch_name END, worktree_path = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(task.approval_target, Number(releaseWorkspace), currentTimestamp(), task.task_id);
             const titleUpdates = compactActiveQueue(store);
             const completedTask = requireTask(store, task.task_id);
             commitTransaction(store.database);
@@ -2661,6 +2801,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
                 committed: false,
                 dequeued: true,
                 noUncommittedChanges: true,
+                approvalTarget: task.approval_target,
                 controlRoomTitle: titleForControlRoom(),
                 gitMode: GIT_MODE,
                 task: serializeTask(completedTask),
@@ -2693,7 +2834,8 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         store.database.prepare("UPDATE tasks SET approved_commit = ?, updated_at = ? WHERE task_id = ?").run(committedCommit, currentTimestamp(), task.task_id);
         commitTransaction(store.database);
         if (commitsOnBase) {
-            return finalizeApprovedCommit(store, task.task_id, committedCommit, false, false);
+            const branchDeleted = task.approval_target === "PAUSED" ? releasePausedSharedWorkspace(store, project, task) : false;
+            return finalizeApprovedCommit(store, task.task_id, committedCommit, false, branchDeleted);
         }
         assertCondition(task.branch_name, `${task.task_id} has no worker branch.`);
         const currentBaseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
@@ -2743,10 +2885,11 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
     try {
         const project = requireProject(store);
         const task = requireTask(store, taskId);
-        if (task.state === "DONE") {
+        if (task.state === "DONE" || task.state === "PAUSED") {
             return {
                 recovered: false,
-                alreadyCompleted: true,
+                alreadyFinalized: true,
+                alreadyCompleted: task.state === "DONE",
                 alreadyCommitted: Boolean(task.integrated_commit),
                 controlRoomTitle: titleForControlRoom(),
                 task: serializeTask(task)
@@ -2787,7 +2930,7 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
                 return { recovered: true, finalized: false, retryCommit: true, controlRoomTitle: titleForControlRoom(), task: serializeTask(requireTask(store, task.task_id)) };
             }
             const retried = commitApprovedTask(options, task.task_id);
-            return { ...retried, recovered: true, finalized: Boolean(retried.task && (retried.task as Record<string, unknown>).state === "DONE") };
+            return { ...retried, recovered: true, finalized: Boolean(retried.task && ["DONE", "PAUSED"].includes(String((retried.task as Record<string, unknown>).state))) };
         }
         const workerBranchResult = task.branch_name ?
             runGit(store.projectRoot, ["rev-parse", "--verify", `refs/heads/${task.branch_name}^{commit}`]) :
@@ -2820,7 +2963,10 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
                 assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot restore ${project.base_branch} with a dirty working tree.`);
                 requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
             }
-            const workerBranchWasDeleted = Boolean(task.branch_name && !workerCommit);
+            let workerBranchWasDeleted = Boolean(task.branch_name && !workerCommit);
+            if (task.approval_target === "PAUSED" && task.branch_name && workerCommit) {
+                workerBranchWasDeleted = releasePausedSharedWorkspace(store, project, task);
+            }
             const result = finalizeApprovedCommit(store, task.task_id, currentBaseCommit, workerBranchWasDeleted, workerBranchWasDeleted);
             return { ...result, recovered: true, finalized: true };
         }
@@ -2889,7 +3035,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         const project = requireProject(store);
         if (taskId) {
             const task = requireTask(store, taskId);
-            const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE";
+            const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE";
             return {
                 projectRoot: store.projectRoot,
                 controlRoomTitle: titleForControlRoom(),
@@ -2904,7 +3050,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
             const task = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.thread_id = ?`).get(validThreadId) as ITaskRow | undefined;
             const exclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
             const isExcluded = Boolean(exclusion && (!task || task.state === "CANCELED"));
-            const includesReviewPacket = task && (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "DONE");
+            const includesReviewPacket = task && (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE");
             return {
                 projectRoot: store.projectRoot,
                 controlRoomTitle: titleForControlRoom(),

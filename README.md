@@ -13,6 +13,7 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Leaves changes uncommitted during implementation and review.
 - Creates a worker branch only when a queued task starts running.
 - Creates a commit only after direct user approval and only when uncommitted changes exist.
+- Can approve and integrate an intermediate checkpoint into `PAUSED`, then resume the same task later with `⏸️`.
 - Creates isolated worktrees only on demand below the repository-local `.control-room/worktrees/` directory.
 - Deletes successfully integrated worker branches and isolated worktrees, but never pushes, creates a pull request, or rewrites Git history.
 - Settles queue changes directly from the task issuing the command, without waking the Control Room task.
@@ -94,7 +95,7 @@ $control-room exclude
 
 For an unregistered task, exclusion consumes no `T_ID`, leaves its title unchanged, and never enters the queue. For a registered `PLANNING` or `QUEUED` task, ControlRoom processes the directive through the normal cancellation event: the task becomes `CANCELED`, leaves and compacts the queue, and regains its semantic title without icon or task ID. Its thread then behaves as excluded outside Control Room. You can put a normal request after the directive in the same message; ControlRoom removes only the directive and continues that request outside the queue. Mentions in prose, quoted text, code, tool output, subagent messages, and side chats do not trigger it.
 
-Registered exclusion is rejected from `RUNNING`, `REVIEW`, `APPROVED`, `BLOCKED`, `DONE`, and ordinary `CANCELED`; use the explicit lifecycle commands appropriate to those states. `$control-room join` adopts an excluded task, restoring the same registered task to `PLANNING` when it already had a `T_ID`.
+Registered exclusion is rejected from `RUNNING`, `REVIEW`, `APPROVED`, `PAUSED`, `BLOCKED`, `DONE`, and ordinary `CANCELED`; use the explicit lifecycle commands appropriate to those states. `$control-room join` adopts an excluded task, restoring the same registered task to `PLANNING` when it already had a `T_ID`.
 
 Automatic registration also does not run for persistently excluded tasks, the manual Control Room console, subagents, side chats, `$control-room init`, `$control-room queue`, or `$control-room help`. Outside initialized projects it does nothing.
 
@@ -144,6 +145,8 @@ English is the canonical command language. ControlRoom can still interpret equiv
 | `Remove dependency T0005` | Remove that requirement from the current task. |
 | `Independent review` | Run one optional read-only review with a fresh second agent after the task enters review. |
 | `Approve` | Approve the current task when it is in review. |
+| `Approve and pause` | Approve and integrate the current checkpoint, then leave the unfinished task paused outside the queue. |
+| `Resume` | Return a paused task to planning, or restore a blocked task to its recorded prior state. |
 | `Cancel` | Cancel the current task. |
 | `Status` | Show the current task state. |
 | `Queue status` | Show the ordered project queue. |
@@ -162,17 +165,17 @@ If the current task is already queued, sending `Enqueue` again moves it from its
 
 A queued task can use `Return to planning` to leave the queue. A task blocked while it was waiting can also return to planning or use `Enqueue` to re-enter at the end; `Enqueue after T0005` chooses an explicit position. These transitions preserve dependencies, and returning to planning clears the old queue position. A task blocked from `RUNNING` or `REVIEW` rejects them because its worker branch may contain uncommitted changes; resume it to its recorded prior state instead.
 
-`Approve` is accepted only from your direct message in the task currently in review. Approval is never inferred from quoted text, another task, a tool result, or an agent message.
+`Approve` and `Approve and pause` are accepted only from your direct message in the task currently in review. Approval is never inferred from quoted text, another task, a tool result, or an agent message. Plain approval finishes the task as `DONE`. Approved checkpointing uses the same commit and integration flow but ends in `PAUSED`, releases the workspace, stays outside the active queue, and does not satisfy dependent tasks. `Resume` returns that same `T_ID` to `PLANNING` with its dependencies, mental model, decision log, and event history intact; it must then be enqueued or run again.
 
 A task may be enqueued without a mental model. When it starts, ControlRoom checks its task-local mental model: the relevant current state, desired outcome, approach, affected areas, invariants, non-goals, and verification plan. If it is missing, the activated worker creates it from the task conversation before modifying project files. This also lets tasks queued before the feature was introduced start normally. During planning and implementation, Codex records only the macro decisions that materially shape the result, each with confidence, impact, evidence, and any remaining uncertainty. Superseded decisions remain in the append-only history.
 
-When the task enters review, ControlRoom shows the final mental model, what changed from its baseline, and the decisions ordered from lowest to highest confidence, with unresolved items called out explicitly. It then asks whether you want an independent review. This is optional: you can decline it or say `Approve` immediately.
+When the task enters review, ControlRoom shows the final mental model, what changed from its baseline, and the decisions ordered from lowest to highest confidence, with unresolved items called out explicitly. It then asks whether you want an independent review. This is optional: you can decline it or say `Approve` or `Approve and pause` immediately.
 
 If you accept, one second agent receives a fresh, read-only review brief containing the request, acceptance criteria, changed-file scope, and verification commands. It does not receive the implementer's reasoning, mental model, or decision log. Its report is advisory and does not change the task state or create an additional approval gate.
 
 At approval time, Codex generates a concise English commit subject that describes the actual final change, such as `Add atomic queue position updates`. It does not reuse `T0001 - Semantic name` or copy the task title. The subject is stored with the approval event so recovery uses the same message.
 
-- If the working tree is clean, ControlRoom only marks the current task done and removes it from the queue. It performs no Git write and does not interpret or merge existing commits.
+- If the working tree is clean, ControlRoom moves the task directly to the requested `DONE` or `PAUSED` target. It performs no commit and releases any task workspace.
 - If uncommitted changes are already on the configured base branch, ControlRoom commits them directly there without a merge.
 - If uncommitted changes are on a task worker branch, ControlRoom commits them there and integrates the result linearly into the latest base branch.
 - After successful isolated integration, ControlRoom removes the isolated worktree and worker branch. A conflict instead blocks the task and preserves both so it can be resumed and reworked.
@@ -187,7 +190,7 @@ ControlRoom uses task titles as the normal status display and keeps routine orch
 - Additional operational messages appear only when an error, blocker, recovery step, or user action needs attention.
 - `Status` and `Queue status` show details only when requested.
 
-The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, serially integrates approved tasks, activates requested isolated workers, activates the next eligible shared worker when that checkout is idle, and returns one mandatory `titleUpdates` list in the same turn. Codex applies every entry before replying, including the green title for a completed task and the renumbered titles of all remaining queued tasks. No wake or routine message is sent to `⚫️ Control Room`.
+The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, serially integrates approved tasks to `DONE` or `PAUSED`, activates requested isolated workers, activates the next eligible shared worker when that checkout is idle, and returns one mandatory `titleUpdates` list in the same turn. Codex applies every entry before replying, including the paused or completed title and the renumbered titles of all remaining queued tasks. No wake or routine message is sent to `⚫️ Control Room`.
 
 ## Example usage
 
@@ -239,6 +242,12 @@ While the task is queued, no branch exists for it. When ControlRoom activates th
 
 > Approve
 
+For a stable intermediate checkpoint that you want to continue later, use:
+
+> Approve and pause
+
+The task becomes `⏸️`; when you are ready, send `Resume`, then enqueue or run it again.
+
 The older conversational form remains available when you want queue details:
 
 > Queue status
@@ -256,6 +265,7 @@ ControlRoom keeps task titles synchronized with their state:
 | Running, awaiting your response | `👉 T0001 - Add audit log` |
 | Review | `💪 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
+| Paused | `⏸️ T0001 - Add audit log` |
 | Done | `🟢 T0001 - Add audit log` |
 | Blocked | `❌ T0001 - Add audit log` |
 | Canceled | `Add audit log` |
@@ -264,7 +274,7 @@ When a running task cannot continue without your direct answer, confirmation, ch
 
 Blocked tasks retain the `❌` status icon and task ID. A queued task or one blocked from the waiting queue can return explicitly to planning; the blocked task can also be enqueued again. Canceled and registered-excluded tasks leave the active queue and return to their undecorated semantic title.
 
-The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` list. Codex applies the list before reporting success, including returned-to-planning and terminal tasks that no longer appear in the queue. Therefore activation, moving, blocking, return-to-planning, resuming, cancellation, exclusion, or completion renumbers every remaining queued task automatically, returns `PLANNING` to `⚪️`, and changes `DONE` to `🟢`.
+The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on; `PAUSED` stays outside the active queue. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` list. Codex applies the list before reporting success, including paused, returned-to-planning, and terminal tasks that no longer appear in the queue. Therefore activation, moving, blocking, pausing, resuming, cancellation, exclusion, or completion renumbers every remaining queued task automatically and applies `⚪️`, `⏸️`, or `🟢` as appropriate.
 
 ## Typical workflow
 
@@ -274,9 +284,9 @@ The queue marker is derived from SQLite's active order, but it counts only tasks
 4. The worker invokes settlement, which activates the first eligible task after its dependencies are done.
 5. If its mental model is missing, the activated worker creates and records it from the task context before modifying files. Codex then implements and verifies the change while recording material decisions. If it needs a blocking confirmation, its title switches from `🔴` to `👉` until you respond.
 6. The task moves to review and shows its mental model and confidence-ordered decisions. ControlRoom asks whether you also want one independent review; it never starts one automatically.
-7. Review the result, optionally request the independent pass, and say `Approve` in the same task when satisfied. Further implementation requests return it to running, then back to review when the changes are ready.
-8. Settlement completes the task: it either performs no Git operation for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.
-9. The task becomes done and the next eligible task can start from the updated base.
+7. Review the result, optionally request the independent pass, and say `Approve` when finished or `Approve and pause` for an intermediate checkpoint. Further implementation requests return it to running, then back to review when the changes are ready.
+8. Settlement finalizes the approval: it either performs no commit for a clean tree, commits directly on the base branch, or commits and integrates the worker branch.
+9. The task becomes `DONE`, or becomes `PAUSED` until `Resume` returns it to planning. The next eligible task can start from the updated base in either case.
 
 Dependencies must be `DONE` before a dependent task can run. A clean approval can satisfy this state without ControlRoom creating a commit.
 
@@ -289,17 +299,18 @@ ControlRoom uses one shared mode by default and one explicit isolated mode:
 - Every Codex task remains in the **Local** environment.
 - Normal tasks use the same primary checkout and remain mutually exclusive there.
 - `Run isolated now` creates `<project-root>/.control-room/worktrees/<T_ID>` on `control-room/<T_ID>` from the latest configured base branch. The root `.gitignore` pattern `.control-room/` excludes this directory name at every level.
-- Planning and queued tasks do not modify files or create branches.
+- Planning, queued, and paused tasks do not modify files or create branches.
 - When a normal queued task starts, ControlRoom creates and checks out `control-room/T0001` from the configured base branch in the primary checkout.
 - The worker changes files only in the `workspacePath` from its activation brief, without staging or committing them. Review feedback that requires edits first returns the task to running in the same workspace and branch.
 - Review does not require dirty files and does not freeze the working tree; manual or external changes may still continue until `Approve`.
-- A clean shared approval performs no Git write and only removes the task from the active queue. A clean isolated approval also removes its unused worktree and branch.
+- A clean shared approval creates no commit and releases the task workspace. A clean isolated approval also removes its unused worktree and branch. The requested target still determines whether the task becomes `DONE` or `PAUSED`.
 - When dirty changes are already on the configured base branch, approval commits them there using the meaningful English subject captured by the approval event.
 - When dirty changes are on the worker branch, approval creates that commit on the worker branch.
 - The commit contains the current uncommitted changes at approval time.
 - Worker commits are integrated one at a time into the latest base. If the base is already an ancestor, it advances directly; otherwise ControlRoom creates a linear single-parent integration commit with the combined tree, without a merge commit or rebase.
 - A dirty shared task can remain checked out while an isolated approval advances the base branch reference; its `HEAD`, index, and working files are untouched.
 - After successful isolated integration, ControlRoom removes the worktree and branch. If integration conflicts, it clears the lease, keeps both, and marks the task `BLOCKED` from `RUNNING`; resume it before reworking and requesting review again.
+- A successful approved checkpoint also removes its active branch or worktree before entering `PAUSED`; resumption starts a new execution from the latest base.
 - Canceling an unchanged isolated task removes its workspace and branch. Canceling a task with uncommitted changes or task-local commits preserves them and reports the path for recovery.
 - ControlRoom does not push or open a pull request.
 

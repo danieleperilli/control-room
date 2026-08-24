@@ -17,7 +17,7 @@ const USER_COMMANDS = [
     "Run isolated now | Run T0002 isolated now",
     "Move first | Move to 3 | Move before T0002 | Move after T0002",
     "Depends on T0002 | Remove dependency T0002",
-    "Approve | Cancel | Status | Queue status"
+    "Approve | Approve and pause | Resume | Cancel | Status | Queue status"
 ];
 
 /**
@@ -125,6 +125,7 @@ Commands:
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-rework --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
+  request-approve-and-pause --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-exclude --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --reason TEXT [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
@@ -287,6 +288,15 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     if (parsed.command === "request-approve") {
         validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "commit-message", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "APPROVAL_REQUESTED", {
+            approvalTarget: "DONE",
+            commitMessage: requireOption(values, "commit-message"),
+            userRequestId: requireOption(values, "user-request-id")
+        });
+    }
+    if (parsed.command === "request-approve-and-pause") {
+        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "commit-message", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "APPROVAL_REQUESTED", {
+            approvalTarget: "PAUSED",
             commitMessage: requireOption(values, "commit-message"),
             userRequestId: requireOption(values, "user-request-id")
         });

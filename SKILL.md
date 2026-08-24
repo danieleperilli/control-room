@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate top-level Codex project tasks through deterministic planning, serial queueing, explicit repository-local isolated execution, task-local mental models and decision logs, user-controlled independent review, approval-only Git integration, cancellation, exclusion, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room exclude, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only and persistently excluded requests unregistered; when a side chat is explicitly asked to create a new top-level Local task for the project; or when the user says Return to planning, Enqueue, Run now, Run isolated now, Move, Depends on, Remove dependency, Approve, Cancel, Status, or Queue status. Never assign task IDs to subagents or side chats; a top-level task created from a side chat registers itself.
+description: Coordinate top-level Codex project tasks through deterministic planning, serial queueing, explicit repository-local isolated execution, task-local mental models and decision logs, user-controlled independent review, approval-only Git integration, approved checkpoints, cancellation, exclusion, and status workflows. Use when the user invokes $control-room init, $control-room join, $control-room exclude, $control-room queue, or $control-room help; when the internal $control-room console prompt initializes the manual console task; before top-level project messages after initialization to register change work while leaving purely read-only and persistently excluded requests unregistered; when a side chat is explicitly asked to create a new top-level Local task for the project; or when the user says Return to planning, Enqueue, Run now, Run isolated now, Move, Depends on, Remove dependency, Approve, Approve and pause, Resume, Cancel, Status, or Queue status. Never assign task IDs to subagents or side chats; a top-level task created from a side chat registers itself.
 ---
 
 # ControlRoom
@@ -114,7 +114,7 @@ $control-room exclude
 
 For an unregistered task, persist it with `exclude --reason "manual directive"`. For a `PLANNING` or `QUEUED` worker, submit `request-exclude --reason "manual directive"` and settle. Remove only the standalone directive, then fulfill every remaining part of the message outside Control Room in the same turn. If the message contains only the directive, return one concise acknowledgement. Treat mentions in prose, quoted text, code, or tool output as ordinary text, not as authorization to exclude. Briefly state in commentary when the skill persists a new exclusion. If one direct message contains both standalone `$control-room exclude` and `$control-room join`, do not mutate state until the user resolves the conflicting directives.
 
-An exclusion is idempotent, and its first reason remains recorded. Reject registered-task exclusion from `RUNNING`, `REVIEW`, `APPROVED`, `BLOCKED`, `DONE`, or an ordinary `CANCELED` task because it may own implementation or terminal state; explicit `Cancel` retains its existing broader lifecycle rules. An explicit `$control-room join` is the only normal override for an excluded task.
+An exclusion is idempotent, and its first reason remains recorded. Reject registered-task exclusion from `RUNNING`, `REVIEW`, `APPROVED`, `PAUSED`, `BLOCKED`, `DONE`, or an ordinary `CANCELED` task because it may own implementation, checkpoint, or terminal state; explicit `Cancel` retains its existing broader lifecycle rules. An explicit `$control-room join` is the only normal override for an excluded task.
 
 ## Use global read commands
 
@@ -145,7 +145,7 @@ Apply the same request-preservation rule when automatically registering a new to
 - Keep `⚫️ Control Room` fixed as a manual console. It receives no routine messages and does not run in the background.
 - Let any worker or the manual console submit a valid event, then invoke the deterministic `settle` command in that same turn.
 - Treat the ControlRoom engine as the only queue and state writer. A task triggers the engine but does not edit SQLite directly.
-- Keep `PLANNING` and `QUEUED` read-only on the configured base branch.
+- Keep `PLANNING`, `QUEUED`, and `PAUSED` read-only on the configured base branch.
 - Allow only a `RUNNING` or `REVIEW` task to modify files, and only inside the `workspacePath` returned by its activation brief.
 - Keep normal tasks exclusive in the shared checkout. Allow additional tasks to run concurrently only after the user explicitly requests isolated execution for each one.
 - Create a worker branch only when settlement activates a task. Normal activation switches the shared checkout; isolated activation creates `<project-root>/.control-room/worktrees/<T_ID>` on the same `control-room/<T_ID>` branch without touching the shared checkout.
@@ -165,13 +165,14 @@ Use every returned title exactly:
 - `RUNNING`: `🔴 T0001 - Semantic name`
 - `REVIEW`: `💪 T0001 - Semantic name`
 - `APPROVED`: `🟢 T0001 - Semantic name`
+- `PAUSED`: `⏸️ T0001 - Semantic name`
 - `DONE`: `🟢 T0001 - Semantic name`
 - `BLOCKED`: `❌ T0001 - Semantic name`
 - `CANCELED`: `Semantic name`, with every ControlRoom icon, queue marker, and task ID removed
 
-The `👉` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. Persist only numeric `queue_position` and the undecorated semantic name.
+The `👉` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. `PAUSED` remains outside the active queue. Persist only numeric `queue_position` and the undecorated semantic name.
 
-After every settlement, apply the title of every task in the returned final `queue`, plus any returned-to-planning, completed, or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A task returned to `PLANNING` must receive its `⚪️` title. A `DONE` task must receive its returned `🟢` title, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that user-input signaling refreshes `👉` and that enqueueing, moving, activation, blocking, return-to-planning, resumption, cancellation, and completion immediately renumber every remaining queued title.
+After every settlement, apply the title of every task in the returned final `queue`, plus any returned-to-planning, paused, completed, or canceled task returned outside that queue. Apply every `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. A task returned to `PLANNING` must receive its `⚪️` title. A `PAUSED` task must receive its returned `⏸️` title. A `DONE` task must receive its returned `🟢` title, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. This final snapshot guarantees that user-input signaling refreshes `👉` and that enqueueing, moving, activation, blocking, pausing, resumption, cancellation, and completion immediately renumber every remaining queued title.
 
 When controlling Chrome for a worker, name the browser session or tab group `🤖 <T_ID>`, such as `🤖 T0001`.
 
@@ -221,15 +222,17 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Remove dependency T0005`: submit `DEPENDENCY_REMOVE_REQUESTED`.
 - `Independent review`: accept only in `REVIEW` after the user explicitly chooses it. Run the single fresh-context, read-only reviewer described below without changing ControlRoom state.
 - `Approve`: accept only in `REVIEW` and only from the user's direct message in that worker. Generate a concise, meaningful English imperative commit subject describing the final implementation, never the task ID, title, or semantic name, and submit `APPROVAL_REQUESTED` with `--commit-message`.
+- `Approve and pause`: accept under the same direct-user and `REVIEW` rules as `Approve`, but submit the approval through `request-approve-and-pause`. Settlement uses the normal approval commit and integration flow, then places the task in `PAUSED` with `⏸️`, releases its workspace, leaves it outside the active queue, and does not satisfy dependents.
+- `Resume`: for `PAUSED`, run `resume` to return the same `T_ID` to `PLANNING`, preserve dependencies and review history, reset the execution and approval anchors for the next checkpoint, apply the returned `⚪️` title, and settle. For `BLOCKED`, retain the existing recovery behavior that restores its recorded prior state.
 - `Cancel`: submit an idempotent cancellation request from the current worker.
 - `$control-room exclude`: persist an unregistered opt-out, or submit `request-exclude` and settle for a `PLANNING` or `QUEUED` worker. Apply the undecorated canceled title and every renumbered queued title before continuing outside Control Room.
 - `Status`: read the current task snapshot.
 - `Queue status` or `$control-room queue`: read the project queue.
 - `$control-room help`: show commands without changing state.
 
-From a worker, return-to-planning, run-now, run-isolated-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Return T0003 to planning`, `Run T0003 now`, `Run T0003 isolated now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
+From a worker, return-to-planning, resume, run-now, run-isolated-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Return T0003 to planning`, `Resume T0003`, `Run T0003 now`, `Run T0003 isolated now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
 
-Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `REVIEW` as its prior state. Those tasks may own a worker branch and uncommitted changes, so use the lower-level `resume` operation to restore the recorded state instead of demoting them into a read-only state.
+Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `REVIEW` as its prior state. Those tasks may own a worker branch and uncommitted changes, so use the lower-level `resume` operation to restore the recorded state instead of demoting them into a read-only state. A `PAUSED` task has already integrated its approved checkpoint and uses that same operation to return safely to `PLANNING`.
 
 Generate one caller-stable event key for each user request and reuse it only for retries of that same request. A later direct command gets a new key.
 
@@ -254,7 +257,7 @@ After each successful state-changing request, immediately run:
 node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 ```
 
-Do not message or wake the Control Room task. Settlement processes every pending event, serially completes all approved tasks, activates every explicitly requested isolated task, activates the next eligible shared task when the shared checkout is idle, and returns the final active queue.
+Do not message or wake the Control Room task. Settlement processes every pending event, serially finalizes all approved tasks to `DONE` or `PAUSED`, activates every explicitly requested isolated task, activates the next eligible shared task when the shared checkout is idle, and returns the final active queue.
 
 Apply all returned `titleUpdates` silently before sending any activation brief or final response. Send the ordinary `activation.executionBrief` and every `isolatedActivations[].executionBrief` directly to their target workers; if a target worker is the caller, continue locally without a background message. An isolated worker must use its returned `workspacePath` for every file read, edit, command, and verification while continuing to address ControlRoom state through the canonical `projectRoot`. When a brief has `mentalModelRequired: true`, the worker must inspect context, submit and settle `MENTAL_MODEL_RECORDED`, and verify the baseline before its first project-file write. Surface rejected events, blockers, commit recovery, title synchronization failures, and user-action requirements. Routine success needs at most one concise acknowledgement.
 
@@ -267,7 +270,7 @@ Before requesting review, record and process a final mental-model snapshot if th
 1. Show the final mental model and summarize any fields changed from the baseline.
 2. Show current decisions first, ordered by confidence from `low` to `high` and then by impact from `high` to `low`; show superseded decisions last.
 3. Call out unresolved decisions and remaining uncertainty.
-4. Ask whether the user wants an independent review by a second agent. Do not start one automatically and do not block direct approval when the user declines or says `Approve` immediately.
+4. Ask whether the user wants an independent review by a second agent. Do not start one automatically and do not block direct approval or an approved checkpoint when the user declines or says `Approve` or `Approve and pause` immediately.
 
 If the user explicitly accepts the independent review, delegate exactly one bounded, read-only review pass to a second agent with fresh context and no inherited conversation. Give it only the canonical request, acceptance criteria, repository location, changed-file scope, and relevant verification commands. Do not give it the implementer's mental model, decision log, conclusions, or reasoning. The reviewer inspects the implementation and returns a verdict, concrete findings with evidence, verification performed, and residual risks. It must not edit files, stage changes, commit, register as a ControlRoom task, or receive a `T_ID`.
 
@@ -280,9 +283,10 @@ Do not call `process`, `activate-next`, or `commit-approved` separately during n
 - Never create a branch while a task is `PLANNING` or `QUEUED`; activation inside `settle` is the only pre-approval branch operation.
 - In an unborn repository, the first activation may adopt existing uncommitted files without committing them.
 - Never stage or commit during `RUNNING` or `REVIEW`.
-- Approval with a clean working tree only marks the task `DONE` and dequeues it.
+- Approval with a clean working tree creates no commit and moves the task directly to its requested target, `DONE` or `PAUSED`.
 - Approval with changes on the base branch commits there without a merge.
 - Approval with changes on a worker branch commits there and integrates the result linearly into the latest base branch. Successful isolated integration removes its worktree and worker branch.
+- Approval targeting `PAUSED` uses the same Git flow, releases the shared or isolated workspace, preserves the task history and dependencies, and remains unsatisfied for dependency checks until a later approval reaches `DONE`.
 - If isolated integration conflicts, keep the worktree and branch, clear the approval lease, and move the task to `BLOCKED` from `RUNNING`. Resume it, rework against the latest base inside the preserved workspace, then request review and approval again.
 - Canceling an unchanged isolated task removes its worktree and branch. Canceling one with uncommitted changes or task-local commits preserves both and reports their path for manual recovery.
 - Never push, open a pull request, rebase, force-update, or rewrite published history. Create worktrees only for explicit isolated execution and only below the repository-local `.control-room/worktrees/` directory.

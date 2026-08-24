@@ -440,7 +440,7 @@ test("returns the user command list for the created Control Room console", () =>
         "Run isolated now | Run T0002 isolated now",
         "Move first | Move to 3 | Move before T0002 | Move after T0002",
         "Depends on T0002 | Remove dependency T0002",
-        "Approve | Cancel | Status | Queue status"
+        "Approve | Approve and pause | Resume | Cancel | Status | Queue status"
     ]);
     const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
@@ -636,6 +636,7 @@ test("keeps the failure icon for blocked tasks and resets canceled titles", () =
         semantic_name: "Handle failure"
     };
     assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Handle failure");
+    assert.equal(core.titleForTask({ ...baseTask, state: "PAUSED" }), "⏸️ T0001 - Handle failure");
     assert.equal(core.titleForTask({ ...baseTask, state: "CANCELED" }), "Handle failure");
 });
 
@@ -823,13 +824,15 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 14);
+    assert.equal(version, 15);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
     assert.ok(taskColumns.includes("workspace_mode"));
     assert.ok(taskColumns.includes("worktree_path"));
     assert.ok(taskColumns.includes("approved_commit"));
+    assert.ok(taskColumns.includes("approval_event_key"));
+    assert.ok(taskColumns.includes("approval_target"));
     assert.match(dependencySql, /BLOCKING/);
     assert.match(eventSql, /MOVE_REQUESTED/);
     assert.match(eventSql, /REWORK_REQUESTED/);
@@ -881,7 +884,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -926,10 +929,101 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 15);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
+    migratedDatabase.close();
+});
+
+test("migrates version 14 tasks to PAUSED without losing events or dependencies", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    registerTask(options, "thread-one", "Migrate paused state");
+    registerTask(options, "thread-two", "Preserve dependency");
+    core.submitEvent(options, "migration-dependency", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "migration-enqueue", "T0001", "ENQUEUE_REQUESTED", {});
+
+    const legacyDatabase = new DatabaseSync(databasePath);
+    legacyDatabase.exec(`
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE dependencies RENAME TO dependencies_current;
+        ALTER TABLE events RENAME TO events_current;
+        ALTER TABLE tasks RENAME TO tasks_current;
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            task_number INTEGER NOT NULL UNIQUE CHECK (task_number BETWEEN 1 AND 9999),
+            semantic_name TEXT NOT NULL,
+            thread_id TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'DONE', 'BLOCKED', 'CANCELED')),
+            blocked_from_state TEXT CHECK (blocked_from_state IN ('QUEUED', 'RUNNING', 'REVIEW')),
+            awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1)),
+            queue_position INTEGER,
+            base_commit TEXT,
+            branch_name TEXT,
+            workspace_mode TEXT NOT NULL DEFAULT 'shared' CHECK (workspace_mode IN ('shared', 'isolated')),
+            worktree_path TEXT,
+            reviewed_commit TEXT,
+            approved_commit TEXT,
+            reviewed_tree TEXT,
+            integrated_commit TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO tasks (
+            task_id, task_number, semantic_name, thread_id, state, blocked_from_state,
+            awaiting_user, queue_position, base_commit, branch_name, workspace_mode,
+            worktree_path, reviewed_commit, approved_commit, reviewed_tree, integrated_commit, created_at, updated_at
+        )
+        SELECT
+            task_id, task_number, semantic_name, thread_id, state, blocked_from_state,
+            awaiting_user, queue_position, base_commit, branch_name, workspace_mode,
+            worktree_path, reviewed_commit, approved_commit, '{"legacy":true}', integrated_commit, created_at, updated_at
+        FROM tasks_current;
+        CREATE TABLE dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+            dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
+            PRIMARY KEY (task_id, depends_on_id, dependency_kind),
+            CHECK (task_id <> depends_on_id)
+        );
+        INSERT INTO dependencies (task_id, depends_on_id, dependency_kind)
+        SELECT task_id, depends_on_id, dependency_kind FROM dependencies_current;
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'RUN_ISOLATED_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'REVIEW_BLIND_RECORDED', 'REVIEW_AUDIT_RECORDED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            processed_at TEXT,
+            result_json TEXT
+        );
+        INSERT INTO events (sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
+        SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
+        FROM events_current;
+        DROP TABLE dependencies_current;
+        DROP TABLE events_current;
+        DROP TABLE tasks_current;
+        PRAGMA user_version = 14;
+        PRAGMA foreign_keys = ON;
+    `);
+    legacyDatabase.close();
+
+    assert.equal(core.getStatus(options, "T0001").task.approvalTarget, "DONE");
+    const processed = core.processPendingEvents(options);
+    assert.equal(processed.results[0].eventKey, "migration-enqueue");
+    assert.equal(core.getQueue(options).queue[0].taskId, "T0001");
+    const migratedDatabase = new DatabaseSync(databasePath);
+    const taskSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get().sql;
+    const migratedTask = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
+    const dependency = migratedDatabase.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = 'T0002'").get();
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 15);
+    assert.match(taskSql, /'PAUSED'/);
+    assert.equal(migratedTask.reviewed_tree, '{"legacy":true}');
+    assert.equal(dependency.depends_on_id, "T0001");
     migratedDatabase.close();
 });
 
@@ -1275,6 +1369,136 @@ test("settlement commits an approved task and activates the next worker", () => 
     ]);
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Add settled workflow coverage");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
+});
+
+test("approve and pause commits a checkpoint without satisfying dependencies", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.submitEvent(options, "dependency-2-1", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.settleProject(options);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "checkpoint.txt"), "approved checkpoint\n");
+    core.submitEvent(options, "pause-review", "T0001", "REVIEW_REQUESTED", { summary: "Checkpoint ready" });
+    core.settleProject(options);
+
+    const approval = runCli([
+        "request-approve-and-pause",
+        "--project-root", fixture.repositoryRoot,
+        "--state-root", fixture.stateRoot,
+        "--task", "T0001",
+        "--event-key", "pause-approval",
+        "--user-request-id", "pause-user-message",
+        "--commit-message", "Save the approved checkpoint"
+    ]);
+    assert.equal(approval.status, 0, approval.stderr || approval.stdout);
+    const settled = core.settleProject(options);
+
+    assert.equal(settled.completion.task.state, "PAUSED");
+    assert.equal(settled.completion.task.title, "⏸️ T0001 - Task 1");
+    assert.equal(settled.completion.task.approvalTarget, "PAUSED");
+    assert.equal(settled.completion.task.branchName, null);
+    assert.equal(settled.completion.task.worktreePath, null);
+    assert.equal(settled.activation.task.taskId, "T0003");
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0002", "T0003"]);
+    assert.equal(settled.queue[0].state, "QUEUED");
+    assert.deepEqual(settled.queue[0].dependencies, ["T0001"]);
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "main:checkpoint.txt"]), "approved checkpoint");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "main", "-1", "--format=%s"]), "Save the approved checkpoint");
+
+    const resumed = core.resumeTask(options, "T0001");
+    assert.equal(resumed.resumedFrom, "PAUSED");
+    assert.equal(resumed.task.state, "PLANNING");
+    assert.equal(resumed.task.title, "⚪️ T0001 - Task 1");
+    assert.equal(resumed.task.approvalTarget, "DONE");
+    assert.equal(resumed.task.committedCommit, null);
+    assert.ok(core.getReviewPacket(options, "T0001").baseline);
+    assert.throws(() => core.resumeTask(options, "T0001"), /is not resumable/);
+});
+
+test("a resumed checkpoint uses the new approval subject and can finish", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Continue after checkpoint", "enqueue-1");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "checkpoint.txt"), "first\n");
+    core.submitEvent(options, "first-review", "T0001", "REVIEW_REQUESTED", { summary: "First checkpoint" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "first-approval", "T0001", "APPROVAL_REQUESTED", {
+        approvalTarget: "PAUSED",
+        commitMessage: "Save the first implementation checkpoint",
+        userRequestId: "first-user-message"
+    });
+    assert.equal(core.settleProject(options).completion.task.state, "PAUSED");
+
+    core.resumeTask(options, "T0001");
+    core.submitEvent(options, "resume-run", "T0001", "RUN_NOW_REQUESTED", {});
+    const resumed = core.settleProject(options);
+    assert.equal(resumed.activation.task.state, "RUNNING");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "checkpoint.txt"), "finished\n");
+    approveTask(options, "T0001", "final", "Finish the resumed implementation");
+    const completed = core.settleProject(options);
+
+    assert.equal(completed.completion.task.state, "DONE");
+    assert.equal(completed.completion.task.title, "🟢 T0001 - Continue after checkpoint");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-2", "--format=%s"]), "Finish the resumed implementation\nSave the first implementation checkpoint");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "main:checkpoint.txt"]), "finished");
+});
+
+test("approve and pause releases a stale shared worker branch after a base commit", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Pause a base commit", "enqueue-1");
+    runGit(fixture.repositoryRoot, ["checkout", "main"]);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "base-change.txt"), "checkpoint on base\n");
+    core.submitEvent(options, "base-review", "T0001", "REVIEW_REQUESTED", { summary: "Base checkpoint" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "base-pause", "T0001", "APPROVAL_REQUESTED", {
+        approvalTarget: "PAUSED",
+        commitMessage: "Save a checkpoint committed on main",
+        userRequestId: "base-pause-message"
+    });
+    const paused = core.settleProject(options);
+
+    assert.equal(paused.completion.task.state, "PAUSED");
+    assert.equal(paused.completion.branchDeleted, true);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+    core.resumeTask(options, "T0001");
+    core.submitEvent(options, "base-resume-run", "T0001", "RUN_NOW_REQUESTED", {});
+    assert.equal(core.settleProject(options).activation.task.state, "RUNNING");
+});
+
+test("approve and pause removes an isolated workspace before resumption", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    core.installWorktreeIgnore(options);
+    registerTask(options, "thread-one", "Pause isolated work");
+    core.submitEvent(options, "isolated-pause-run", "T0001", "RUN_ISOLATED_NOW_REQUESTED", {});
+    const activation = core.settleProject(options).isolatedActivations[0];
+    const worktreePath = activation.executionBrief.workspacePath;
+    fs.writeFileSync(path.join(worktreePath, "isolated-checkpoint.txt"), "checkpoint\n");
+    core.submitEvent(options, "isolated-pause-review", "T0001", "REVIEW_REQUESTED", { summary: "Checkpoint ready" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "isolated-pause-approval", "T0001", "APPROVAL_REQUESTED", {
+        approvalTarget: "PAUSED",
+        commitMessage: "Save an isolated implementation checkpoint",
+        userRequestId: "isolated-pause-message"
+    });
+    const paused = core.settleProject(options).completion;
+
+    assert.equal(paused.task.state, "PAUSED");
+    assert.equal(paused.task.worktreePath, null);
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "main:isolated-checkpoint.txt"]), "checkpoint");
+    assert.equal(core.resumeTask(options, "T0001").task.state, "PLANNING");
 });
 
 test("moves an already queued task to the end on a new enqueue request", () => {
@@ -1867,6 +2091,37 @@ test("recovery finalizes a commit created before SQLite completion", () => {
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
 });
 
+test("recovery preserves the PAUSED approval target", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Recover paused checkpoint", "enqueue-1");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "checkpoint.txt"), "recover checkpoint\n");
+    core.submitEvent(options, "recover-pause-review", "T0001", "REVIEW_REQUESTED", { summary: "Checkpoint ready" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "recover-pause-approval", "T0001", "APPROVAL_REQUESTED", {
+        approvalTarget: "PAUSED",
+        commitMessage: "Recover an approved checkpoint",
+        userRequestId: "recover-pause-message"
+    });
+    core.processPendingEvents(options);
+    const preCommitHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+    const database = new DatabaseSync(databasePath);
+    database.prepare("UPDATE tasks SET reviewed_commit = ? WHERE task_id = ?").run(preCommitHead, "T0001");
+    database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?").run("T0001", new Date().toISOString());
+    database.close();
+    runGit(fixture.repositoryRoot, ["add", "-A"]);
+    runGit(fixture.repositoryRoot, ["commit", "-m", "Recover an approved checkpoint"]);
+
+    const recovered = core.recoverCommit(options, "T0001");
+    assert.equal(recovered.finalized, true);
+    assert.equal(recovered.task.state, "PAUSED");
+    assert.equal(recovered.task.title, "⏸️ T0001 - Recover paused checkpoint");
+    assert.equal(recovered.task.branchName, null);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+    assert.equal(core.resumeTask(options, "T0001").task.state, "PLANNING");
+});
+
 test("recovery integrates an initial root commit from the unborn worker branch", () => {
     const fixture = createUnbornFixture();
     const databasePath = initializeFixture(fixture);
@@ -2095,6 +2350,21 @@ test("documents independent review as an explicit user choice", () => {
     assert.match(skillText, /is not persisted in SQLite, and is not an approval gate/);
     assert.match(protocolText, /The review is opt-in/);
     assert.match(protocolText, /declining it or approving directly starts no agent and adds no gate/);
+});
+
+test("documents approved checkpoints and exposes their CLI commands", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
+    const readmeText = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+    const help = runCli(["help"]);
+    assert.equal(help.status, 0, help.stderr || help.stdout);
+    assert.match(help.stdout, /Approve and pause/);
+    assert.match(help.stdout, /request-approve-and-pause/);
+    assert.match(skillText, /`PAUSED`: `⏸️ T0001 - Semantic name`/);
+    assert.match(skillText, /does not satisfy dependents/);
+    assert.match(protocolText, /`APPROVED -> PAUSED`/);
+    assert.match(protocolText, /A `PAUSED` prerequisite remains unsatisfied/);
+    assert.match(readmeText, /`Resume` returns that same `T_ID` to `PLANNING`/);
 });
 
 test("documents just-in-time mental-model bootstrap for activated tasks", () => {

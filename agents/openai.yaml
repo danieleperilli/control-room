@@ -1,4 +1,4 @@
 interface:
   display_name: "ControlRoom"
   short_description: "Coordinate task queues, checkpoints, and reviews"
-  default_prompt: "Use $control-room to coordinate, checkpoint, resume, or exclude this task with a review-ready mental model and decision log."
+  default_prompt: "Use $control-room to coordinate, checkpoint, resume, or exclude this task with concise routine messages and a compact review summary."

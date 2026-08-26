@@ -1102,6 +1102,21 @@ test("settles worker events directly and returns the fully renumbered queue", ()
     assert.equal(retry.activation.activated, false);
     assert.equal(retry.activation.reason, "ACTIVE_TASK_PRESENT");
     assert.deepEqual(retry.queue.map((task: Record<string, unknown>) => task.title), settled.queue.map((task: Record<string, unknown>) => task.title));
+    assert.deepEqual(retry.titleUpdates, []);
+});
+
+test("settlement omits unchanged titles after dependency events", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    registerTask(options, "thread-one", "Dependent task");
+    registerTask(options, "thread-two", "Prerequisite task");
+    core.submitEvent(options, "dependency-1-2", "T0001", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0002" });
+
+    const settled = core.settleProject(options);
+
+    assert.equal(settled.processed.results[0].action, "DEPENDENCY_ADDED");
+    assert.deepEqual(settled.titleUpdates, []);
 });
 
 test("runs an eligible planning task immediately ahead of queued work", () => {
@@ -1550,7 +1565,7 @@ test("returns a queued task to planning and preserves its dependencies", () => {
     assert.equal(settled.processed.results[0].task.queuePosition, null);
     assert.equal(settled.processed.results[0].task.title, "⚪️ T0002 - Task 2");
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
-    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "⭕️ ① T0003 - Task 3"]);
     const database = new DatabaseSync(databasePath);
     const dependency = database.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     database.close();
@@ -1584,7 +1599,7 @@ test("returns a blocked waiting task to planning and preserves its dependencies"
     assert.equal(settled.processed.results[0].task.queuePosition, null);
     assert.equal(settled.processed.results[0].task.title, "⚪️ T0002 - Task 2");
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
-    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "⭕️ ① T0003 - Task 3"]);
     const database = new DatabaseSync(databasePath);
     const dependency = database.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     database.close();
@@ -1991,6 +2006,35 @@ test("approval only dequeues a clean task after a user-created commit", () => {
     assert.equal(core.getQueue(options).queue.length, 0);
 });
 
+test("approval integrates clean manual commits from a shared worker branch", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Integrate manual worker commits", "enqueue-1");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "first-manual.txt"), "first manual commit\n");
+    runGit(fixture.repositoryRoot, ["add", "first-manual.txt"]);
+    runGit(fixture.repositoryRoot, ["commit", "-m", "Add first manual worker change"]);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "second-manual.txt"), "second manual commit\n");
+    runGit(fixture.repositoryRoot, ["add", "second-manual.txt"]);
+    runGit(fixture.repositoryRoot, ["commit", "-m", "Add second manual worker change"]);
+    const manualCommit = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+    approveTask(options, "T0001", "first", "Integrate manually committed worker changes");
+
+    const completed = core.commitApprovedTask(options, "T0001");
+
+    assert.equal(completed.task.state, "DONE");
+    assert.equal(completed.committed, true);
+    assert.equal(completed.merged, true);
+    assert.equal(completed.branchDeleted, true);
+    assert.equal(completed.task.committedCommit, manualCommit);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), manualCommit);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--count", "HEAD"]), "3");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:first-manual.txt"]), "first manual commit");
+    assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:second-manual.txt"]), "second manual commit");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+});
+
 test("approval does not reject commits made outside ControlRoom", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
@@ -2344,12 +2388,16 @@ test("maps review-contract CLI commands without exposing an audit subsystem", ()
 test("documents independent review as an explicit user choice", () => {
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
-    assert.match(skillText, /Ask whether the user wants an independent review by a second agent/);
+    assert.match(skillText, /Ask once whether the user wants an independent review by a second agent/);
     assert.match(skillText, /Do not start one automatically/);
     assert.match(skillText, /fresh context and no inherited conversation/);
     assert.match(skillText, /is not persisted in SQLite, and is not an approval gate/);
+    assert.match(skillText, /Treat the direct command or a clear language equivalent as final authorization/);
+    assert.match(skillText, /Do not repeat the independent-review offer or ask the user to confirm/);
+    assert.match(skillText, /present a compact summary from the returned `reviewPacket`/);
     assert.match(protocolText, /The review is opt-in/);
     assert.match(protocolText, /declining it or approving directly starts no agent and adds no gate/);
+    assert.match(protocolText, /final authorization: submit it and settle immediately without another confirmation/);
 });
 
 test("documents approved checkpoints and exposes their CLI commands", () => {
@@ -2410,7 +2458,7 @@ test("documents init as creation of a silent manual Control Room task", () => {
     assert.match(skillText, /does not process routine events or receive wake notifications/);
     assert.match(skillText, /Require both `routing\.installed: true` and `worktreeIgnore\.installed: true` in the `init` result/);
     assert.match(skillText, /exact `\.control-room\/` line to the root `\.gitignore`/);
-    assert.match(skillText, /apply the title of every task in the returned final `queue`/);
+    assert.match(skillText, /engine emits only tasks whose projected title may have changed/);
 });
 
 test("documents project-scoped automatic registration and mandatory title synchronization", () => {
@@ -2425,7 +2473,7 @@ test("documents project-scoped automatic registration and mandatory title synchr
     assert.match(skillText, /If the project is not initialized, continue without registration or commentary/);
     assert.match(skillText, /active `AGENTS\.md` or `AGENTS\.override\.md` at the project Git root/);
     assert.match(skillText, /Never modify global Codex instructions/);
-    assert.match(skillText, /Apply every `titleUpdates` entry with the Codex app title tool before sending the final response/);
+    assert.match(skillText, /apply every returned `titleUpdates` entry with the Codex app title tool before sending the final response/);
     assert.match(skillText, /A `DONE` task must receive its returned `🟢` title/);
 });
 

@@ -156,6 +156,7 @@ const TASK_ID_PATTERN = /^T\d{4}$/;
 const DECISION_ID_PATTERN = /^D(?:00[1-9]|0[1-9]\d|[1-9]\d{2})$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const ACTIVE_STATES: TaskState[] = ["QUEUED", "RUNNING", "REVIEW", "APPROVED", "BLOCKED"];
+const TITLE_CHANGING_EVENT_ACTIONS = new Set(["RETURNED_TO_PLANNING", "ENQUEUED", "REENQUEUED", "USER_INPUT_REQUESTED", "USER_INPUT_RECEIVED", "REVIEW_READY", "REWORK_STARTED", "APPROVED", "CANCELED", "BLOCKED"]);
 const QUEUE_POSITION_DIGITS = ["⓪", "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
 const TASK_WITH_QUEUED_POSITION_SELECT = `
     SELECT task.*,
@@ -584,6 +585,9 @@ function initializeSchema(database: any): void {
     const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
     const schemaVersion = Number(versionRow.user_version);
     assertCondition(schemaVersion >= 0 && schemaVersion <= CURRENT_SCHEMA_VERSION, `Unsupported Control Room schema version: ${schemaVersion}`);
+    if (schemaVersion === CURRENT_SCHEMA_VERSION) {
+        return;
+    }
     beginTransaction(database);
     try {
         database.exec(`
@@ -2784,8 +2788,11 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         const workspacePath = resolveTaskWorkspace(store, task);
         const currentHead = resolveCurrentHeadIfExists(workspacePath);
         const workingTreeStatus = readWorkingTreeStatus(workspacePath);
-        const isolatedBranchHasCommits = task.workspace_mode === "isolated" && currentHead !== task.base_commit;
-        if (workingTreeStatus.length === 0 && !task.approved_commit && !isolatedBranchHasCommits) {
+        const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Resolve current branch");
+        const commitsOnBase = currentBranch === project.base_branch;
+        assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
+        const workerBranchHasCommits = currentBranch === task.branch_name && currentHead !== task.base_commit;
+        if (workingTreeStatus.length === 0 && !task.approved_commit && !workerBranchHasCommits) {
             if (task.workspace_mode === "isolated") {
                 assertCondition(currentHead, `${task.task_id} has no worktree commit.`);
                 removeIsolatedWorkspace(store, task, currentHead);
@@ -2808,9 +2815,6 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
                 titleUpdates
             };
         }
-        const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Resolve current branch");
-        const commitsOnBase = currentBranch === project.base_branch;
-        assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
         const commitMessage = readApprovalCommitMessage(store, task);
         const timestamp = currentTimestamp();
         store.database.prepare("UPDATE tasks SET reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(currentHead, timestamp, task.task_id);
@@ -2826,7 +2830,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
             requireGit(workspacePath, ["commit", "--message", commitMessage], "Commit approved changes");
             committedCommit = validateCommitId(requireGit(workspacePath, ["rev-parse", "HEAD"], "Resolve approved commit"));
             assertCondition(commitHasExpectedParent(workspacePath, committedCommit, currentHead), currentHead ? `Approved commit does not have expected parent ${currentHead}.` : "Approved initial commit is not a root commit.");
-        } else if (isolatedBranchHasCommits) {
+        } else if (workerBranchHasCommits) {
             committedCommit = currentHead;
         }
         assertCondition(committedCommit, `${task.task_id} has no approved commit to integrate.`);
@@ -3125,24 +3129,49 @@ function addSettlementTitleUpdate(updates: Map<string, ITitleUpdate>, task: unkn
 }
 
 /**
- * Collect every final title that the caller must apply after settlement.
- * @param processed Processed event batch.
- * @param queue Final active queue snapshot.
- * @param completions Approval completion results.
+ * Add projected title updates returned by one settlement phase.
+ * @param updates Title updates keyed by Codex thread ID.
+ * @param candidates Projected title update candidates.
  */
-function collectSettlementTitleUpdates(processed: Record<string, unknown>, queue: Record<string, unknown>[], completions: Record<string, unknown>[]): ITitleUpdate[] {
+function addSettlementTitleUpdateList(updates: Map<string, ITitleUpdate>, candidates: unknown): void {
+    if (!Array.isArray(candidates)) {
+        return;
+    }
+    for (const candidate of candidates) {
+        addSettlementTitleUpdate(updates, candidate);
+    }
+}
+
+/**
+ * Collect only titles whose projection may have changed during settlement.
+ * @param processed Processed event batch.
+ * @param completions Approval completion results.
+ * @param activation Shared activation result.
+ * @param isolatedActivations Isolated activation results.
+ */
+function collectSettlementTitleUpdates(processed: Record<string, unknown>, completions: Record<string, unknown>[], activation: Record<string, unknown> | null, isolatedActivations: Record<string, unknown>[]): ITitleUpdate[] {
     const updates = new Map<string, ITitleUpdate>();
     const results = Array.isArray(processed.results) ? processed.results : [];
     for (const result of results) {
         if (result && typeof result === "object") {
-            addSettlementTitleUpdate(updates, (result as Record<string, unknown>).task);
+            const eventResult = result as Record<string, unknown>;
+            if (typeof eventResult.action === "string" && TITLE_CHANGING_EVENT_ACTIONS.has(eventResult.action)) {
+                addSettlementTitleUpdate(updates, eventResult.task);
+            }
+            addSettlementTitleUpdateList(updates, eventResult.titleUpdates);
         }
-    }
-    for (const task of queue) {
-        addSettlementTitleUpdate(updates, task);
     }
     for (const completion of completions) {
         addSettlementTitleUpdate(updates, completion.task);
+        addSettlementTitleUpdateList(updates, completion.titleUpdates);
+    }
+    if (activation) {
+        addSettlementTitleUpdate(updates, activation.task);
+        addSettlementTitleUpdateList(updates, activation.titleUpdates);
+    }
+    for (const isolatedActivation of isolatedActivations) {
+        addSettlementTitleUpdate(updates, isolatedActivation.task);
+        addSettlementTitleUpdateList(updates, isolatedActivation.titleUpdates);
     }
     return Array.from(updates.values());
 }
@@ -3170,7 +3199,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
             completions: [],
             isolatedActivations: [],
             isolatedCancellations,
-            titleUpdates: collectSettlementTitleUpdates(processed, activeQueue, [])
+            titleUpdates: collectSettlementTitleUpdates(processed, [], null, [])
         };
     }
     const completions: Record<string, unknown>[] = [];
@@ -3209,7 +3238,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         queue: activeQueue,
         reviewPacket: reviewPackets[0] || null,
         reviewPackets,
-        titleUpdates: collectSettlementTitleUpdates(processed, activeQueue, completions)
+        titleUpdates: collectSettlementTitleUpdates(processed, completions, activation, isolatedActivations)
     };
 }
 

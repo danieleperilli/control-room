@@ -1838,6 +1838,34 @@ test("review and approval do not create a commit", () => {
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
 });
 
+for (const [command, target] of [["request-approve", "DONE"], ["request-approve-and-pause", "PAUSED"]]) {
+    test(`${command} recovers an interrupted running task`, () => {
+        const fixture = createFixture();
+        initializeFixture(fixture);
+        const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+        activateTask(options, "thread-one", "Recover interrupted approval", "enqueue-1");
+        fs.writeFileSync(path.join(fixture.repositoryRoot, "change.txt"), "ready before interruption\n");
+
+        const approval = runCli([
+            command,
+            "--project-root", fixture.repositoryRoot,
+            "--state-root", fixture.stateRoot,
+            "--task", "T0001",
+            "--event-key", "approve-running",
+            "--user-request-id", "user-message-1",
+            "--commit-message", "Recover interrupted task approval"
+        ]);
+        assert.equal(approval.status, 0, approval.stderr || approval.stdout);
+        assert.equal(core.getStatus(options, "T0001").task.state, "RUNNING");
+        const settled = core.settleProject(options);
+
+        assert.equal(settled.processed.results[0].action, "APPROVED");
+        assert.equal(settled.completion.task.state, target);
+        assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:change.txt"]), "ready before interruption");
+        assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Recover interrupted task approval");
+    });
+}
+
 test("returns review to running before rework without changing Git state", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
@@ -2393,10 +2421,13 @@ test("documents independent review as an explicit user choice", () => {
     assert.match(skillText, /fresh context and no inherited conversation/);
     assert.match(skillText, /is not persisted in SQLite, and is not an approval gate/);
     assert.match(skillText, /Treat the direct command or a clear language equivalent as final authorization/);
+    assert.match(skillText, /accept in `RUNNING` or `REVIEW`/);
+    assert.match(skillText, /must not require the user to repair the state or repeat approval/);
     assert.match(skillText, /Do not repeat the independent-review offer or ask the user to confirm/);
     assert.match(skillText, /present a compact summary from the returned `reviewPacket`/);
     assert.match(protocolText, /The review is opt-in/);
     assert.match(protocolText, /declining it or approving directly starts no agent and adds no gate/);
+    assert.match(protocolText, /Accept it from `RUNNING` or `REVIEW`/);
     assert.match(protocolText, /final authorization: submit it and settle immediately without another confirmation/);
 });
 

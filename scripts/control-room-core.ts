@@ -1310,7 +1310,7 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
         } else if (kind === "REWORK_REQUESTED") {
             assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
-            assertCondition(task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
+            assertCondition(task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
         } else if (kind === "CANCEL_REQUESTED") {
             if (validPayload.cancelSource === "exclude") {
@@ -1861,7 +1861,8 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
             const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
             return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId, commitMessage, approvalTarget: task.approval_target };
         }
-        assertCondition(task.state === "REVIEW", `Cannot approve ${task.task_id} from ${task.state}.`);
+        // A direct RUNNING approval recovers a turn interrupted before it recorded REVIEW.
+        assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot approve ${task.task_id} from ${task.state}.`);
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Approval requires a direct user request ID.");
         const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
         const approvalTarget = payload.approvalTarget || "DONE";

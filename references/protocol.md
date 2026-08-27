@@ -222,7 +222,7 @@ node <skill-dir>/scripts/control-room.ts request-approve-and-pause \
     --commit-message "<meaningful English imperative subject>"
 ```
 
-The subject is a single line of at most 72 characters, describes the implemented change, and must not copy the task ID or semantic title. The first successful approval event in the current execution fixes the subject and target for commit and recovery. Plain approval targets `DONE`; approved checkpointing targets `PAUSED`. A direct `Approve` or clear language equivalent in the worker task is final authorization: submit it and settle immediately without another confirmation, commit question, integration question, or repeated independent-review offer. If the task is not in `REVIEW`, report its exact state and required next action once.
+The subject is a single line of at most 72 characters, describes the implemented change, and must not copy the task ID or semantic title. The first successful approval event in the current execution fixes the subject and target for commit and recovery. Plain approval targets `DONE`; approved checkpointing targets `PAUSED`. A direct `Approve` or clear language equivalent in the worker task is final authorization: submit it and settle immediately without another confirmation, commit question, integration question, or repeated independent-review offer. Accept it from `RUNNING` or `REVIEW` so an interrupted turn that missed the review transition cannot block approval. Direct approval from `RUNNING` authorizes the current assigned workspace without a synthetic review event or proof of interruption. Retries from `APPROVED`, `PAUSED`, or `DONE` are idempotent; `PLANNING`, `QUEUED`, `BLOCKED`, and `CANCELED` still reject approval with the exact state and required next action.
 
 Cancel or block:
 
@@ -279,9 +279,9 @@ node <skill-dir>/scripts/control-room.ts queue --project-root <root>
 ## State machine
 
 ```text
-PLANNING -> QUEUED -> RUNNING <-> REVIEW -> APPROVED
-                                             |-> DONE
-                                             `-> PAUSED -> PLANNING
+PLANNING -> QUEUED -> RUNNING <-> REVIEW
+RUNNING, REVIEW -> APPROVED -> DONE
+                          `-> PAUSED -> PLANNING
 QUEUED -> PLANNING
 QUEUED -> BLOCKED -> QUEUED or PLANNING
 RUNNING -> BLOCKED -> RUNNING

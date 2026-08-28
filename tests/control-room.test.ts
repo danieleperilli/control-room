@@ -534,6 +534,9 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.match(agentsContent, /cancellation and settlement/);
     assert.match(agentsContent, /only an explicit `\$control-room join` adopts one/);
     assert.match(agentsContent, /Do not automatically register a purely read-only request/);
+    assert.match(agentsContent, /Treat a direct user `Enqueue` command as advance authorization/);
+    assert.match(agentsContent, /send one activation brief to its recorded thread without asking for another confirmation/);
+    assert.match(agentsContent, /never covers another task, thread, project, or implementation scope/);
     assert.match(agentsContent, /Apply every ControlRoom task title update before replying/);
     assert.match(agentsContent, /Never register subagents or side chats as ControlRoom workers/);
     assert.match(agentsContent, /A side chat may create a new top-level task in this saved project with the Local environment only when the user explicitly requests it/);
@@ -541,6 +544,13 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.match(agentsContent, /let the created task register and mutate its own state/);
     assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
     assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? .gitignore\n?? AGENTS.md");
+
+    const staleAgentsContent = agentsContent.replace(/^- Treat a direct user `Enqueue` command.*\n/mu, "");
+    fs.writeFileSync(agentsPath, staleAgentsContent);
+    const repaired = runCli(argumentsList, { CODEX_HOME: codexHome });
+    assert.equal(repaired.status, 0, repaired.stderr || repaired.stdout);
+    assert.equal(JSON.parse(repaired.stdout).updated, true);
+    assert.equal(fs.readFileSync(agentsPath, "utf8"), agentsContent);
 
     const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
@@ -1357,7 +1367,7 @@ test("removes only unchanged canceled isolated worktrees", () => {
     }
 });
 
-test("settlement commits an approved task and activates the next worker", () => {
+test("settlement commits an approved task and automatically activates the user-enqueued next worker", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
@@ -1377,6 +1387,10 @@ test("settlement commits an approved task and activates the next worker", () => 
     assert.equal(settled.completion.committed, true);
     assert.equal(settled.activation.activated, true);
     assert.equal(settled.activation.task.taskId, "T0002");
+    assert.equal(settled.activation.executionBrief.taskId, "T0002");
+    assert.equal(settled.activation.executionBrief.threadId, "thread-2");
+    assert.equal(settled.activation.executionBrief.projectRoot, fs.realpathSync(fixture.repositoryRoot));
+    assert.equal(settled.activation.executionBrief.workspacePath, fs.realpathSync(fixture.repositoryRoot));
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Task 2"]);
     assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), [
         "🟢 T0001 - Task 1",
@@ -2429,6 +2443,17 @@ test("documents independent review as an explicit user choice", () => {
     assert.match(protocolText, /declining it or approving directly starts no agent and adds no gate/);
     assert.match(protocolText, /Accept it from `RUNNING` or `REVIEW`/);
     assert.match(protocolText, /final authorization: submit it and settle immediately without another confirmation/);
+});
+
+test("documents enqueue as bounded advance authorization for automatic worker handoff", () => {
+    const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
+    const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
+    const readmeText = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+    assert.match(skillText, /The direct user command is advance authorization for that exact registered task to start automatically/);
+    assert.match(skillText, /do not reinterpret the activation as an unrelated implementation request/);
+    assert.match(protocolText, /Approval of the preceding task merely makes that existing authorization eligible/);
+    assert.match(protocolText, /no second start command or confirmation is required/);
+    assert.match(readmeText, /this is queue continuation, not a new unrelated implementation request/);
 });
 
 test("documents approved checkpoints and exposes their CLI commands", () => {

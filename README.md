@@ -161,7 +161,7 @@ Queue order and dependencies are separate. `Enqueue after` and every `Move` comm
 
 From a worker, `Move` and dependency commands apply to that task. From `⚫️ Control Room`, include the target ID, for example `Move T0003 before T0005` or `Make T0003 depend on T0005`.
 
-If the current task is already queued, sending `Enqueue` again moves it from its current position to the end. Retrying the same request is still idempotent; a later explicit `Enqueue` is treated as a new request and performs the move.
+If the current task is already queued, sending `Enqueue` again moves it from its current position to the end. Retrying the same request is still idempotent; a later explicit `Enqueue` is treated as a new request and performs the move. A direct `Enqueue` also authorizes that exact registered task to start automatically when it becomes the first dependency-eligible queued worker and authorizes one activation brief to its recorded task thread. Finishing the preceding task therefore starts the queued task without another confirmation. This advance authorization does not apply to a different task, thread, project, or implementation scope.
 
 A queued task can use `Return to planning` to leave the queue. A task blocked while it was waiting can also return to planning or use `Enqueue` to re-enter at the end; `Enqueue after T0005` chooses an explicit position. These transitions preserve dependencies, and returning to planning clears the old queue position. A task blocked from `RUNNING` or `REVIEW` rejects them because its worker branch may contain uncommitted changes; resume it to its recorded prior state instead.
 
@@ -191,7 +191,7 @@ ControlRoom uses task titles as the normal status display and keeps routine orch
 - Additional operational messages appear only when an error, blocker, recovery step, or user action needs attention.
 - `Status` and `Queue status` show details only when requested.
 
-The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, serially integrates approved tasks to `DONE` or `PAUSED`, activates requested isolated workers, activates the next eligible shared worker when that checkout is idle, and returns one mandatory `titleUpdates` delta in the same turn. Codex applies every changed entry before replying, including paused or completed tasks and queued tasks whose visible position changed; unchanged queue titles are not resubmitted. No wake or routine message is sent to `⚫️ Control Room`.
+The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, serially integrates approved tasks to `DONE` or `PAUSED`, activates requested isolated workers, activates the next eligible shared worker when that checkout is idle, and returns one mandatory `titleUpdates` delta in the same turn. Codex applies every changed entry before replying, including paused or completed tasks and queued tasks whose visible position changed; unchanged queue titles are not resubmitted. When approval frees the shared checkout, the next eligible worker receives its activation brief under the authorization already granted by its direct `Enqueue`; this is queue continuation, not a new unrelated implementation request. No wake or routine message is sent to `⚫️ Control Room`.
 
 ## Example usage
 

@@ -1061,6 +1061,7 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "- For a registered PLANNING or QUEUED task, route `$control-room exclude` through cancellation and settlement so it leaves the queue and regains its undecorated semantic title.",
         "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
+        "- Treat a direct user `Enqueue` command as advance authorization for that exact registered task to start automatically when it becomes the first dependency-eligible queued worker. After settlement activates it, send one activation brief to its recorded thread without asking for another confirmation merely because a different task's approval freed the queue. This authorization never covers another task, thread, project, or implementation scope.",
         "- Apply every ControlRoom task title update before replying.",
         "- Never register subagents or side chats as ControlRoom workers, allocate task IDs for them, or let them submit queue or lifecycle mutations on their own behalf.",
         "- A side chat may create a new top-level task in this saved project with the Local environment only when the user explicitly requests it; remove only the task-creation wrapper, preserve the delegated prompt and lifecycle intent, and let the created task register and mutate its own state.",

@@ -193,6 +193,10 @@ ControlRoom uses task titles as the normal status display and keeps routine orch
 
 The task issuing a state-changing command immediately invokes the deterministic settlement engine. Settlement processes pending events, serially integrates approved tasks to `DONE` or `PAUSED`, activates requested isolated workers, activates the next eligible shared worker when that checkout is idle, and returns one mandatory `titleUpdates` delta in the same turn. Codex applies every changed entry before replying, including paused or completed tasks and queued tasks whose visible position changed; unchanged queue titles are not resubmitted. When approval frees the shared checkout, the next eligible worker receives its activation brief under the authorization already granted by its direct `Enqueue`; this is queue continuation, not a new unrelated implementation request. No wake or routine message is sent to `⚫️ Control Room`.
 
+The activation brief carries a reference to the accepted start request, including the original user-message ID when available. Before a handoff across tasks, Codex checks the original direct request in task history when it is absent from the current context. This makes the authorization traceable but cannot guarantee that Codex auto-review will allow the send. If delivery after approval is denied, the **approved sender** shows `🟡` where your intervention is needed, and the **next worker** returns to the `⭕️` queue display instead of retaining the `🔴` assigned before delivery. The predecessor stays completed, and the destination keeps its reserved workspace. An explicit authorization permits one delivery attempt; successful delivery restores `🟢` (or `⏸️`) to the sender and `🔴` to the destination. No approval settings are weakened and denied sends are not retried automatically.
+
+Approval of an unchanged shared worker also releases its branch and restores the base checkout before starting the next task. It creates no commit, including when the repository has no commits yet.
+
 ## Example usage
 
 Initialize from any top-level Local task:
@@ -264,6 +268,8 @@ ControlRoom keeps task titles synchronized with their state:
 | Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
 | Running, awaiting your response | `🟡 T0001 - Add audit log` |
+| Approved sender, activation delivery needs your intervention | `🟡 T0001 - Add audit log` |
+| Destination waiting for activation delivery | `⭕️ ① T0002 - Add export` |
 | Review | `💪 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
 | Paused | `⏸️ T0001 - Add audit log` |
@@ -275,7 +281,7 @@ When a running task cannot continue without your direct answer, confirmation, ch
 
 Blocked tasks retain the `❌` status icon and task ID. A queued task or one blocked from the waiting queue can return explicitly to planning; the blocked task can also be enqueued again. Canceled and registered-excluded tasks leave the active queue and return to their undecorated semantic title.
 
-The queue marker is derived from SQLite's active order, but it counts only tasks still in `QUEUED`. A task in `RUNNING`, `REVIEW`, `APPROVED`, or `BLOCKED` keeps its internal order without consuming `①`, `②`, and so on; `PAUSED` stays outside the active queue. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` delta. Codex applies changed titles before reporting success, including paused, returned-to-planning, terminal tasks, and every queued task whose visible position changed. Unchanged active titles are omitted, while activation, moving, blocking, pausing, resuming, cancellation, exclusion, or completion still applies `⚪️`, `⏸️`, or `🟢` and renumbers affected queued tasks automatically.
+The queue marker is derived from SQLite's active order and counts `QUEUED` tasks plus destinations waiting for activation delivery. An undelivered destination retains its internal `RUNNING` state to reserve its workspace, but displays `⭕️` with its visible position. Other active states do not consume a visible number; `PAUSED` stays outside the active queue. The marker is never stored in the semantic task name. Every settlement returns the final queue snapshot and a deduplicated `titleUpdates` delta, including the completed sender when its handoff needs attention. Codex applies changed titles before reporting success and renumbers affected waiting tasks automatically.
 
 ## Typical workflow
 

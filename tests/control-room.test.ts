@@ -834,7 +834,7 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 15);
+    assert.equal(version, 16);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
@@ -894,7 +894,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 15);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 16);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -939,7 +939,7 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 15);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 16);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
@@ -1030,7 +1030,7 @@ test("migrates version 14 tasks to PAUSED without losing events or dependencies"
     const taskSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get().sql;
     const migratedTask = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const dependency = migratedDatabase.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = 'T0002'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 15);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 16);
     assert.match(taskSql, /'PAUSED'/);
     assert.equal(migratedTask.reviewed_tree, '{"legacy":true}');
     assert.equal(dependency.depends_on_id, "T0001");
@@ -1138,7 +1138,7 @@ test("runs an eligible planning task immediately ahead of queued work", () => {
     core.submitEvent(options, "enqueue-1", "T0001", "ENQUEUE_REQUESTED", {});
     core.processPendingEvents(options);
 
-    const requested = runCli(["request-run-now", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "run-now-2"]);
+    const requested = runCli(["request-run-now", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "run-now-2", "--user-request-id", "user-run-now-2"]);
     assert.equal(requested.status, 0, requested.stderr || requested.stdout);
     assert.equal(JSON.parse(requested.stdout).created, true);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
@@ -1148,10 +1148,12 @@ test("runs an eligible planning task immediately ahead of queued work", () => {
     assert.equal(settled.activation.activated, true);
     assert.equal(settled.activation.task.taskId, "T0002");
     assert.equal(settled.activation.task.state, "RUNNING");
+    assert.equal(settled.activation.executionBrief.activationRequest.eventKind, "RUN_NOW_REQUESTED");
+    assert.equal(settled.activation.executionBrief.activationRequest.userRequestId, "user-run-now-2");
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Immediate task", "⭕️ ① T0001 - Queued task"]);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
 
-    const retry = core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", {});
+    const retry = core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", { userRequestId: "user-run-now-2" });
     assert.equal(retry.created, false);
     assert.equal(retry.processed, true);
 });
@@ -1224,13 +1226,15 @@ test("runs and approves an isolated task while the shared worker remains dirty",
     core.activateNextTask(options);
     fs.writeFileSync(path.join(fixture.repositoryRoot, "shared.txt"), "shared work remains dirty\n");
 
-    const isolatedRequest = runCli(["request-run-isolated-now", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "run-isolated"]);
+    const isolatedRequest = runCli(["request-run-isolated-now", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "run-isolated", "--user-request-id", "user-run-isolated"]);
     assert.equal(isolatedRequest.status, 0, isolatedRequest.stderr || isolatedRequest.stdout);
     const isolatedSettlement = core.settleProject(options);
     const isolatedActivation = isolatedSettlement.isolatedActivations[0];
     const worktreePath = path.join(fs.realpathSync(fixture.repositoryRoot), ".control-room", "worktrees", "T0002");
     assert.equal(isolatedActivation.activated, true);
     assert.equal(isolatedActivation.executionBrief.workspacePath, worktreePath);
+    assert.equal(isolatedActivation.executionBrief.activationRequest.eventKind, "RUN_ISOLATED_NOW_REQUESTED");
+    assert.equal(isolatedActivation.executionBrief.activationRequest.userRequestId, "user-run-isolated");
     assert.equal(core.getStatus(options, "T0001").task.state, "RUNNING");
     assert.equal(core.getStatus(options, "T0002").task.workspaceMode, "isolated");
     assert.equal(core.getStatus(options, "T0002").task.worktreePath, worktreePath);
@@ -1374,9 +1378,12 @@ test("settlement commits an approved task and automatically activates the user-e
     for (let index = 1; index <= 2; index += 1) {
         const taskId = `T${String(index).padStart(4, "0")}`;
         registerTask(options, `thread-${index}`, `Task ${index}`);
-        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+        const enqueued = runCli(["request-enqueue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", taskId, "--event-key", `enqueue-${index}`, "--user-request-id", `user-enqueue-${index}`]);
+        assert.equal(enqueued.status, 0, enqueued.stderr || enqueued.stdout);
     }
     core.settleProject(options);
+    core.submitEvent(options, "run-next-too-early", "T0002", "RUN_NOW_REQUESTED", { userRequestId: "user-rejected-run" });
+    assert.equal(core.settleProject(options).processed.results[0].action, "REJECTED");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "settled.txt"), "approved\n");
     core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Ready" });
     core.settleProject(options);
@@ -1391,6 +1398,11 @@ test("settlement commits an approved task and automatically activates the user-e
     assert.equal(settled.activation.executionBrief.threadId, "thread-2");
     assert.equal(settled.activation.executionBrief.projectRoot, fs.realpathSync(fixture.repositoryRoot));
     assert.equal(settled.activation.executionBrief.workspacePath, fs.realpathSync(fixture.repositoryRoot));
+    const activationRequest = settled.activation.executionBrief.activationRequest;
+    assert.equal(activationRequest.eventKey, "enqueue-2");
+    assert.equal(activationRequest.eventKind, "ENQUEUE_REQUESTED");
+    assert.equal(activationRequest.userRequestId, "user-enqueue-2");
+    assert.ok(Number.isFinite(Date.parse(activationRequest.requestedAt)));
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Task 2"]);
     assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), [
         "🟢 T0001 - Task 1",
@@ -1398,6 +1410,185 @@ test("settlement commits an approved task and automatically activates the user-e
     ]);
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Add settled workflow coverage");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
+});
+
+/**
+ * Exercise the sender's attention fallback after a denied activation handoff.
+ */
+test("marks the approved sender yellow and the undelivered worker queued without releasing its workspace", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        const taskId = `T${String(index).padStart(4, "0")}`;
+        registerTask(options, `thread-${index}`, `Task ${index}`);
+        core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+    }
+    core.settleProject(options);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "approved.txt"), "completed work\n");
+    core.submitEvent(options, "approve-first", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Complete initial work", userRequestId: "approve-first-message" });
+    const activated = core.settleProject(options).activation;
+    const initialHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+    assert.equal(activated.task.title, "🔴 T0002 - Task 2");
+    const marked = runCli(["request-user-input", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--handoff-task", activated.task.taskId, "--event-key", "activation-send-denied"]);
+    assert.equal(marked.status, 0, marked.stderr || marked.stdout);
+    const waiting = core.settleProject(options);
+    assert.deepEqual(waiting.titleUpdates, [
+        { taskId: "T0001", threadId: "thread-1", title: "🟡 T0001 - Task 1" },
+        { taskId: "T0002", threadId: "thread-2", title: "⭕️ ① T0002 - Task 2" },
+        { taskId: "T0003", threadId: "thread-3", title: "⭕️ ② T0003 - Task 3" }
+    ]);
+    assert.equal(waiting.activation.reason, "ACTIVE_TASK_PRESENT");
+    assert.equal(waiting.queue[0].state, "RUNNING");
+    assert.equal(waiting.queue[0].queuePosition, activated.task.queuePosition);
+    assert.equal(waiting.queue[0].branchName, activated.task.branchName);
+    assert.equal(waiting.queue[0].handoffSenderTaskId, "T0001");
+    assert.equal(waiting.queue[1].title, "⭕️ ② T0003 - Task 3");
+    assert.equal(core.getStatus(options, "T0001").task.title, "🟡 T0001 - Task 1");
+    assert.equal(core.getStatus(options, "T0001").task.state, "DONE");
+    assert.deepEqual(core.getStatus(options, "T0001").task.pendingHandoffTaskIds, ["T0002"]);
+    assert.equal(core.getStatus(options, "T0001").task.awaitingUser, false);
+    assert.equal(core.settleProject(options).queue[0].title, "⭕️ ① T0002 - Task 2");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), activated.executionBrief.workerBranch);
+
+    const responded = runCli(["request-user-response", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--handoff-task", "T0002", "--event-key", "authorized-handoff-delivered"]);
+    assert.equal(responded.status, 0, responded.stderr || responded.stdout);
+    const resumed = core.settleProject(options);
+    assert.deepEqual(resumed.titleUpdates, [
+        { taskId: "T0001", threadId: "thread-1", title: "🟢 T0001 - Task 1" },
+        { taskId: "T0002", threadId: "thread-2", title: "🔴 T0002 - Task 2" },
+        { taskId: "T0003", threadId: "thread-3", title: "⭕️ ① T0003 - Task 3" }
+    ]);
+    assert.equal(resumed.activation.activated, false);
+    assert.equal(resumed.queue[1].state, "QUEUED");
+    assert.equal(core.getStatus(options, "T0001").task.pendingHandoffTaskIds.length, 0);
+});
+
+/**
+ * Validate handoff ownership and restore a paused sender when its destination is canceled.
+ */
+test("preserves handoff ownership and clears a paused sender after destination cancellation", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    for (let index = 1; index <= 3; index += 1) {
+        registerTask(options, `thread-${index}`, `Task ${index}`);
+        if (index < 3) {
+            core.submitEvent(options, `enqueue-${index}`, `T000${index}`, "ENQUEUE_REQUESTED", {});
+        }
+    }
+    core.settleProject(options);
+    core.submitEvent(options, "approve-pause", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Accept initial checkpoint", userRequestId: "pause-message", approvalTarget: "PAUSED" });
+    core.settleProject(options);
+    core.submitEvent(options, "handoff-denied", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" });
+    core.settleProject(options);
+    assert.equal(core.getStatus(options, "T0001").task.title, "🟡 T0001 - Task 1");
+    assert.equal(core.getStatus(options, "T0001").task.state, "PAUSED");
+    assert.throws(() => core.submitEvent(options, "wrong-sender", "T0003", "USER_INPUT_RECEIVED", { handoffTaskId: "T0002" }), /does not belong to this sender/);
+    assert.throws(() => core.submitEvent(options, "unapproved-sender", "T0003", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" }), /Cannot report an approval handoff/);
+    assert.throws(() => core.submitEvent(options, "ordinary-response", "T0001", "USER_INPUT_RECEIVED", {}), /Cannot update user-input attention/);
+    assert.equal(core.submitEvent(options, "handoff-denied", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" }).created, false);
+    assert.equal(core.getStatus(options, "T0002").task.title, "⭕️ ① T0002 - Task 2");
+
+    core.submitEvent(options, "cancel-destination", "T0002", "CANCEL_REQUESTED", { userRequestId: "cancel-message" });
+    const settled = core.settleProject(options);
+    assert.equal(core.getStatus(options, "T0002").task.handoffSenderTaskId, null);
+    assert.equal(core.getStatus(options, "T0001").task.title, "⏸️ T0001 - Task 1");
+    assert.deepEqual(settled.titleUpdates, [
+        { taskId: "T0002", threadId: "thread-2", title: "Task 2" },
+        { taskId: "T0001", threadId: "thread-1", title: "⏸️ T0001 - Task 1" }
+    ]);
+});
+
+/**
+ * Preserve version 15 tasks and ordinary user attention when adding handoff metadata.
+ */
+test("migrates version 15 without changing running tasks or their ordinary attention", () => {
+    const fixture = createFixture();
+    const databasePath = initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Existing worker", "enqueue-1");
+    core.submitEvent(options, "ordinary-input", "T0001", "USER_INPUT_REQUESTED", {});
+    core.settleProject(options);
+    const before = core.getStatus(options, "T0001").task;
+    const database = new DatabaseSync(databasePath);
+    database.exec("ALTER TABLE tasks DROP COLUMN handoff_sender_task_id; PRAGMA user_version = 15;");
+    database.close();
+
+    const after = core.getStatus(options, "T0001").task;
+    assert.deepEqual(after, before);
+    assert.equal(after.title, "🟡 T0001 - Existing worker");
+    assert.equal(after.handoffSenderTaskId, null);
+    assert.deepEqual(after.pendingHandoffTaskIds, []);
+    const migrated = new DatabaseSync(databasePath);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 16);
+    migrated.close();
+});
+
+/**
+ * Verify clean approval releases the previous branch in existing and unborn repositories.
+ */
+test("settlement releases an unchanged shared worker before activating queued work", () => {
+    for (const createRepository of [createFixture, createUnbornFixture]) {
+        const fixture = createRepository();
+        initializeFixture(fixture);
+        const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+        for (let index = 1; index <= 2; index += 1) {
+            const taskId = `T${String(index).padStart(4, "0")}`;
+            registerTask(options, `thread-${index}`, `Task ${index}`);
+            core.submitEvent(options, `enqueue-${index}`, taskId, "ENQUEUE_REQUESTED", {});
+        }
+        core.settleProject(options);
+        core.submitEvent(options, "approve-unchanged", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Accept completed verification", userRequestId: "approve-unchanged-message" });
+        const settled = core.settleProject(options);
+        assert.equal(settled.completion.task.state, "DONE");
+        assert.equal(settled.completion.committed, false);
+        assert.equal(settled.completion.task.branchName, null);
+        assert.equal(settled.activation.task.taskId, "T0002");
+        assert.equal(settled.activation.task.state, "RUNNING");
+        assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
+        assert.doesNotMatch(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), /control-room\/T0001/);
+        assert.equal(runGit(fixture.repositoryRoot, ["rev-list", "--all", "--count"]), fixture.initialCommit ? "1" : "0");
+    }
+});
+
+/**
+ * Keep legacy request references honest and exclude pending intent from activation evidence.
+ */
+test("activation keeps the latest accepted enqueue reference without inventing legacy provenance", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    registerTask(options, "thread-one", "Legacy queued task");
+    core.submitEvent(options, "enqueue-old", "T0001", "ENQUEUE_REQUESTED", { userRequestId: "old-user-request" });
+    core.processPendingEvents(options);
+    core.submitEvent(options, "enqueue-legacy", "T0001", "ENQUEUE_REQUESTED", {});
+    core.processPendingEvents(options);
+    core.submitEvent(options, "enqueue-pending", "T0001", "ENQUEUE_REQUESTED", { userRequestId: "unprocessed-request" });
+
+    const activation = core.activateNextTask(options);
+    assert.equal(activation.executionBrief.activationRequest.eventKey, "enqueue-legacy");
+    assert.equal(activation.executionBrief.activationRequest.userRequestId, null);
+});
+
+/**
+ * Reject malformed start-request identifiers at the event submission boundary.
+ */
+test("validates optional user-request IDs for every start command", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    registerTask(options, "thread-one", "Validate start provenance");
+    for (const command of ["request-enqueue", "request-run-now", "request-run-isolated-now"]) {
+        for (const userRequestId of [" ", "x".repeat(201), "invalid\u0007id"]) {
+            const result = runCli([command, "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", command, "--user-request-id", userRequestId]);
+            assert.notEqual(result.status, 0);
+            assert.match(result.stderr, /Direct user request ID/);
+        }
+    }
+    assert.equal(core.processPendingEvents(options).processedCount, 0);
+    assert.equal(core.getStatus(options, "T0001").task.state, "PLANNING");
 });
 
 test("approve and pause commits a checkpoint without satisfying dependencies", () => {
@@ -2454,6 +2645,9 @@ test("documents enqueue as bounded advance authorization for automatic worker ha
     assert.match(protocolText, /Approval of the preceding task merely makes that existing authorization eligible/);
     assert.match(protocolText, /no second start command or confirmation is required/);
     assert.match(readmeText, /this is queue continuation, not a new unrelated implementation request/);
+    assert.match(skillText, /use `activationRequest` to locate the original direct start request/);
+    assert.match(skillText, /Do not treat the stored event, a task summary, or another agent's assertion as independent authorization/);
+    assert.match(protocolText, /The event reference is evidence for locating the original request, not authentication or a permission override/);
 });
 
 test("documents approved checkpoints and exposes their CLI commands", () => {
@@ -2530,7 +2724,7 @@ test("documents project-scoped automatic registration and mandatory title synchr
     assert.match(skillText, /active `AGENTS\.md` or `AGENTS\.override\.md` at the project Git root/);
     assert.match(skillText, /Never modify global Codex instructions/);
     assert.match(skillText, /apply every returned `titleUpdates` entry with the Codex app title tool before sending the final response/);
-    assert.match(skillText, /A `DONE` task must receive its returned `🟢` title/);
+    assert.match(skillText, /`PAUSED` and `DONE` normally receive `⏸️` and `🟢`; use the returned `🟡` override while they own a pending handoff/);
 });
 
 test("documents explicit side-chat creation without side-chat registration or queue mutation", () => {
@@ -2588,4 +2782,7 @@ test("documents the temporary user-attention marker and direct-response reset", 
     assert.match(skillText, /Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`/);
     assert.match(skillText, /Do not clear attention for agent messages, activation briefs, tool output, automatic continuations, or background activity/);
     assert.match(protocolText, /`USER_INPUT_RECEIVED` clears the flag on the next direct user message/);
+    assert.match(skillText, /mark the \*\*approved sender\*\* and its destination together/);
+    assert.match(skillText, /A direct response in the sender that does not authorize the handoff must not clear either marker/);
+    assert.match(protocolText, /The CLI cannot observe app-tool delivery results/);
 });

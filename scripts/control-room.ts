@@ -112,14 +112,14 @@ Commands:
   exclude --project-root ROOT --thread-id ID --reason TEXT [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--adopt-excluded true] [--state-root PATH]
   request-planning --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
-  request-enqueue --project-root ROOT --task T0001 --event-key KEY [--after T0002] [--state-root PATH]
-  request-run-now --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
-  request-run-isolated-now --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
+  request-enqueue --project-root ROOT --task T0001 --event-key KEY [--user-request-id ID] [--after T0002] [--state-root PATH]
+  request-run-now --project-root ROOT --task T0001 --event-key KEY [--user-request-id ID] [--state-root PATH]
+  request-run-isolated-now --project-root ROOT --task T0001 --event-key KEY [--user-request-id ID] [--state-root PATH]
   request-move --project-root ROOT --task T0001 --event-key KEY (--position N | --before T0002 | --after T0002) [--state-root PATH]
   request-dependency-add --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
-  request-user-input --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
-  request-user-response --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
+  request-user-input --project-root ROOT --task T0001 --event-key KEY [--handoff-task T0002] [--state-root PATH]
+  request-user-response --project-root ROOT --task T0001 --event-key KEY [--handoff-task T0002] [--state-root PATH]
   record-mental-model --project-root ROOT --task T0001 --event-key KEY --current-state TEXT --desired-outcome TEXT --approach TEXT --affected-areas TEXT --invariants TEXT --non-goals TEXT --verification TEXT [--state-root PATH]
   record-decision --project-root ROOT --task T0001 --event-key KEY --decision TEXT --rationale TEXT --confidence (low|medium|high) --impact (low|medium|high) --evidence TEXT --status (active|unresolved) [--alternatives TEXT] [--uncertainty TEXT] [--supersedes D001] [--state-root PATH]
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
@@ -202,18 +202,19 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "PLANNING_REQUESTED", {});
     }
     if (parsed.command === "request-enqueue") {
-        validateOptions(values, ["project-root", "task", "event-key", "after", "state-root"]);
+        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "after", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "ENQUEUE_REQUESTED", {
-            afterTaskId: values.after
+            afterTaskId: values.after,
+            userRequestId: values["user-request-id"]
         });
     }
     if (parsed.command === "request-run-now") {
-        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
-        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "RUN_NOW_REQUESTED", {});
+        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "RUN_NOW_REQUESTED", { userRequestId: values["user-request-id"] });
     }
     if (parsed.command === "request-run-isolated-now") {
-        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
-        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "RUN_ISOLATED_NOW_REQUESTED", {});
+        validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "RUN_ISOLATED_NOW_REQUESTED", { userRequestId: values["user-request-id"] });
     }
     if (parsed.command === "request-move") {
         validateOptions(values, ["project-root", "task", "event-key", "position", "before", "after", "state-root"]);
@@ -240,12 +241,12 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         });
     }
     if (parsed.command === "request-user-input") {
-        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
-        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_REQUESTED", {});
+        validateOptions(values, ["project-root", "task", "event-key", "handoff-task", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_REQUESTED", { handoffTaskId: values["handoff-task"] });
     }
     if (parsed.command === "request-user-response") {
-        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
-        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_RECEIVED", {});
+        validateOptions(values, ["project-root", "task", "event-key", "handoff-task", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_RECEIVED", { handoffTaskId: values["handoff-task"] });
     }
     if (parsed.command === "record-mental-model") {
         validateOptions(values, ["project-root", "task", "event-key", "current-state", "desired-outcome", "approach", "affected-areas", "invariants", "non-goals", "verification", "state-root"]);

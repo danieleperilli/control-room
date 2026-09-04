@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 
-const CURRENT_SCHEMA_VERSION = 15;
+const CURRENT_SCHEMA_VERSION = 16;
 
 type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
 type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "RUN_ISOLATED_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "MENTAL_MODEL_RECORDED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
@@ -38,6 +38,7 @@ interface IEventPayload {
     evidence?: string;
     exclusionReason?: string;
     impact?: DecisionImpact;
+    handoffTaskId?: string;
     invariants?: string;
     nonGoals?: string;
     position?: number;
@@ -111,6 +112,8 @@ interface ITaskRow {
     state: TaskState;
     blocked_from_state: TaskState | null;
     awaiting_user: number;
+    handoff_sender_task_id?: string | null;
+    pending_handoff_task_ids?: string;
     queue_position: number | null;
     queued_display_position?: number | null;
     base_commit: string | null;
@@ -160,11 +163,13 @@ const TITLE_CHANGING_EVENT_ACTIONS = new Set(["RETURNED_TO_PLANNING", "ENQUEUED"
 const QUEUE_POSITION_DIGITS = ["⓪", "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
 const TASK_WITH_QUEUED_POSITION_SELECT = `
     SELECT task.*,
+        (SELECT json_group_array(destination.task_id) FROM tasks AS destination
+            WHERE destination.handoff_sender_task_id = task.task_id AND destination.state = 'RUNNING') AS pending_handoff_task_ids,
         CASE
-            WHEN task.state = 'QUEUED' AND task.queue_position IS NOT NULL THEN (
+            WHEN (task.state = 'QUEUED' OR (task.state = 'RUNNING' AND task.handoff_sender_task_id IS NOT NULL)) AND task.queue_position IS NOT NULL THEN (
                 SELECT COUNT(*)
                 FROM tasks AS queued_task
-                WHERE queued_task.state = 'QUEUED'
+                WHERE (queued_task.state = 'QUEUED' OR (queued_task.state = 'RUNNING' AND queued_task.handoff_sender_task_id IS NOT NULL))
                     AND (
                         queued_task.queue_position < task.queue_position
                         OR (
@@ -409,16 +414,22 @@ function validateQueuePosition(position: number | undefined): number {
  * @param payload Caller-supplied event payload.
  */
 function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPayload {
-    if (kind === "PLANNING_REQUESTED" || kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
+    if (kind === "PLANNING_REQUESTED") {
         return {};
+    }
+    if (kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
+        return { handoffTaskId: payload.handoffTaskId !== undefined ? validateTaskId(payload.handoffTaskId) : undefined };
     }
     if (kind === "ENQUEUE_REQUESTED") {
         return {
-            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined
+            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined,
+            userRequestId: payload.userRequestId !== undefined ? validateCompactText(payload.userRequestId, "Direct user request ID", 200, true) : undefined
         };
     }
     if (kind === "RUN_NOW_REQUESTED" || kind === "RUN_ISOLATED_NOW_REQUESTED") {
-        return {};
+        return {
+            userRequestId: payload.userRequestId !== undefined ? validateCompactText(payload.userRequestId, "Direct user request ID", 200, true) : undefined
+        };
     }
     if (kind === "MOVE_REQUESTED") {
         const selectorCount = Number(Boolean(payload.beforeTaskId)) + Number(Boolean(payload.afterTaskId)) + Number(payload.position !== undefined);
@@ -803,6 +814,9 @@ function initializeSchema(database: any): void {
                 DROP TABLE tasks_before_paused;
             `);
         }
+        if (!databaseHasColumn(database, "tasks", "handoff_sender_task_id")) {
+            database.exec("ALTER TABLE tasks ADD COLUMN handoff_sender_task_id TEXT REFERENCES tasks(task_id) CHECK (handoff_sender_task_id IS NULL OR handoff_sender_task_id <> task_id)");
+        }
         database.exec(`
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
@@ -915,11 +929,11 @@ function titleForTask(task: ITaskRow): string {
         return task.semantic_name;
     }
     let prefix = "";
-    if (task.awaiting_user && task.state === "RUNNING") {
+    if ((task.pending_handoff_task_ids && task.pending_handoff_task_ids !== "[]") || (task.awaiting_user && task.state === "RUNNING")) {
         prefix = "🟡 ";
     } else if (task.state === "PLANNING") {
         prefix = "⚪️ ";
-    } else if (task.state === "QUEUED") {
+    } else if (task.state === "QUEUED" || (task.state === "RUNNING" && task.handoff_sender_task_id)) {
         const positionMarker = queuePositionMarker(task.queued_display_position ?? task.queue_position);
         prefix = positionMarker ? `⭕️ ${positionMarker} ` : "⭕️ ";
     } else if (task.state === "RUNNING") {
@@ -958,6 +972,8 @@ function serializeTask(task: ITaskRow): Record<string, unknown> {
         state: task.state,
         blockedFromState: task.blocked_from_state,
         awaitingUser: Boolean(task.awaiting_user),
+        handoffSenderTaskId: task.handoff_sender_task_id || null,
+        pendingHandoffTaskIds: JSON.parse(task.pending_handoff_task_ids || "[]"),
         title: titleForTask(task),
         queuePosition: task.queue_position,
         queuedPosition: task.queued_display_position ?? null,
@@ -1301,9 +1317,21 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             assertCondition(validPayload.dependencyTaskId !== task.task_id, "A task cannot depend on itself.");
             requireTask(store, String(validPayload.dependencyTaskId));
         } else if (kind === "USER_INPUT_REQUESTED") {
-            assertCondition(task.state === "RUNNING", `Cannot request user input for ${task.task_id} from ${task.state}.`);
+            if (validPayload.handoffTaskId) {
+                assertCondition(task.state === "DONE" || task.state === "PAUSED", `Cannot report an approval handoff for ${task.task_id} from ${task.state}.`);
+                const destination = requireTask(store, validPayload.handoffTaskId);
+                assertCondition(destination.task_id !== task.task_id && destination.state === "RUNNING", "Handoff destination must be a different RUNNING task.");
+                assertCondition(!destination.handoff_sender_task_id || destination.handoff_sender_task_id === task.task_id, "Handoff destination already belongs to a different sender.");
+            } else {
+                assertCondition(task.state === "RUNNING", `Cannot request user input for ${task.task_id} from ${task.state}.`);
+            }
         } else if (kind === "USER_INPUT_RECEIVED") {
-            assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot update user-input attention for ${task.task_id} from ${task.state}.`);
+            if (validPayload.handoffTaskId) {
+                const destination = requireTask(store, validPayload.handoffTaskId);
+                assertCondition(destination.task_id !== task.task_id && (!destination.handoff_sender_task_id || destination.handoff_sender_task_id === task.task_id), "Handoff destination does not belong to this sender.");
+            } else {
+                assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot update user-input attention for ${task.task_id} from ${task.state}.`);
+            }
         } else if (kind === "MENTAL_MODEL_RECORDED" || kind === "DECISION_RECORDED") {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record review context for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
@@ -1346,18 +1374,18 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
  * @param orderedTaskIds Active task IDs in desired order.
  */
 function writeQueueOrder(store: IStore, orderedTaskIds: string[]): ITitleUpdate[] {
-    const readCurrentPosition = store.database.prepare("SELECT state, queue_position FROM tasks WHERE task_id = ?");
+    const readCurrentPosition = store.database.prepare("SELECT state, queue_position, handoff_sender_task_id FROM tasks WHERE task_id = ?");
     const updatePosition = store.database.prepare("UPDATE tasks SET queue_position = ?, updated_at = ? WHERE task_id = ?");
     const timestamp = currentTimestamp();
     const changedQueuedTaskIds: string[] = [];
     for (let index = 0; index < orderedTaskIds.length; index += 1) {
         const taskId = orderedTaskIds[index];
         const nextPosition = index + 1;
-        const current = readCurrentPosition.get(taskId) as { queue_position: number | null; state: TaskState } | undefined;
+        const current = readCurrentPosition.get(taskId) as { queue_position: number | null; state: TaskState; handoff_sender_task_id: string | null } | undefined;
         assertCondition(current, `Cannot order unknown task: ${taskId}`);
         if (current.queue_position !== nextPosition) {
             updatePosition.run(nextPosition, timestamp, taskId);
-            if (current.state === "QUEUED") {
+            if (current.state === "QUEUED" || (current.state === "RUNNING" && current.handoff_sender_task_id)) {
                 changedQueuedTaskIds.push(taskId);
             }
         }
@@ -1382,7 +1410,7 @@ function writeQueueOrder(store: IStore, orderedTaskIds: string[]): ITitleUpdate[
 function readQueuedTitleUpdates(store: IStore, minimumQueuePosition: number): ITitleUpdate[] {
     const queuedTasks = store.database.prepare(`
         ${TASK_WITH_QUEUED_POSITION_SELECT}
-        WHERE task.state = 'QUEUED' AND task.queue_position >= ?
+        WHERE (task.state = 'QUEUED' OR (task.state = 'RUNNING' AND task.handoff_sender_task_id IS NOT NULL)) AND task.queue_position >= ?
         ORDER BY task.queue_position, task.task_number
     `).all(minimumQueuePosition) as ITaskRow[];
     const titleUpdates: ITitleUpdate[] = [];
@@ -1814,6 +1842,27 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     if (event.kind === "DEPENDENCY_REMOVE_REQUESTED") {
         return applyDependencyEvent(store, task, payload, false);
     }
+    if ((event.kind === "USER_INPUT_REQUESTED" || event.kind === "USER_INPUT_RECEIVED") && payload.handoffTaskId) {
+        const destination = requireTask(store, payload.handoffTaskId);
+        const waiting = event.kind === "USER_INPUT_REQUESTED";
+        assertCondition(destination.task_id !== task.task_id, "Handoff destination must differ from its sender.");
+        assertCondition(!destination.handoff_sender_task_id || destination.handoff_sender_task_id === task.task_id, "Handoff destination does not belong to this sender.");
+        if (waiting) {
+            assertCondition(task.state === "DONE" || task.state === "PAUSED", `Cannot report an approval handoff for ${task.task_id} from ${task.state}.`);
+            assertCondition(destination.state === "RUNNING", "Handoff destination must be RUNNING.");
+        }
+        store.database.prepare("UPDATE tasks SET handoff_sender_task_id = ?, awaiting_user = CASE WHEN ? THEN 0 ELSE awaiting_user END, updated_at = ? WHERE task_id = ?").run(waiting ? task.task_id : null, Number(waiting), currentTimestamp(), destination.task_id);
+        const refreshedDestination = requireTask(store, destination.task_id);
+        return {
+            action: event.kind,
+            task: serializeTask(requireTask(store, task.task_id)),
+            handoffTaskId: destination.task_id,
+            titleUpdates: [
+                { taskId: destination.task_id, threadId: destination.thread_id, title: titleForTask(refreshedDestination) },
+                ...readQueuedTitleUpdates(store, destination.queue_position || 1)
+            ]
+        };
+    }
     if (event.kind === "USER_INPUT_REQUESTED") {
         assertCondition(task.state === "RUNNING", `Cannot request user input for ${task.task_id} from ${task.state}.`);
         if (task.awaiting_user) {
@@ -1943,7 +1992,19 @@ function processPendingEvents(options: IControlRoomOptions): Record<string, unkn
                     commitTransaction(store.database);
                     continue;
                 }
+                const previousTask = requireTask(store, event.task_id);
                 const result = applyPendingEvent(store, event);
+                const updatedTask = requireTask(store, event.task_id);
+                if (previousTask.handoff_sender_task_id && updatedTask.state !== "RUNNING") {
+                    store.database.prepare("UPDATE tasks SET handoff_sender_task_id = NULL WHERE task_id = ?").run(updatedTask.task_id);
+                    const sender = requireTask(store, previousTask.handoff_sender_task_id);
+                    result.task = serializeTask(requireTask(store, updatedTask.task_id));
+                    result.titleUpdates = [
+                        ...(Array.isArray(result.titleUpdates) ? result.titleUpdates : []),
+                        { taskId: sender.task_id, threadId: sender.thread_id, title: titleForTask(sender) },
+                        ...readQueuedTitleUpdates(store, previousTask.queue_position || 1)
+                    ];
+                }
                 store.database.prepare("UPDATE events SET processed_at = ?, result_json = ? WHERE sequence = ?").run(currentTimestamp(), JSON.stringify(result), event.sequence);
                 commitTransaction(store.database);
                 results.push({ eventKey: event.event_key, ...result });
@@ -1981,6 +2042,35 @@ function dependenciesAreDone(store: IStore, taskId: string): boolean {
         WHERE dependency.task_id = ? AND prerequisite.state <> 'DONE'
     `).get(taskId) as { count: number };
     return Number(unmet.count) === 0;
+}
+
+/**
+ * Retrieve the accepted start request for an activation without inventing user provenance.
+ * @param store Open project store.
+ * @param taskId Task being activated.
+ */
+function readActivationRequest(store: IStore, taskId: string): Record<string, unknown> | null {
+    const event = store.database.prepare(`
+        SELECT event_key, kind, payload_json, created_at
+        FROM events
+        WHERE task_id = ? AND processed_at IS NOT NULL
+            AND kind IN ('ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'RUN_ISOLATED_NOW_REQUESTED')
+            AND json_extract(result_json, '$.action') IN (
+                'ENQUEUED', 'REENQUEUED', 'RUN_NOW_ENQUEUED', 'RUN_NOW_PRIORITIZED', 'RUN_ISOLATED_REQUESTED'
+            )
+        ORDER BY sequence DESC
+        LIMIT 1
+    `).get(taskId) as { event_key: string; kind: EventKind; payload_json: string; created_at: string } | undefined;
+    if (!event) {
+        return null;
+    }
+    const payload = JSON.parse(event.payload_json) as IEventPayload;
+    return {
+        eventKey: event.event_key,
+        eventKind: event.kind,
+        userRequestId: payload.userRequestId || null,
+        requestedAt: event.created_at
+    };
 }
 
 /**
@@ -2081,6 +2171,7 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): Rec
         `).run(baseCommit, workerBranch, worktreePath, currentTimestamp(), task.task_id);
         const runningTask = requireTask(store, task.task_id);
         const reviewPacket = readReviewPacketFromStore(store, task.task_id);
+        const activationRequest = readActivationRequest(store, task.task_id);
         const mentalModelRequired = reviewPacket.baseline === null;
         const titleUpdates = readQueuedTitleUpdates(store, task.queue_position || 1);
         const instruction = mentalModelRequired ?
@@ -2100,6 +2191,7 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): Rec
                 semanticName: runningTask.semantic_name,
                 projectRoot: store.projectRoot,
                 workspacePath: worktreePath,
+                activationRequest,
                 baseCommit,
                 baseBranch: project.base_branch,
                 workerBranch,
@@ -2208,6 +2300,7 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             WHERE task_id = ?
         `).run(currentBaseCommit, workerBranch, currentTimestamp(), selectedTask.task_id);
         const runningTask = requireTask(store, selectedTask.task_id);
+        const activationRequest = readActivationRequest(store, selectedTask.task_id);
         const titleUpdates = readQueuedTitleUpdates(store, selectedTask.queue_position || 1);
         const controlRoomTitle = titleForControlRoom();
         const instruction =
@@ -2225,6 +2318,7 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
                 semanticName: runningTask.semantic_name,
                 projectRoot: store.projectRoot,
                 workspacePath: store.projectRoot,
+                activationRequest,
                 baseCommit: runningTask.base_commit,
                 baseBranch: project.base_branch,
                 workerBranch: runningTask.branch_name,
@@ -2527,30 +2621,30 @@ function removeIsolatedWorkspace(store: IStore, task: ITaskRow, workerCommit: st
 }
 
 /**
- * Release the shared worker branch before a task enters PAUSED.
+ * Release an unchanged shared worker branch after approval.
  * @param store Open project store.
  * @param project Initialized project record.
- * @param task Approved shared task being paused.
+ * @param task Approved shared task releasing its workspace.
  */
-function releasePausedSharedWorkspace(store: IStore, project: IProjectRow, task: ITaskRow): boolean {
+function releaseSharedWorkerBranch(store: IStore, project: IProjectRow, task: ITaskRow): boolean {
     if (task.workspace_mode !== "shared" || !task.branch_name || task.branch_name === project.base_branch) {
         return false;
     }
-    const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch before pausing");
-    assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Cannot pause ${task.task_id} while the primary checkout is on unrelated branch ${currentBranch || "detached HEAD"}.`);
+    const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch before releasing workspace");
+    assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Cannot release ${task.task_id} while the primary checkout is on unrelated branch ${currentBranch || "detached HEAD"}.`);
     const workerCommit = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
     if (!workerCommit) {
-        assertCondition(task.base_commit === null && currentBranch === task.branch_name, `Worker branch ${task.branch_name} disappeared before ${task.task_id} was paused.`);
-        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} while pausing ${task.task_id}.`);
+        assertCondition(task.base_commit === null && currentBranch === task.branch_name, `Worker branch ${task.branch_name} disappeared before ${task.task_id} released its workspace.`);
+        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} for ${task.task_id}.`);
         requireGit(store.projectRoot, ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], `Restore unborn base branch ${project.base_branch}`);
         return true;
     }
     assertCondition(workerCommit === task.base_commit, `Worker branch ${task.branch_name} contains commits that were not integrated for ${task.task_id}.`);
     if (currentBranch === task.branch_name) {
-        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} while pausing ${task.task_id}.`);
+        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} for ${task.task_id}.`);
         requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
     }
-    requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete paused worker branch ${task.branch_name}`);
+    requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete released worker branch ${task.branch_name}`);
     return true;
 }
 
@@ -2798,10 +2892,10 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
             if (task.workspace_mode === "isolated") {
                 assertCondition(currentHead, `${task.task_id} has no worktree commit.`);
                 removeIsolatedWorkspace(store, task, currentHead);
-            } else if (task.approval_target === "PAUSED") {
-                releasePausedSharedWorkspace(store, project, task);
+            } else if (task.approval_target === "PAUSED" || !commitsOnBase) {
+                releaseSharedWorkerBranch(store, project, task);
             }
-            const releaseWorkspace = task.workspace_mode === "isolated" || task.approval_target === "PAUSED";
+            const releaseWorkspace = task.workspace_mode === "isolated" || task.approval_target === "PAUSED" || !commitsOnBase;
             store.database.prepare("UPDATE tasks SET state = ?, branch_name = CASE WHEN ? THEN NULL ELSE branch_name END, worktree_path = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(task.approval_target, Number(releaseWorkspace), currentTimestamp(), task.task_id);
             const titleUpdates = compactActiveQueue(store);
             const completedTask = requireTask(store, task.task_id);
@@ -2840,7 +2934,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): Recor
         store.database.prepare("UPDATE tasks SET approved_commit = ?, updated_at = ? WHERE task_id = ?").run(committedCommit, currentTimestamp(), task.task_id);
         commitTransaction(store.database);
         if (commitsOnBase) {
-            const branchDeleted = task.approval_target === "PAUSED" ? releasePausedSharedWorkspace(store, project, task) : false;
+            const branchDeleted = task.approval_target === "PAUSED" ? releaseSharedWorkerBranch(store, project, task) : false;
             return finalizeApprovedCommit(store, task.task_id, committedCommit, false, branchDeleted);
         }
         assertCondition(task.branch_name, `${task.task_id} has no worker branch.`);
@@ -2971,7 +3065,7 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
             }
             let workerBranchWasDeleted = Boolean(task.branch_name && !workerCommit);
             if (task.approval_target === "PAUSED" && task.branch_name && workerCommit) {
-                workerBranchWasDeleted = releasePausedSharedWorkspace(store, project, task);
+                workerBranchWasDeleted = releaseSharedWorkerBranch(store, project, task);
             }
             const result = finalizeApprovedCommit(store, task.task_id, currentBaseCommit, workerBranchWasDeleted, workerBranchWasDeleted);
             return { ...result, recovered: true, finalized: true };

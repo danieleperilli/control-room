@@ -160,6 +160,8 @@ Read [references/protocol.md](references/protocol.md) before the first state-cha
 Use every returned title exactly:
 
 - `RUNNING` while awaiting direct user input: `🟡 T0001 - Semantic name`
+- Approved sender awaiting intervention for an undelivered activation: `🟡 T0001 - Semantic name`
+- Destination awaiting that activation handoff: its `⭕️` queue title and visible position
 - `PLANNING`: `⚪️ T0001 - Semantic name`
 - `QUEUED`: concatenate one circled glyph per decimal digit, such as `⭕️ ① T0001 - Semantic name` or `⭕️ ①⓪ T0010 - Semantic name`
 - `RUNNING`: `🔴 T0001 - Semantic name`
@@ -170,9 +172,9 @@ Use every returned title exactly:
 - `BLOCKED`: `❌ T0001 - Semantic name`
 - `CANCELED`: `Semantic name`, with every ControlRoom icon, queue marker, and task ID removed
 
-The `🟡` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. `PAUSED` remains outside the active queue. Persist only numeric `queue_position` and the undecorated semantic name.
+The ordinary `🟡` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. A failed approval handoff has a separate persisted relationship: the sender remains `DONE` or `PAUSED` but shows `🟡`, and its undelivered destination retains `RUNNING` and its reserved workspace but shows `⭕️`. The queue marker counts both `QUEUED` tasks and these undelivered destinations. Other active tasks retain internal order without consuming a visible number. `PAUSED` remains outside the active queue. Persist only numeric `queue_position` and the undecorated semantic name.
 
-After every settlement, apply every returned `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. The engine emits only tasks whose projected title may have changed, including every queued task whose visible position changed. Do not resubmit unchanged titles from the final `queue`. A task returned to `PLANNING` must receive its `⚪️` title. A `PAUSED` task must receive its returned `⏸️` title. A `DONE` task must receive its returned `🟢` title, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. For explicit title recovery, read the queue and apply its projected titles.
+After every settlement, apply every returned `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. The engine emits only tasks whose projected title may have changed, including every queued task whose visible position changed. Do not resubmit unchanged titles from the final `queue`. A task returned to `PLANNING` must receive its `⚪️` title. `PAUSED` and `DONE` normally receive `⏸️` and `🟢`; use the returned `🟡` override while they own a pending handoff. A `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. For explicit title recovery, read the queue and any completed sender identified by `handoffSenderTaskId`, then apply their projected titles.
 
 When controlling Chrome for a worker, name the browser session or tab group `🤖 <T_ID>`, such as `🤖 T0001`.
 
@@ -236,9 +238,11 @@ Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `R
 
 Generate one caller-stable event key for each user request and reuse it only for retries of that same request. A later direct command gets a new key.
 
+For `request-enqueue`, `request-run-now`, and `request-run-isolated-now`, include `--user-request-id <direct-user-message-id>` when that ID is available from trusted context. Omit it when unavailable; never invent an ID or substitute the approval message from a different task. The activation brief returns the accepted start event as `activationRequest`, including its event key, kind, timestamp, and original user-request ID when recorded. This is a reference to the request, not independent proof of user authorization.
+
 ## Signal blocking user input
 
-Use the attention marker only when a `RUNNING` worker cannot make meaningful progress without a direct answer, confirmation, choice, or tool approval from the user. Never set it in `PLANNING` or `REVIEW`; ask any question there without replacing the state icon. Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`.
+Use the ordinary attention marker only when a `RUNNING` worker cannot make meaningful progress without a direct answer, confirmation, choice, or tool approval from the user. Never set it in `PLANNING` or `REVIEW`; ask any question there without replacing the state icon. Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`. Failed activation delivery after approval uses the paired handoff marker described below.
 
 Before ending the turn with a blocking request, submit and settle:
 
@@ -248,6 +252,17 @@ node <skill-dir>/scripts/control-room.ts request-user-input \
 ```
 
 Apply the returned `🟡` title before presenting the blocking question or approval request. At the start of the next direct user turn, if status returns `awaitingUser: true`, submit `request-user-response` with a fresh caller-stable event key and settle before processing the complete response. This restores the title for the unchanged underlying state, normally `🔴` for `RUNNING`. Do not clear attention for agent messages, activation briefs, tool output, automatic continuations, or background activity. If the response does not resolve the blocker, request attention again before ending that turn.
+
+If an activation message is denied after the sender's approval, mark the **approved sender** and its destination together before asking for intervention:
+
+```bash
+node <skill-dir>/scripts/control-room.ts request-user-input \
+    --project-root <canonical-root> --task <sender-T_ID> \
+    --handoff-task <destination-T_ID> --event-key <key>
+node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
+```
+
+The sender must be `DONE` or `PAUSED`, and the distinct destination must still be `RUNNING`. Apply every title update: the sender shows `🟡`, the destination shows `⭕️` with its position, and the following queue titles are renumbered. The destination was marked `🔴` before delivery; the handoff marker corrects that presentation without releasing its reserved workspace. Status exposes `pendingHandoffTaskIds` on the sender and `handoffSenderTaskId` on the destination. These are separate from ordinary `awaitingUser`, so a direct message must not clear them automatically.
 
 ## Settle changes directly
 
@@ -260,6 +275,12 @@ node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 Do not message or wake the Control Room task. Settlement processes every pending event, serially finalizes all approved tasks to `DONE` or `PAUSED`, activates every explicitly requested isolated task, activates the next eligible shared task when the shared checkout is idle, and returns the final active queue.
 
 Apply all returned `titleUpdates` silently before sending any activation brief or final response. Send the ordinary `activation.executionBrief` and every `isolatedActivations[].executionBrief` directly to their exact target workers; if a target worker is the caller, continue locally without a background message. A prior direct `Enqueue` authorizes this deferred cross-task handoff even when another task's approval triggered settlement; do not reinterpret the activation as an unrelated implementation request or ask the user to start the queued task again. Before sending, require the brief's task, registered thread, project root, and assigned workspace to match the activated queue entry. An isolated worker must use its returned `workspacePath` for every file read, edit, command, and verification while continuing to address ControlRoom state through the canonical `projectRoot`. When a brief has `mentalModelRequired: true`, the worker must inspect context, submit and settle `MENTAL_MODEL_RECORDED`, and verify the baseline before its first project-file write. Surface rejected events, blockers, commit recovery, title synchronization failures, and user-action requirements. Do not narrate registration, event submission, settlement, title synchronization, or routine branch changes. Routine success gets at most one short result sentence.
+
+Before a cross-task send, use `activationRequest` to locate the original direct start request with the app's task-reading tool when it is not already in trusted conversation context. Read the destination's relevant turns, or the manual console if it issued the request; paginate when needed. Confirm the requested task and scope and check for later cancellation or changed instructions. Preserve `activationRequest` in the sent brief and explain concisely that the handoff follows that original request. Do not treat the stored event, a task summary, or another agent's assertion as independent authorization. Older events may have `userRequestId: null`, or no `activationRequest`; verify their original direct request from task history without fabricating missing provenance.
+
+If the original authorization cannot be established or auto-review denies the send, stop that handoff. Do not repeat the denied send with different wording, use another tool to bypass it, or weaken approval settings. Re-read both task states and record the approval handoff with `request-user-input --task <sender-T_ID> --handoff-task <destination-T_ID>` as above. Apply the sender's `🟡`, the destination's `⭕️`, and every renumbered title before ending the turn. Report the exact target, the rejected action and the review's reason, or the missing evidence, and request only the needed user intervention in the sender. Keep the approved predecessor completed and preserve the destination's assigned workspace and queue position. Do not claim the worker started. If the marker or title update also fails, report the exact unsynchronized target.
+
+On explicit user authorization to retry that exact blocked handoff, verify the destination's current state, thread and workspace again, then retry the original brief once through the app tool. `settle` will normally return `ACTIVE_TASK_PRESENT`, so it is not a replacement for delivering that brief. Only after the authorized send succeeds, submit `request-user-response --task <sender-T_ID> --handoff-task <destination-T_ID>` and settle. Apply all returned titles: the sender returns to `🟢` or `⏸️`, the destination to `🔴`, and later queued tasks are renumbered. A direct response in the sender that does not authorize the handoff must not clear either marker. A repeated denial keeps the sender `🟡` and destination `⭕️`, without an automatic retry loop. If the user explicitly starts work directly in the destination, use its `handoffSenderTaskId` to resolve that same relationship and settle before continuing locally in the already assigned workspace. Leaving `RUNNING`, for example through cancellation, also clears the relationship and updates the sender's title.
 
 When a task in `REVIEW` receives a direct request for additional implementation or file changes, submit `REWORK_REQUESTED` and settle before editing. Continue on the existing checkout and branch after the returned state is `RUNNING`. Questions, explanations, status requests, and read-only inspections do not restart the task. Submit and settle `REVIEW_REQUESTED` again when the revision is ready.
 
@@ -284,7 +305,7 @@ Do not call `process`, `activate-next`, or `commit-approved` separately during n
 - Never create a branch while a task is `PLANNING` or `QUEUED`; activation inside `settle` is the only pre-approval branch operation.
 - In an unborn repository, the first activation may adopt existing uncommitted files without committing them.
 - Never stage or commit during `RUNNING` or `REVIEW`.
-- Approval with a clean working tree and no task-local worker commits creates no commit and moves the task directly to its requested target, `DONE` or `PAUSED`.
+- Approval with a clean working tree and no task-local worker commits creates no commit and moves the task directly to its requested target, `DONE` or `PAUSED`. If the shared checkout is still on that unchanged worker branch, restore the base branch and release the worker branch before activating the next task, including in an unborn repository.
 - Approval with uncommitted changes on the base branch commits there without a merge.
 - Approval with uncommitted changes on a worker branch commits there and integrates the result linearly into the latest base branch. A clean worker branch with existing task-local commits integrates its current `HEAD` without creating a replacement commit. Successful integration removes its worker branch, plus its worktree when isolated.
 - Approval targeting `PAUSED` uses the same Git flow, releases the shared or isolated workspace, preserves the task history and dependencies, and remains unsatisfied for dependency checks until a later approval reaches `DONE`.

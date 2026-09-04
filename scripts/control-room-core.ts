@@ -916,7 +916,7 @@ function titleForTask(task: ITaskRow): string {
     }
     let prefix = "";
     if (task.awaiting_user && task.state === "RUNNING") {
-        prefix = "👉 ";
+        prefix = "🟡 ";
     } else if (task.state === "PLANNING") {
         prefix = "⚪️ ";
     } else if (task.state === "QUEUED") {

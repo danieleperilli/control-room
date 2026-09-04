@@ -263,7 +263,7 @@ ControlRoom keeps task titles synchronized with their state:
 | Queued | `⭕️ ① T0001 - Add audit log` |
 | Queued, multi-digit position | `⭕️ ①⓪ T0010 - Add audit log` |
 | Running | `🔴 T0001 - Add audit log` |
-| Running, awaiting your response | `👉 T0001 - Add audit log` |
+| Running, awaiting your response | `🟡 T0001 - Add audit log` |
 | Review | `💪 T0001 - Add audit log` |
 | Approved | `🟢 T0001 - Add audit log` |
 | Paused | `⏸️ T0001 - Add audit log` |
@@ -271,7 +271,7 @@ ControlRoom keeps task titles synchronized with their state:
 | Blocked | `❌ T0001 - Add audit log` |
 | Canceled | `Add audit log` |
 
-When a running task cannot continue without your direct answer, confirmation, choice, or approval, it temporarily switches from `🔴` to `👉`. The underlying state, queue order, branch, and files do not change. Your next direct message restores `🔴` before the task continues; if it still needs an answer, it shows `👉` again. Planning and review tasks always retain their normal state icons, even when Codex asks a question. Ordinary review approval and optional questions do not use this marker.
+When a running task cannot continue without your direct answer, confirmation, choice, or approval, it temporarily switches from `🔴` to `🟡`. The underlying state, queue order, branch, and files do not change. Your next direct message restores `🔴` before the task continues; if it still needs an answer, it shows `🟡` again. Planning and review tasks always retain their normal state icons, even when Codex asks a question. Ordinary review approval and optional questions do not use this marker.
 
 Blocked tasks retain the `❌` status icon and task ID. A queued task or one blocked from the waiting queue can return explicitly to planning; the blocked task can also be enqueued again. Canceled and registered-excluded tasks leave the active queue and return to their undecorated semantic title.
 
@@ -283,7 +283,7 @@ The queue marker is derived from SQLite's active order, but it counts only tasks
 2. Refine the plan without editing code.
 3. Say `Enqueue`; use `Move` to reprioritize it and `Depends on T0005` only when it truly depends on another task.
 4. The worker invokes settlement, which activates the first eligible task after its dependencies are done.
-5. If its mental model is missing, the activated worker creates and records it from the task context before modifying files. Codex then implements and verifies the change while recording material decisions. If it needs a blocking confirmation, its title switches from `🔴` to `👉` until you respond.
+5. If its mental model is missing, the activated worker creates and records it from the task context before modifying files. Codex then implements and verifies the change while recording material decisions. If it needs a blocking confirmation, its title switches from `🔴` to `🟡` until you respond.
 6. The task moves to review and shows a compact outcome, verification, relevant model changes, and unresolved or low-confidence decisions. ControlRoom asks once whether you also want one independent review; it never starts one automatically.
 7. Review the result, optionally request the independent pass, and say `Approve` when finished or `Approve and pause` for an intermediate checkpoint. Further implementation requests return it to running, then back to review when the changes are ready.
 8. Settlement finalizes the approval: it either performs no commit for an unchanged task, accepts existing worker commits, commits uncommitted changes directly on the base branch, or commits and integrates the worker branch.

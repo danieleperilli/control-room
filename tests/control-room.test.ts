@@ -682,7 +682,7 @@ test("uses the pointing hand only while a running task awaits user input", () =>
         awaiting_user: 1
     };
     assert.equal(core.titleForTask({ ...baseTask, state: "PLANNING" }), "⚪️ T0001 - Confirm implementation");
-    assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "👉 T0001 - Confirm implementation");
+    assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🟡 T0001 - Confirm implementation");
     assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "💪 T0001 - Confirm implementation");
     assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Confirm implementation");
 });
@@ -714,10 +714,10 @@ test("marks a running task for user attention and restores red after the respons
     assert.equal(waiting.processed.results[0].action, "USER_INPUT_REQUESTED");
     assert.equal(waiting.queue[0].state, "RUNNING");
     assert.equal(waiting.queue[0].awaitingUser, true);
-    assert.equal(waiting.queue[0].title, "👉 T0001 - Confirm implementation");
+    assert.equal(waiting.queue[0].title, "🟡 T0001 - Confirm implementation");
     assert.equal(waiting.queue[0].queuePosition, initialTask.queuePosition);
     assert.equal(waiting.queue[0].branchName, initialTask.branchName);
-    assert.deepEqual(waiting.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "👉 T0001 - Confirm implementation" }]);
+    assert.deepEqual(waiting.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "🟡 T0001 - Confirm implementation" }]);
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
 
     const responded = runCli(["request-user-response", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", "user-response-1"]);
@@ -2582,7 +2582,7 @@ test("documents persistent task exclusions and the brand-forge default", () => {
 test("documents the temporary user-attention marker and direct-response reset", () => {
     const skillText = fs.readFileSync(path.join(__dirname, "..", "SKILL.md"), "utf8");
     const protocolText = fs.readFileSync(path.join(__dirname, "..", "references", "protocol.md"), "utf8");
-    assert.match(skillText, /`RUNNING` while awaiting direct user input: `👉 T0001 - Semantic name`/);
+    assert.match(skillText, /`RUNNING` while awaiting direct user input: `🟡 T0001 - Semantic name`/);
     assert.match(skillText, /does not change the underlying task state, queue order, branch, or Git behavior/);
     assert.match(skillText, /Never set it in `PLANNING` or `REVIEW`/);
     assert.match(skillText, /Do not use it for optional questions, routine progress updates, or the ordinary approval expected after entering `REVIEW`/);

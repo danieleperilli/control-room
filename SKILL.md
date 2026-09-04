@@ -159,7 +159,7 @@ Read [references/protocol.md](references/protocol.md) before the first state-cha
 
 Use every returned title exactly:
 
-- `RUNNING` while awaiting direct user input: `👉 T0001 - Semantic name`
+- `RUNNING` while awaiting direct user input: `🟡 T0001 - Semantic name`
 - `PLANNING`: `⚪️ T0001 - Semantic name`
 - `QUEUED`: concatenate one circled glyph per decimal digit, such as `⭕️ ① T0001 - Semantic name` or `⭕️ ①⓪ T0010 - Semantic name`
 - `RUNNING`: `🔴 T0001 - Semantic name`
@@ -170,7 +170,7 @@ Use every returned title exactly:
 - `BLOCKED`: `❌ T0001 - Semantic name`
 - `CANCELED`: `Semantic name`, with every ControlRoom icon, queue marker, and task ID removed
 
-The `👉` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. `PAUSED` remains outside the active queue. Persist only numeric `queue_position` and the undecorated semantic name.
+The `🟡` marker is a temporary presentation override backed by `awaiting_user` and is valid only while the underlying state is `RUNNING`; it does not change the underlying task state, queue order, branch, or Git behavior. The queue marker is derived presentation only and counts tasks currently in `QUEUED`. `RUNNING`, `REVIEW`, `APPROVED`, and `BLOCKED` retain internal order without consuming a visible number. `PAUSED` remains outside the active queue. Persist only numeric `queue_position` and the undecorated semantic name.
 
 After every settlement, apply every returned `titleUpdates` entry with the Codex app title tool before sending the final response; do not rely on a worker to rename itself. The engine emits only tasks whose projected title may have changed, including every queued task whose visible position changed. Do not resubmit unchanged titles from the final `queue`. A task returned to `PLANNING` must receive its `⚪️` title. A `PAUSED` task must receive its returned `⏸️` title. A `DONE` task must receive its returned `🟢` title, while a `CANCELED` task must be reset to its semantic name only. Retry one failed title update once, then report the exact unsynchronized task instead of claiming success. For explicit title recovery, read the queue and apply its projected titles.
 
@@ -247,7 +247,7 @@ node <skill-dir>/scripts/control-room.ts request-user-input \
     --project-root <canonical-root> --task <T_ID> --event-key <key>
 ```
 
-Apply the returned `👉` title before presenting the blocking question or approval request. At the start of the next direct user turn, if status returns `awaitingUser: true`, submit `request-user-response` with a fresh caller-stable event key and settle before processing the complete response. This restores the title for the unchanged underlying state, normally `🔴` for `RUNNING`. Do not clear attention for agent messages, activation briefs, tool output, automatic continuations, or background activity. If the response does not resolve the blocker, request attention again before ending that turn.
+Apply the returned `🟡` title before presenting the blocking question or approval request. At the start of the next direct user turn, if status returns `awaitingUser: true`, submit `request-user-response` with a fresh caller-stable event key and settle before processing the complete response. This restores the title for the unchanged underlying state, normally `🔴` for `RUNNING`. Do not clear attention for agent messages, activation briefs, tool output, automatic continuations, or background activity. If the response does not resolve the blocker, request attention again before ending that turn.
 
 ## Settle changes directly
 

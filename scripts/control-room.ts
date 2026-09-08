@@ -10,6 +10,7 @@ const USER_COMMANDS = [
     "$control-room join",
     "$control-room exclude",
     "$control-room queue",
+    "$control-room doctor",
     "$control-room help",
     "Return to planning | Return T0002 to planning",
     "Enqueue [after T0002]",
@@ -120,7 +121,6 @@ Commands:
   request-dependency-remove --project-root ROOT --task T0001 --event-key KEY --depends-on T0002 [--state-root PATH]
   request-user-input --project-root ROOT --task T0001 --event-key KEY [--handoff-task T0002] [--state-root PATH]
   request-user-response --project-root ROOT --task T0001 --event-key KEY [--handoff-task T0002] [--state-root PATH]
-  record-mental-model --project-root ROOT --task T0001 --event-key KEY --current-state TEXT --desired-outcome TEXT --approach TEXT --affected-areas TEXT --invariants TEXT --non-goals TEXT --verification TEXT [--state-root PATH]
   record-decision --project-root ROOT --task T0001 --event-key KEY --decision TEXT --rationale TEXT --confidence (low|medium|high) --impact (low|medium|high) --evidence TEXT --status (active|unresolved) [--alternatives TEXT] [--uncertainty TEXT] [--supersedes D001] [--state-root PATH]
   request-review --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-rework --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
@@ -135,6 +135,9 @@ Commands:
   recover-commit --project-root ROOT --task T0001 [--state-root PATH]
   resume --project-root ROOT --task T0001 [--state-root PATH]
   commit-approved --project-root ROOT --task T0001 [--state-root PATH]
+  doctor --project-root ROOT [--task T0001] [--state-root PATH]
+  claim-activation --project-root ROOT --activation-key KEY [--retry-user-request-id ID] [--state-root PATH]
+  confirm-activation --project-root ROOT --activation-key KEY --claim-token TOKEN --receipt ID [--state-root PATH]
   status --project-root ROOT [--task T0001 | --thread-id ID] [--state-root PATH]
   queue --project-root ROOT [--state-root PATH]
   review-packet --project-root ROOT --task T0001 [--state-root PATH]
@@ -145,13 +148,13 @@ Commands:
  * Dispatch the parsed command to the deterministic core.
  * @param parsed Parsed command and options.
  */
-function executeCommand(parsed: IParsedArguments): Record<string, unknown> | null {
+function executeCommand(parsed: IParsedArguments): unknown {
     const values = parsed.values;
     if (parsed.command === "help" || parsed.command === "--help" || parsed.command === "-h" || parsed.command === "") {
         printHelp();
         return null;
     }
-    const core = require("./control-room-core.ts");
+    const core: import("./control-room-core.ts").IControlRoomApi = require("./control-room-core.ts");
     if (parsed.command === "init") {
         validateOptions(values, ["project-root", "control-room-thread", "base-branch", "state-root"]);
         const options = buildOptions(values);
@@ -248,27 +251,15 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
         validateOptions(values, ["project-root", "task", "event-key", "handoff-task", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "USER_INPUT_RECEIVED", { handoffTaskId: values["handoff-task"] });
     }
-    if (parsed.command === "record-mental-model") {
-        validateOptions(values, ["project-root", "task", "event-key", "current-state", "desired-outcome", "approach", "affected-areas", "invariants", "non-goals", "verification", "state-root"]);
-        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "MENTAL_MODEL_RECORDED", {
-            currentState: requireOption(values, "current-state"),
-            desiredOutcome: requireOption(values, "desired-outcome"),
-            approach: requireOption(values, "approach"),
-            affectedAreas: requireOption(values, "affected-areas"),
-            invariants: requireOption(values, "invariants"),
-            nonGoals: requireOption(values, "non-goals"),
-            verification: requireOption(values, "verification")
-        });
-    }
     if (parsed.command === "record-decision") {
         validateOptions(values, ["project-root", "task", "event-key", "decision", "rationale", "confidence", "impact", "evidence", "status", "alternatives", "uncertainty", "supersedes", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "DECISION_RECORDED", {
             decision: requireOption(values, "decision"),
             rationale: requireOption(values, "rationale"),
-            confidence: requireOption(values, "confidence"),
-            impact: requireOption(values, "impact"),
+            confidence: requireOption(values, "confidence") as import("./control-room-types.ts").DecisionConfidence,
+            impact: requireOption(values, "impact") as import("./control-room-types.ts").DecisionImpact,
             evidence: requireOption(values, "evidence"),
-            status: requireOption(values, "status"),
+            status: requireOption(values, "status") as import("./control-room-types.ts").DecisionInputStatus,
             alternatives: values.alternatives,
             uncertainty: values.uncertainty,
             supersedesDecisionId: values.supersedes
@@ -345,6 +336,18 @@ function executeCommand(parsed: IParsedArguments): Record<string, unknown> | nul
     if (parsed.command === "commit-approved") {
         validateOptions(values, ["project-root", "task", "state-root"]);
         return core.commitApprovedTask(buildOptions(values), requireOption(values, "task"));
+    }
+    if (parsed.command === "doctor") {
+        validateOptions(values, ["project-root", "task", "state-root"]);
+        return core.doctorProject(buildOptions(values), values.task);
+    }
+    if (parsed.command === "claim-activation") {
+        validateOptions(values, ["project-root", "activation-key", "retry-user-request-id", "state-root"]);
+        return core.claimActivation(buildOptions(values), requireOption(values, "activation-key"), values["retry-user-request-id"]);
+    }
+    if (parsed.command === "confirm-activation") {
+        validateOptions(values, ["project-root", "activation-key", "claim-token", "receipt", "state-root"]);
+        return core.confirmActivation(buildOptions(values), requireOption(values, "activation-key"), requireOption(values, "claim-token"), requireOption(values, "receipt"));
     }
     if (parsed.command === "status") {
         validateOptions(values, ["project-root", "task", "thread-id", "state-root"]);

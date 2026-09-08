@@ -1,519 +1,19 @@
-const childProcess = require("node:child_process");
-const nodeCrypto = require("node:crypto");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { DatabaseSync } = require("node:sqlite");
+const { isolatedWorktreePathForTask }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
+const { requireProject, requireTask, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
+const { resolveTaskWorkspace, cleanupCanceledIsolatedTasks, commitApprovedTask, recoverCommit }: import("./control-room-integration.ts").IIntegrationApi = require("./control-room-integration.ts");
+import type { IApprovalResult, IEventPayloadByKind, IActivationRequest, IActivationDelivery, IDeliveryRow, IExecutionBrief, IActivationResult, TaskState, EventKind, DecisionConfidence, DecisionImpact, DecisionInputStatus, IControlRoomOptions, IEventPayload, IDecision, IReviewPacket, IStore, IProjectRow, ITaskRow, ITaskExclusionRow, IEventRow, ITitleUpdate } from "./control-room-types.ts";
+const { currentTimestamp, validateThreadId, validateSemanticName, validateTaskId, validateBranchName, workerBranchForTask, validateEventKey, validateCompactText, validateDecisionId, validateDecisionPayload, validateApprovalCommitMessage, validateQueuePosition, validateEventPayload }: import("./control-room-validation.ts").IValidationApi = require("./control-room-validation.ts");
+const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
+const { canonicalizeProjectRoot, runGit, requireGit, requireBranchCheckout, requireBaseCheckout, readWorkingTreeStatus, resolveCurrentHeadIfExists, resolveLocalBranchHeadIfExists }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
+const { openReadStore, pathIsSymbolicLink, openStore, beginTransaction, commitTransaction, rollbackTransaction }: import("./control-room-storage.ts").IStorageApi = require("./control-room-storage.ts");
+const nodeCrypto: typeof import("node:crypto") = require("node:crypto");
+const fs: typeof import("node:fs") = require("node:fs");
+const path: typeof import("node:path") = require("node:path");
 
-const CURRENT_SCHEMA_VERSION = 16;
-
-type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
-type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "RUN_ISOLATED_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "MENTAL_MODEL_RECORDED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
-type WorkspaceMode = "shared" | "isolated";
-type ApprovalTarget = "DONE" | "PAUSED";
-type DecisionConfidence = "low" | "medium" | "high";
-type DecisionImpact = "low" | "medium" | "high";
-type DecisionInputStatus = "active" | "unresolved";
-type DecisionStatus = DecisionInputStatus | "superseded";
-
-interface IControlRoomOptions {
-    projectRoot: string;
-    stateRoot?: string;
-}
-
-interface IEventPayload {
-    afterTaskId?: string;
-    affectedAreas?: string;
-    approvalTarget?: ApprovalTarget;
-    alternatives?: string;
-    approach?: string;
-    beforeTaskId?: string;
-    cancelSource?: "cancel" | "exclude";
-    commitMessage?: string;
-    confidence?: DecisionConfidence;
-    currentState?: string;
-    decision?: string;
-    dependencyTaskId?: string;
-    desiredOutcome?: string;
-    evidence?: string;
-    exclusionReason?: string;
-    impact?: DecisionImpact;
-    handoffTaskId?: string;
-    invariants?: string;
-    nonGoals?: string;
-    position?: number;
-    reason?: string;
-    rationale?: string;
-    status?: DecisionInputStatus;
-    summary?: string;
-    supersedesDecisionId?: string;
-    uncertainty?: string;
-    userRequestId?: string;
-    verification?: string;
-}
-
-interface IMentalModel {
-    currentState: string;
-    desiredOutcome: string;
-    approach: string;
-    affectedAreas: string;
-    invariants: string;
-    nonGoals: string;
-    verification: string;
-}
-
-interface IDecision {
-    decisionId: string;
-    decision: string;
-    rationale: string;
-    confidence: DecisionConfidence;
-    impact: DecisionImpact;
-    evidence: string;
-    alternatives: string | null;
-    uncertainty: string | null;
-    supersedesDecisionId: string | null;
-    supersededByDecisionId: string | null;
-    status: DecisionStatus;
-}
-
-interface IReviewPacket {
-    taskId: string;
-    baseline: IMentalModel | null;
-    final: IMentalModel | null;
-    changedFields: string[];
-    decisionCount: number;
-    unresolvedDecisionIds: string[];
-    decisions: IDecision[];
-}
-
-interface IStore {
-    database: any;
-    databasePath: string;
-    projectKey: string;
-    projectRoot: string;
-}
-
-interface IProjectRow {
-    project_key: string;
-    project_root: string;
-    coordinator_thread_id: string;
-    base_branch: string;
-    git_mode: string;
-    next_task_number: number;
-    integration_task_id: string | null;
-    integration_started_at: string | null;
-}
-
-interface ITaskRow {
-    task_id: string;
-    task_number: number;
-    semantic_name: string;
-    thread_id: string;
-    state: TaskState;
-    blocked_from_state: TaskState | null;
-    awaiting_user: number;
-    handoff_sender_task_id?: string | null;
-    pending_handoff_task_ids?: string;
-    queue_position: number | null;
-    queued_display_position?: number | null;
-    base_commit: string | null;
-    branch_name: string | null;
-    workspace_mode: WorkspaceMode;
-    worktree_path: string | null;
-    reviewed_commit: string | null;
-    approved_commit: string | null;
-    approval_event_key: string | null;
-    approval_target: ApprovalTarget;
-    integrated_commit: string | null;
-    created_at: string;
-    updated_at: string;
-}
-
-interface ITaskExclusionRow {
-    thread_id: string;
-    reason: string;
-    created_at: string;
-}
-
-interface IEventRow {
-    sequence: number;
-    event_key: string;
-    task_id: string;
-    kind: EventKind;
-    payload_json: string;
-}
-
-interface IGitResult {
-    status: number | null;
-    stdout: string;
-    stderr: string;
-}
-
-interface ITitleUpdate {
-    taskId: string;
-    threadId: string;
-    title: string;
-}
-
-const TASK_ID_PATTERN = /^T\d{4}$/;
-const DECISION_ID_PATTERN = /^D(?:00[1-9]|0[1-9]\d|[1-9]\d{2})$/;
-const COMMIT_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
-const ACTIVE_STATES: TaskState[] = ["QUEUED", "RUNNING", "REVIEW", "APPROVED", "BLOCKED"];
 const TITLE_CHANGING_EVENT_ACTIONS = new Set(["RETURNED_TO_PLANNING", "ENQUEUED", "REENQUEUED", "USER_INPUT_REQUESTED", "USER_INPUT_RECEIVED", "REVIEW_READY", "REWORK_STARTED", "APPROVED", "CANCELED", "BLOCKED"]);
-const QUEUE_POSITION_DIGITS = ["⓪", "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
-const TASK_WITH_QUEUED_POSITION_SELECT = `
-    SELECT task.*,
-        (SELECT json_group_array(destination.task_id) FROM tasks AS destination
-            WHERE destination.handoff_sender_task_id = task.task_id AND destination.state = 'RUNNING') AS pending_handoff_task_ids,
-        CASE
-            WHEN (task.state = 'QUEUED' OR (task.state = 'RUNNING' AND task.handoff_sender_task_id IS NOT NULL)) AND task.queue_position IS NOT NULL THEN (
-                SELECT COUNT(*)
-                FROM tasks AS queued_task
-                WHERE (queued_task.state = 'QUEUED' OR (queued_task.state = 'RUNNING' AND queued_task.handoff_sender_task_id IS NOT NULL))
-                    AND (
-                        queued_task.queue_position < task.queue_position
-                        OR (
-                            queued_task.queue_position = task.queue_position
-                            AND queued_task.task_number <= task.task_number
-                        )
-                    )
-            )
-            ELSE NULL
-        END AS queued_display_position
-    FROM tasks AS task
-`;
 const GIT_MODE = "local-approval-commit";
 const ROUTING_FILE_LIMIT_BYTES = 1024 * 1024;
 const WORKTREE_IGNORE_PATTERN = ".control-room/";
-const MENTAL_MODEL_FIELDS: Array<keyof IMentalModel> = ["currentState", "desiredOutcome", "approach", "affectedAreas", "invariants", "nonGoals", "verification"];
-
-/**
- * Reject an invalid condition with a stable error message.
- * @param condition Condition that must be truthy.
- * @param message Error message used when the condition fails.
- */
-function assertCondition(condition: unknown, message: string): asserts condition {
-    if (!condition) {
-        throw new Error(message);
-    }
-}
-
-/**
- * Return the current timestamp in a SQLite-friendly format.
- */
-function currentTimestamp(): string {
-    return new Date().toISOString();
-}
-
-/**
- * Resolve and validate the canonical project directory.
- * @param projectRoot Repository root supplied by the caller.
- */
-function canonicalizeProjectRoot(projectRoot: string): string {
-    assertCondition(typeof projectRoot === "string" && projectRoot.trim().length > 0, "A project root is required.");
-    const resolvedRoot = path.resolve(projectRoot);
-    assertCondition(fs.existsSync(resolvedRoot), `Project root does not exist: ${resolvedRoot}`);
-    assertCondition(fs.statSync(resolvedRoot).isDirectory(), `Project root is not a directory: ${resolvedRoot}`);
-    const requestedRoot = fs.realpathSync(resolvedRoot);
-    const gitRootResult = runGit(requestedRoot, ["rev-parse", "--show-toplevel"]);
-    assertCondition(gitRootResult.status === 0, `Project root is not a Git repository: ${requestedRoot}`);
-    assertCondition(fs.realpathSync(gitRootResult.stdout) === requestedRoot, `Project root must be the Git working tree root: ${gitRootResult.stdout}`);
-    const commonDirectoryResult = runGit(requestedRoot, ["rev-parse", "--git-common-dir"]);
-    assertCondition(commonDirectoryResult.status === 0, `Cannot resolve the common Git directory: ${requestedRoot}`);
-    const commonDirectory = fs.realpathSync(path.resolve(requestedRoot, commonDirectoryResult.stdout));
-    assertCondition(path.basename(commonDirectory) === ".git", `Unsupported common Git directory: ${commonDirectory}`);
-    const canonicalRoot = fs.realpathSync(path.dirname(commonDirectory));
-    const canonicalGitRoot = runGit(canonicalRoot, ["rev-parse", "--show-toplevel"]);
-    assertCondition(canonicalGitRoot.status === 0 && fs.realpathSync(canonicalGitRoot.stdout) === canonicalRoot, `Cannot resolve the primary Local checkout: ${canonicalRoot}`);
-    assertCondition(requestedRoot === canonicalRoot, "ControlRoom requires the primary Local checkout. Use Hand off > Local before continuing.");
-    return canonicalRoot;
-}
-
-/**
- * Validate an opaque Codex thread identifier before persistence.
- * @param threadId Thread identifier supplied by Codex.
- */
-function validateThreadId(threadId: string): string {
-    assertCondition(typeof threadId === "string", "A thread ID is required.");
-    const normalizedThreadId = threadId.trim();
-    assertCondition(normalizedThreadId.length > 0 && normalizedThreadId.length <= 200, "Thread ID must contain 1 to 200 characters.");
-    assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedThreadId), "Thread ID contains control characters.");
-    return normalizedThreadId;
-}
-
-/**
- * Validate and normalize a short semantic task name.
- * @param semanticName User-facing semantic task name.
- */
-function validateSemanticName(semanticName: string): string {
-    assertCondition(typeof semanticName === "string", "A semantic task name is required.");
-    const normalizedName = semanticName.trim().replace(/^(?:⚪️|⭕️|🔴|🟡|🔵|💪|🟢|✅|❌|👉)\s*(?:(?:[⓪①-⑨]+|[❶-❾]|#\d{1,4})\s+)?/u, "");
-    assertCondition(normalizedName.length > 0 && normalizedName.length <= 80, "Semantic task name must contain 1 to 80 characters.");
-    assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedName), "Semantic task name contains control characters.");
-    return normalizedName;
-}
-
-/**
- * Validate a Control Room task identifier.
- * @param taskId Task identifier to validate.
- */
-function validateTaskId(taskId: string): string {
-    assertCondition(typeof taskId === "string" && TASK_ID_PATTERN.test(taskId), `Invalid task ID: ${String(taskId)}`);
-    return taskId;
-}
-
-/**
- * Validate a full Git commit identifier.
- * @param commitId Git object identifier to validate.
- */
-function validateCommitId(commitId: string): string {
-    assertCondition(typeof commitId === "string" && COMMIT_PATTERN.test(commitId), "A full 40- or 64-character Git commit ID is required.");
-    return commitId.toLowerCase();
-}
-
-/**
- * Validate a Git branch name without invoking a shell.
- * @param branchName Git branch name to validate.
- */
-function validateBranchName(branchName: string): string {
-    assertCondition(typeof branchName === "string", "A Git branch name is required.");
-    const normalizedBranch = branchName.trim();
-    assertCondition(normalizedBranch.length > 0 && normalizedBranch.length <= 240, "Git branch name must contain 1 to 240 characters.");
-    assertCondition(!normalizedBranch.startsWith("-"), "Git branch names cannot start with a hyphen.");
-    assertCondition(!normalizedBranch.startsWith("refs/") && normalizedBranch !== "HEAD", "Use a local branch name without a refs/ prefix.");
-    assertCondition(!/[\u0000-\u0020\u007f~^:?*[\\]/u.test(normalizedBranch), "Git branch name contains forbidden characters.");
-    assertCondition(!normalizedBranch.includes("..") && !normalizedBranch.includes("@{") && !normalizedBranch.includes("//"), "Git branch name contains a forbidden sequence.");
-    assertCondition(!normalizedBranch.endsWith(".") && !normalizedBranch.endsWith("/") && !normalizedBranch.endsWith(".lock"), "Git branch name has a forbidden suffix.");
-    return normalizedBranch;
-}
-
-/**
- * Build the deterministic worker branch name created when a task starts.
- * @param taskId Control Room task identifier.
- */
-function workerBranchForTask(taskId: string): string {
-    return validateBranchName(`control-room/${validateTaskId(taskId)}`);
-}
-
-/**
- * Validate an idempotency key.
- * @param eventKey Caller-stable event identifier.
- */
-function validateEventKey(eventKey: string): string {
-    assertCondition(typeof eventKey === "string", "An event key is required.");
-    const normalizedKey = eventKey.trim();
-    assertCondition(normalizedKey.length > 0 && normalizedKey.length <= 200, "Event key must contain 1 to 200 characters.");
-    assertCondition(!/[\u0000-\u001f\u007f]/u.test(normalizedKey), "Event key contains control characters.");
-    return normalizedKey;
-}
-
-/**
- * Validate compact persisted event text.
- * @param value Text supplied in an event payload.
- * @param fieldName Human-readable field name used in failures.
- * @param maximumLength Maximum accepted character count.
- * @param required Whether empty text is invalid.
- */
-function validateCompactText(value: string | undefined, fieldName: string, maximumLength: number, required: boolean): string | undefined {
-    if (value === undefined) {
-        assertCondition(!required, `${fieldName} is required.`);
-        return undefined;
-    }
-    assertCondition(typeof value === "string", `${fieldName} must be text.`);
-    const normalizedValue = value.trim();
-    assertCondition(!required || normalizedValue.length > 0, `${fieldName} is required.`);
-    assertCondition(normalizedValue.length <= maximumLength, `${fieldName} must not exceed ${maximumLength} characters.`);
-    assertCondition(!/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(normalizedValue), `${fieldName} contains control characters.`);
-    return normalizedValue;
-}
-
-/**
- * Validate a stable task-local decision identifier.
- * @param decisionId Decision identifier supplied by the caller.
- */
-function validateDecisionId(decisionId: string): string {
-    assertCondition(typeof decisionId === "string" && DECISION_ID_PATTERN.test(decisionId), `Invalid decision ID: ${String(decisionId)}`);
-    return decisionId;
-}
-
-/**
- * Validate and normalize one complete mental-model snapshot.
- * @param payload Caller-supplied event payload.
- */
-function validateMentalModelPayload(payload: IEventPayload): IMentalModel {
-    return {
-        currentState: String(validateCompactText(payload.currentState, "Current state", 2000, true)),
-        desiredOutcome: String(validateCompactText(payload.desiredOutcome, "Desired outcome", 2000, true)),
-        approach: String(validateCompactText(payload.approach, "Approach", 2000, true)),
-        affectedAreas: String(validateCompactText(payload.affectedAreas, "Affected areas", 2000, true)),
-        invariants: String(validateCompactText(payload.invariants, "Invariants", 2000, true)),
-        nonGoals: String(validateCompactText(payload.nonGoals, "Non-goals", 2000, true)),
-        verification: String(validateCompactText(payload.verification, "Verification", 2000, true))
-    };
-}
-
-/**
- * Validate and normalize one task-local macro decision.
- * @param payload Caller-supplied event payload.
- */
-function validateDecisionPayload(payload: IEventPayload): IEventPayload {
-    assertCondition(payload.confidence === "low" || payload.confidence === "medium" || payload.confidence === "high", "Decision confidence must be low, medium, or high.");
-    assertCondition(payload.impact === "low" || payload.impact === "medium" || payload.impact === "high", "Decision impact must be low, medium, or high.");
-    assertCondition(payload.status === "active" || payload.status === "unresolved", "Decision status must be active or unresolved.");
-    return {
-        decision: validateCompactText(payload.decision, "Decision", 2000, true),
-        rationale: validateCompactText(payload.rationale, "Decision rationale", 2000, true),
-        confidence: payload.confidence,
-        impact: payload.impact,
-        evidence: validateCompactText(payload.evidence, "Decision evidence", 2000, true),
-        alternatives: validateCompactText(payload.alternatives, "Decision alternatives", 2000, false),
-        uncertainty: validateCompactText(payload.uncertainty, "Decision uncertainty", 2000, false),
-        supersedesDecisionId: payload.supersedesDecisionId ? validateDecisionId(payload.supersedesDecisionId) : undefined,
-        status: payload.status
-    };
-}
-
-/**
- * Validate a concise one-line Git commit subject.
- * @param commitMessage Commit subject supplied with direct approval.
- */
-function validateCommitMessage(commitMessage: string | undefined): string {
-    const normalizedMessage = validateCompactText(commitMessage, "Commit message", 72, true);
-    assertCondition(normalizedMessage && normalizedMessage.length >= 8, "Commit message must contain at least 8 characters.");
-    assertCondition(!/[\t\r\n]/u.test(normalizedMessage), "Commit message must be a single line.");
-    assertCondition(/[A-Za-z]/u.test(normalizedMessage), "Commit message must contain Latin letters.");
-    return normalizedMessage;
-}
-
-/**
- * Reject a commit subject copied from the task identifier or semantic title.
- * @param task Task receiving direct approval.
- * @param commitMessage Proposed commit subject.
- */
-function validateApprovalCommitMessage(task: ITaskRow, commitMessage: string | undefined): string {
-    const normalizedMessage = validateCommitMessage(commitMessage);
-    const normalizedComparison = normalizedMessage.toLocaleLowerCase("en-US");
-    const semanticComparison = task.semantic_name.trim().toLocaleLowerCase("en-US");
-    assertCondition(normalizedComparison !== semanticComparison, "Commit message must describe the implemented change rather than copy the task name.");
-    assertCondition(!normalizedComparison.startsWith(`${task.task_id.toLocaleLowerCase("en-US")} -`), "Commit message must not use the task title format.");
-    return normalizedMessage;
-}
-
-/**
- * Validate a one-based position in the waiting queue.
- * @param position Queue position supplied by the caller.
- */
-function validateQueuePosition(position: number | undefined): number {
-    assertCondition(Number.isSafeInteger(position) && Number(position) >= 1 && Number(position) <= 9999, "Queue position must be an integer between 1 and 9999.");
-    return Number(position);
-}
-
-/**
- * Validate and canonicalize an event payload before persistence.
- * @param kind Requested event kind.
- * @param payload Caller-supplied event payload.
- */
-function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPayload {
-    if (kind === "PLANNING_REQUESTED") {
-        return {};
-    }
-    if (kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
-        return { handoffTaskId: payload.handoffTaskId !== undefined ? validateTaskId(payload.handoffTaskId) : undefined };
-    }
-    if (kind === "ENQUEUE_REQUESTED") {
-        return {
-            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined,
-            userRequestId: payload.userRequestId !== undefined ? validateCompactText(payload.userRequestId, "Direct user request ID", 200, true) : undefined
-        };
-    }
-    if (kind === "RUN_NOW_REQUESTED" || kind === "RUN_ISOLATED_NOW_REQUESTED") {
-        return {
-            userRequestId: payload.userRequestId !== undefined ? validateCompactText(payload.userRequestId, "Direct user request ID", 200, true) : undefined
-        };
-    }
-    if (kind === "MOVE_REQUESTED") {
-        const selectorCount = Number(Boolean(payload.beforeTaskId)) + Number(Boolean(payload.afterTaskId)) + Number(payload.position !== undefined);
-        assertCondition(selectorCount === 1, "Move requires exactly one destination: before, after, or position.");
-        return {
-            afterTaskId: payload.afterTaskId ? validateTaskId(payload.afterTaskId) : undefined,
-            beforeTaskId: payload.beforeTaskId ? validateTaskId(payload.beforeTaskId) : undefined,
-            position: payload.position !== undefined ? validateQueuePosition(payload.position) : undefined
-        };
-    }
-    if (kind === "DEPENDENCY_ADD_REQUESTED" || kind === "DEPENDENCY_REMOVE_REQUESTED") {
-        return {
-            dependencyTaskId: validateTaskId(String(payload.dependencyTaskId || ""))
-        };
-    }
-    if (kind === "MENTAL_MODEL_RECORDED") {
-        return validateMentalModelPayload(payload);
-    }
-    if (kind === "DECISION_RECORDED") {
-        return validateDecisionPayload(payload);
-    }
-    if (kind === "REVIEW_REQUESTED" || kind === "REWORK_REQUESTED") {
-        return {
-            summary: validateCompactText(payload.summary, kind === "REVIEW_REQUESTED" ? "Review summary" : "Rework summary", 2000, false)
-        };
-    }
-    if (kind === "APPROVAL_REQUESTED") {
-        const approvalTarget = payload.approvalTarget || "DONE";
-        assertCondition(approvalTarget === "DONE" || approvalTarget === "PAUSED", "Approval target must be DONE or PAUSED.");
-        return {
-            approvalTarget,
-            commitMessage: validateCommitMessage(payload.commitMessage),
-            userRequestId: validateCompactText(payload.userRequestId, "Direct user request ID", 200, true)
-        };
-    }
-    if (kind === "CANCEL_REQUESTED") {
-        const cancelSource = payload.cancelSource || "cancel";
-        assertCondition(cancelSource === "cancel" || cancelSource === "exclude", "Cancellation source must be cancel or exclude.");
-        return {
-            cancelSource,
-            exclusionReason: cancelSource === "exclude" ? validateCompactText(payload.exclusionReason, "Exclusion reason", 200, true) : undefined,
-            userRequestId: validateCompactText(payload.userRequestId, "Direct user request ID", 200, true)
-        };
-    }
-    assertCondition(kind === "BLOCKED_REPORTED", `Unsupported event kind: ${kind}`);
-    return {
-        reason: validateCompactText(payload.reason, "Blocked reason", 1000, true)
-    };
-}
-
-/**
- * Create a secure directory if needed and restrict its mode.
- * @param directoryPath Directory to create or secure.
- */
-function ensurePrivateDirectory(directoryPath: string): void {
-    fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
-    const directoryStatus = fs.lstatSync(directoryPath);
-    assertCondition(!directoryStatus.isSymbolicLink(), `State directory cannot be a symbolic link: ${directoryPath}`);
-    assertCondition(directoryStatus.isDirectory(), `State path is not a directory: ${directoryPath}`);
-    fs.chmodSync(directoryPath, 0o700);
-}
-
-/**
- * Inspect a path without following its final symbolic link.
- * @param targetPath Path whose final component must be inspected.
- */
-function pathIsSymbolicLink(targetPath: string): boolean {
-    try {
-        return fs.lstatSync(targetPath).isSymbolicLink();
-    } catch (error) {
-        const errorCode = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-        if (errorCode === "ENOENT") {
-            return false;
-        }
-        throw error;
-    }
-}
-
-/**
- * Resolve the active Codex home directory.
- */
-function resolveCodexHome(): string {
-    return process.env.CODEX_HOME ? path.resolve(process.env.CODEX_HOME) : path.join(os.homedir(), ".codex");
-}
 
 /**
  * Validate one existing instruction file before reading or replacing it.
@@ -570,421 +70,6 @@ function writeProjectFileAtomically(targetPath: string, content: string): void {
         }
         throw error;
     }
-}
-
-/**
- * Determine whether a SQLite table contains a named column.
- * @param database Open SQLite database.
- * @param tableName Fixed internal table name.
- * @param columnName Fixed internal column name.
- */
-function databaseHasColumn(database: any, tableName: string, columnName: string): boolean {
-    const columns = database.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
-    for (const column of columns) {
-        if (column.name === columnName) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Create or migrate the Control Room schema transactionally.
- * @param database Open SQLite database.
- */
-function initializeSchema(database: any): void {
-    const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
-    const schemaVersion = Number(versionRow.user_version);
-    assertCondition(schemaVersion >= 0 && schemaVersion <= CURRENT_SCHEMA_VERSION, `Unsupported Control Room schema version: ${schemaVersion}`);
-    if (schemaVersion === CURRENT_SCHEMA_VERSION) {
-        return;
-    }
-    beginTransaction(database);
-    try {
-        database.exec(`
-            CREATE TABLE IF NOT EXISTS projects (
-                project_key TEXT PRIMARY KEY,
-                project_root TEXT NOT NULL UNIQUE,
-                coordinator_thread_id TEXT NOT NULL,
-                base_branch TEXT NOT NULL,
-                git_mode TEXT NOT NULL CHECK (git_mode = 'local-approval-commit'),
-                next_task_number INTEGER NOT NULL CHECK (next_task_number BETWEEN 1 AND 10000),
-                integration_task_id TEXT,
-                integration_started_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                task_number INTEGER NOT NULL UNIQUE CHECK (task_number BETWEEN 1 AND 9999),
-                semantic_name TEXT NOT NULL,
-                thread_id TEXT NOT NULL UNIQUE,
-                state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'PAUSED', 'DONE', 'BLOCKED', 'CANCELED')),
-                blocked_from_state TEXT CHECK (blocked_from_state IN ('QUEUED', 'RUNNING', 'REVIEW')),
-                awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1)),
-                queue_position INTEGER,
-                base_commit TEXT,
-                branch_name TEXT,
-                workspace_mode TEXT NOT NULL DEFAULT 'shared' CHECK (workspace_mode IN ('shared', 'isolated')),
-                worktree_path TEXT,
-                reviewed_commit TEXT,
-                approved_commit TEXT,
-                approval_event_key TEXT,
-                approval_target TEXT NOT NULL DEFAULT 'DONE' CHECK (approval_target IN ('DONE', 'PAUSED')),
-                integrated_commit TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS task_exclusions (
-                thread_id TEXT PRIMARY KEY,
-                reason TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS dependencies (
-                task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
-                dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
-                PRIMARY KEY (task_id, depends_on_id, dependency_kind),
-                CHECK (task_id <> depends_on_id)
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_key TEXT NOT NULL UNIQUE,
-                task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'RUN_ISOLATED_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'REVIEW_BLIND_RECORDED', 'REVIEW_AUDIT_RECORDED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                processed_at TEXT,
-                result_json TEXT
-            );
-        `);
-        if (!databaseHasColumn(database, "projects", "integration_task_id")) {
-            database.exec("ALTER TABLE projects ADD COLUMN integration_task_id TEXT");
-        }
-        if (!databaseHasColumn(database, "projects", "integration_started_at")) {
-            database.exec("ALTER TABLE projects ADD COLUMN integration_started_at TEXT");
-        }
-        if (!databaseHasColumn(database, "tasks", "reviewed_commit")) {
-            database.exec("ALTER TABLE tasks ADD COLUMN reviewed_commit TEXT");
-        }
-        if (!databaseHasColumn(database, "tasks", "awaiting_user")) {
-            database.exec("ALTER TABLE tasks ADD COLUMN awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1))");
-        }
-        if (!databaseHasColumn(database, "tasks", "workspace_mode")) {
-            database.exec("ALTER TABLE tasks ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'shared' CHECK (workspace_mode IN ('shared', 'isolated'))");
-        }
-        if (!databaseHasColumn(database, "tasks", "worktree_path")) {
-            database.exec("ALTER TABLE tasks ADD COLUMN worktree_path TEXT");
-        }
-        if (!databaseHasColumn(database, "tasks", "approved_commit")) {
-            database.exec("ALTER TABLE tasks ADD COLUMN approved_commit TEXT");
-        }
-        const projectTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'").get() as { sql: string } | undefined;
-        if (projectTable && projectTable.sql.includes("local-ff-only")) {
-            database.exec(`
-                ALTER TABLE projects RENAME TO projects_legacy;
-                CREATE TABLE projects (
-                    project_key TEXT PRIMARY KEY,
-                    project_root TEXT NOT NULL UNIQUE,
-                    coordinator_thread_id TEXT NOT NULL,
-                    base_branch TEXT NOT NULL,
-                    git_mode TEXT NOT NULL CHECK (git_mode = 'local-approval-commit'),
-                    next_task_number INTEGER NOT NULL CHECK (next_task_number BETWEEN 1 AND 10000),
-                    integration_task_id TEXT,
-                    integration_started_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                INSERT INTO projects (
-                    project_key, project_root, coordinator_thread_id, base_branch, git_mode,
-                    next_task_number, integration_task_id, integration_started_at, created_at, updated_at
-                )
-                SELECT
-                    project_key, project_root, coordinator_thread_id, base_branch, 'local-approval-commit',
-                    next_task_number, integration_task_id, integration_started_at, created_at, updated_at
-                FROM projects_legacy;
-                DROP TABLE projects_legacy;
-            `);
-        }
-        const dependencyTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dependencies'").get() as { sql: string } | undefined;
-        if (dependencyTable && dependencyTable.sql.includes("'ORDER'")) {
-            database.exec(`
-                ALTER TABLE dependencies RENAME TO dependencies_legacy;
-                CREATE TABLE dependencies (
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
-                    dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
-                    PRIMARY KEY (task_id, depends_on_id, dependency_kind),
-                    CHECK (task_id <> depends_on_id)
-                );
-                INSERT INTO dependencies (task_id, depends_on_id, dependency_kind)
-                SELECT task_id, depends_on_id, 'BLOCKING' FROM dependencies_legacy;
-                DROP TABLE dependencies_legacy;
-            `);
-        }
-        const eventTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get() as { sql: string } | undefined;
-        if (eventTable && (!eventTable.sql.includes("USER_INPUT_REQUESTED") || !eventTable.sql.includes("USER_INPUT_RECEIVED") || !eventTable.sql.includes("MENTAL_MODEL_RECORDED") || !eventTable.sql.includes("DECISION_RECORDED") || !eventTable.sql.includes("RUN_ISOLATED_NOW_REQUESTED"))) {
-            database.exec(`
-                ALTER TABLE events RENAME TO events_legacy;
-                CREATE TABLE events (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_key TEXT NOT NULL UNIQUE,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'RUN_ISOLATED_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'REVIEW_BLIND_RECORDED', 'REVIEW_AUDIT_RECORDED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    processed_at TEXT,
-                    result_json TEXT
-                );
-                INSERT INTO events (sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
-                SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
-                FROM events_legacy;
-                DROP TABLE events_legacy;
-            `);
-        }
-        const taskTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get() as { sql: string } | undefined;
-        if (taskTable && (!taskTable.sql.includes("'PAUSED'") || !databaseHasColumn(database, "tasks", "approval_event_key") || !databaseHasColumn(database, "tasks", "approval_target"))) {
-            const hasLegacyReviewedTree = databaseHasColumn(database, "tasks", "reviewed_tree");
-            const reviewedTreeDefinition = hasLegacyReviewedTree ? "reviewed_tree TEXT," : "";
-            const reviewedTreeInsertColumn = hasLegacyReviewedTree ? "reviewed_tree," : "";
-            const reviewedTreeSelectColumn = hasLegacyReviewedTree ? "reviewed_tree," : "";
-            database.exec(`
-                PRAGMA defer_foreign_keys = ON;
-                ALTER TABLE dependencies RENAME TO dependencies_before_paused;
-                ALTER TABLE events RENAME TO events_before_paused;
-                ALTER TABLE tasks RENAME TO tasks_before_paused;
-                CREATE TABLE tasks (
-                    task_id TEXT PRIMARY KEY,
-                    task_number INTEGER NOT NULL UNIQUE CHECK (task_number BETWEEN 1 AND 9999),
-                    semantic_name TEXT NOT NULL,
-                    thread_id TEXT NOT NULL UNIQUE,
-                    state TEXT NOT NULL CHECK (state IN ('PLANNING', 'QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'PAUSED', 'DONE', 'BLOCKED', 'CANCELED')),
-                    blocked_from_state TEXT CHECK (blocked_from_state IN ('QUEUED', 'RUNNING', 'REVIEW')),
-                    awaiting_user INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_user IN (0, 1)),
-                    queue_position INTEGER,
-                    base_commit TEXT,
-                    branch_name TEXT,
-                    workspace_mode TEXT NOT NULL DEFAULT 'shared' CHECK (workspace_mode IN ('shared', 'isolated')),
-                    worktree_path TEXT,
-                    reviewed_commit TEXT,
-                    approved_commit TEXT,
-                    ${reviewedTreeDefinition}
-                    approval_event_key TEXT,
-                    approval_target TEXT NOT NULL DEFAULT 'DONE' CHECK (approval_target IN ('DONE', 'PAUSED')),
-                    integrated_commit TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                INSERT INTO tasks (
-                    task_id, task_number, semantic_name, thread_id, state, blocked_from_state,
-                    awaiting_user, queue_position, base_commit, branch_name, workspace_mode,
-                    worktree_path, reviewed_commit, approved_commit, ${reviewedTreeInsertColumn} approval_event_key,
-                    approval_target, integrated_commit, created_at, updated_at
-                )
-                SELECT
-                    task_id, task_number, semantic_name, thread_id, state, blocked_from_state,
-                    awaiting_user, queue_position, base_commit, branch_name, workspace_mode,
-                    worktree_path, reviewed_commit, approved_commit, ${reviewedTreeSelectColumn} NULL,
-                    'DONE', integrated_commit, created_at, updated_at
-                FROM tasks_before_paused;
-                CREATE TABLE dependencies (
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    depends_on_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
-                    dependency_kind TEXT NOT NULL CHECK (dependency_kind = 'BLOCKING'),
-                    PRIMARY KEY (task_id, depends_on_id, dependency_kind),
-                    CHECK (task_id <> depends_on_id)
-                );
-                INSERT INTO dependencies (task_id, depends_on_id, dependency_kind)
-                SELECT task_id, depends_on_id, dependency_kind FROM dependencies_before_paused;
-                CREATE TABLE events (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_key TEXT NOT NULL UNIQUE,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK (kind IN ('PLANNING_REQUESTED', 'ENQUEUE_REQUESTED', 'RUN_NOW_REQUESTED', 'RUN_ISOLATED_NOW_REQUESTED', 'MOVE_REQUESTED', 'DEPENDENCY_ADD_REQUESTED', 'DEPENDENCY_REMOVE_REQUESTED', 'USER_INPUT_REQUESTED', 'USER_INPUT_RECEIVED', 'MENTAL_MODEL_RECORDED', 'DECISION_RECORDED', 'REVIEW_REQUESTED', 'REWORK_REQUESTED', 'REVIEW_BLIND_RECORDED', 'REVIEW_AUDIT_RECORDED', 'APPROVAL_REQUESTED', 'CANCEL_REQUESTED', 'BLOCKED_REPORTED')),
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    processed_at TEXT,
-                    result_json TEXT
-                );
-                INSERT INTO events (sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json)
-                SELECT sequence, event_key, task_id, kind, payload_json, created_at, processed_at, result_json
-                FROM events_before_paused;
-                DROP TABLE dependencies_before_paused;
-                DROP TABLE events_before_paused;
-                DROP TABLE tasks_before_paused;
-            `);
-        }
-        if (!databaseHasColumn(database, "tasks", "handoff_sender_task_id")) {
-            database.exec("ALTER TABLE tasks ADD COLUMN handoff_sender_task_id TEXT REFERENCES tasks(task_id) CHECK (handoff_sender_task_id IS NULL OR handoff_sender_task_id <> task_id)");
-        }
-        database.exec(`
-            CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
-            CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
-            PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};
-        `);
-        commitTransaction(database);
-    } catch (error) {
-        rollbackTransaction(database);
-        throw error;
-    }
-}
-
-/**
- * Create or open the project-scoped SQLite store.
- * @param options Project and optional state-root settings.
- */
-function openStore(options: IControlRoomOptions): IStore {
-    const projectRoot = canonicalizeProjectRoot(options.projectRoot);
-    const codexHome = resolveCodexHome();
-    const stateRoot = options.stateRoot ? path.resolve(options.stateRoot) : path.join(codexHome, "control-room", "projects");
-    const projectKey = nodeCrypto.createHash("sha256").update(projectRoot).digest("hex").slice(0, 24);
-    const projectDirectory = path.join(stateRoot, projectKey);
-    ensurePrivateDirectory(stateRoot);
-    ensurePrivateDirectory(projectDirectory);
-    const databasePath = path.join(projectDirectory, "state.sqlite");
-    assertCondition(!pathIsSymbolicLink(databasePath), `State database cannot be a symbolic link: ${databasePath}`);
-    const database = new DatabaseSync(databasePath);
-    try {
-        database.exec("PRAGMA foreign_keys = ON");
-        database.exec("PRAGMA journal_mode = WAL");
-        database.exec("PRAGMA synchronous = FULL");
-        database.exec("PRAGMA busy_timeout = 5000");
-        initializeSchema(database);
-        fs.chmodSync(databasePath, 0o600);
-        return { database, databasePath, projectKey, projectRoot };
-    } catch (error) {
-        database.close();
-        throw error;
-    }
-}
-
-/**
- * Start an immediate SQLite transaction.
- * @param database Open SQLite database.
- */
-function beginTransaction(database: any): void {
-    database.exec("BEGIN IMMEDIATE");
-}
-
-/**
- * Commit the active SQLite transaction.
- * @param database Open SQLite database.
- */
-function commitTransaction(database: any): void {
-    database.exec("COMMIT");
-}
-
-/**
- * Roll back the active SQLite transaction without hiding the original failure.
- * @param database Open SQLite database.
- */
-function rollbackTransaction(database: any): void {
-    try {
-        database.exec("ROLLBACK");
-    } catch {
-        // The original operation error is more useful than a secondary rollback error.
-    }
-}
-
-/**
- * Load the initialized project record.
- * @param store Open project store.
- */
-function requireProject(store: IStore): IProjectRow {
-    const row = store.database.prepare("SELECT * FROM projects WHERE project_key = ?").get(store.projectKey) as IProjectRow | undefined;
-    assertCondition(row, "Control Room is not initialized for this project.");
-    assertCondition(row.project_root === store.projectRoot, "Stored project root does not match the canonical project root.");
-    return row;
-}
-
-/**
- * Load a task or fail with a stable message.
- * @param store Open project store.
- * @param taskId Task identifier to load.
- */
-function requireTask(store: IStore, taskId: string): ITaskRow {
-    const validTaskId = validateTaskId(taskId);
-    const row = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.task_id = ?`).get(validTaskId) as ITaskRow | undefined;
-    assertCondition(row, `Unknown task: ${validTaskId}`);
-    return row;
-}
-
-/**
- * Format the visual marker for one waiting-queue position.
- * @param position One-based waiting-queue position.
- */
-function queuePositionMarker(position: number | null): string {
-    if (!Number.isSafeInteger(position) || Number(position) < 1) {
-        return "";
-    }
-    return String(position).split("").map((digit) => QUEUE_POSITION_DIGITS[Number(digit)]).join("");
-}
-
-/**
- * Convert a task state into its exact user-facing title.
- * @param task Task record to title.
- */
-function titleForTask(task: ITaskRow): string {
-    if (task.state === "CANCELED") {
-        return task.semantic_name;
-    }
-    let prefix = "";
-    if ((task.pending_handoff_task_ids && task.pending_handoff_task_ids !== "[]") || (task.awaiting_user && task.state === "RUNNING")) {
-        prefix = "🟡 ";
-    } else if (task.state === "PLANNING") {
-        prefix = "⚪️ ";
-    } else if (task.state === "QUEUED" || (task.state === "RUNNING" && task.handoff_sender_task_id)) {
-        const positionMarker = queuePositionMarker(task.queued_display_position ?? task.queue_position);
-        prefix = positionMarker ? `⭕️ ${positionMarker} ` : "⭕️ ";
-    } else if (task.state === "RUNNING") {
-        prefix = "🔴 ";
-    } else if (task.state === "REVIEW") {
-        prefix = "💪 ";
-    } else if (task.state === "APPROVED") {
-        prefix = "🟢 ";
-    } else if (task.state === "PAUSED") {
-        prefix = "⏸️ ";
-    } else if (task.state === "DONE") {
-        prefix = "🟢 ";
-    } else if (task.state === "BLOCKED") {
-        prefix = "❌ ";
-    }
-    return `${prefix}${task.task_id} - ${task.semantic_name}`;
-}
-
-/**
- * Return the fixed Control Room console title.
- */
-function titleForControlRoom(): string {
-    return "⚫️ Control Room";
-}
-
-/**
- * Convert a database task row into stable public JSON.
- * @param task Task database row.
- */
-function serializeTask(task: ITaskRow): Record<string, unknown> {
-    return {
-        taskId: task.task_id,
-        number: task.task_number,
-        semanticName: task.semantic_name,
-        threadId: task.thread_id,
-        state: task.state,
-        blockedFromState: task.blocked_from_state,
-        awaitingUser: Boolean(task.awaiting_user),
-        handoffSenderTaskId: task.handoff_sender_task_id || null,
-        pendingHandoffTaskIds: JSON.parse(task.pending_handoff_task_ids || "[]"),
-        title: titleForTask(task),
-        queuePosition: task.queue_position,
-        queuedPosition: task.queued_display_position ?? null,
-        baseCommit: task.base_commit,
-        branchName: task.branch_name,
-        workspaceMode: task.workspace_mode,
-        worktreePath: task.worktree_path,
-        approvedCommit: task.approved_commit,
-        approvalTarget: task.approval_target,
-        committedCommit: task.integrated_commit
-    };
 }
 
 /**
@@ -1266,7 +351,7 @@ function registerTask(options: IControlRoomOptions, threadId: string, semanticNa
  * @param kind Event kind requested by the worker.
  * @param payload Compact event payload.
  */
-function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: string, kind: EventKind, payload: IEventPayload): Record<string, unknown> {
+function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, eventKey: string, taskId: string, kind: Kind, payload: IEventPayloadByKind[Kind]): Record<string, unknown> {
     const validEventKey = validateEventKey(eventKey);
     const validTaskId = validateTaskId(taskId);
     const validPayload = validateEventPayload(kind, payload);
@@ -1332,7 +417,7 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
             } else {
                 assertCondition(task.state === "PLANNING" || task.state === "RUNNING" || task.state === "REVIEW", `Cannot update user-input attention for ${task.task_id} from ${task.state}.`);
             }
-        } else if (kind === "MENTAL_MODEL_RECORDED" || kind === "DECISION_RECORDED") {
+        } else if (kind === "DECISION_RECORDED") {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record review context for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
@@ -1369,76 +454,6 @@ function submitEvent(options: IControlRoomOptions, eventKey: string, taskId: str
 }
 
 /**
- * Normalize active queue positions and return changed queued title projections.
- * @param store Open project store.
- * @param orderedTaskIds Active task IDs in desired order.
- */
-function writeQueueOrder(store: IStore, orderedTaskIds: string[]): ITitleUpdate[] {
-    const readCurrentPosition = store.database.prepare("SELECT state, queue_position, handoff_sender_task_id FROM tasks WHERE task_id = ?");
-    const updatePosition = store.database.prepare("UPDATE tasks SET queue_position = ?, updated_at = ? WHERE task_id = ?");
-    const timestamp = currentTimestamp();
-    const changedQueuedTaskIds: string[] = [];
-    for (let index = 0; index < orderedTaskIds.length; index += 1) {
-        const taskId = orderedTaskIds[index];
-        const nextPosition = index + 1;
-        const current = readCurrentPosition.get(taskId) as { queue_position: number | null; state: TaskState; handoff_sender_task_id: string | null } | undefined;
-        assertCondition(current, `Cannot order unknown task: ${taskId}`);
-        if (current.queue_position !== nextPosition) {
-            updatePosition.run(nextPosition, timestamp, taskId);
-            if (current.state === "QUEUED" || (current.state === "RUNNING" && current.handoff_sender_task_id)) {
-                changedQueuedTaskIds.push(taskId);
-            }
-        }
-    }
-    const titleUpdates: ITitleUpdate[] = [];
-    for (const taskId of changedQueuedTaskIds) {
-        const queuedTask = requireTask(store, taskId);
-        titleUpdates.push({
-            taskId: queuedTask.task_id,
-            threadId: queuedTask.thread_id,
-            title: titleForTask(queuedTask)
-        });
-    }
-    return titleUpdates;
-}
-
-/**
- * Project title updates for queued tasks at or after an active queue position.
- * @param store Open project store.
- * @param minimumQueuePosition First active queue position whose queued titles may have changed.
- */
-function readQueuedTitleUpdates(store: IStore, minimumQueuePosition: number): ITitleUpdate[] {
-    const queuedTasks = store.database.prepare(`
-        ${TASK_WITH_QUEUED_POSITION_SELECT}
-        WHERE (task.state = 'QUEUED' OR (task.state = 'RUNNING' AND task.handoff_sender_task_id IS NOT NULL)) AND task.queue_position >= ?
-        ORDER BY task.queue_position, task.task_number
-    `).all(minimumQueuePosition) as ITaskRow[];
-    const titleUpdates: ITitleUpdate[] = [];
-    for (const queuedTask of queuedTasks) {
-        titleUpdates.push({
-            taskId: queuedTask.task_id,
-            threadId: queuedTask.thread_id,
-            title: titleForTask(queuedTask)
-        });
-    }
-    return titleUpdates;
-}
-
-/**
- * Read explicit blocking dependencies for one task.
- * @param store Open project store.
- * @param taskId Task whose dependencies should be read.
- */
-function readTaskDependencies(store: IStore, taskId: string): string[] {
-    const dependencyRows = store.database.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = ? ORDER BY depends_on_id").all(taskId) as Array<{ depends_on_id: string }>;
-    const dependencies: string[] = [];
-    for (const dependencyRow of dependencyRows) {
-        dependencies.push(dependencyRow.depends_on_id);
-    }
-    return dependencies;
-}
-
-/**
  * Reconstruct the task review packet from successfully processed append-only events.
  * @param store Open project store.
  * @param taskId Task whose review packet should be reconstructed.
@@ -1450,19 +465,14 @@ function readReviewPacketFromStore(store: IStore, taskId: string): IReviewPacket
         FROM events
         WHERE task_id = ?
             AND processed_at IS NOT NULL
-            AND kind IN ('MENTAL_MODEL_RECORDED', 'DECISION_RECORDED')
+            AND kind = 'DECISION_RECORDED'
         ORDER BY sequence
     `).all(validTaskId) as Array<{ kind: EventKind; payload_json: string; result_json: string | null }>;
-    const mentalModels: IMentalModel[] = [];
     const decisions: IDecision[] = [];
     const decisionsById = new Map<string, IDecision>();
     for (const row of rows) {
         const result = row.result_json ? JSON.parse(row.result_json) as Record<string, unknown> : {};
         const payload = JSON.parse(row.payload_json) as IEventPayload;
-        if (row.kind === "MENTAL_MODEL_RECORDED" && result.action === "MENTAL_MODEL_RECORDED") {
-            mentalModels.push(validateMentalModelPayload(payload));
-            continue;
-        }
         if (row.kind !== "DECISION_RECORDED" || result.action !== "DECISION_RECORDED") {
             continue;
         }
@@ -1490,16 +500,6 @@ function readReviewPacketFromStore(store: IStore, taskId: string): IReviewPacket
         decisions.push(decision);
         decisionsById.set(decisionId, decision);
     }
-    const baseline = mentalModels[0] || null;
-    const final = mentalModels.length > 0 ? mentalModels[mentalModels.length - 1] : null;
-    const changedFields: string[] = [];
-    if (baseline && final) {
-        for (const fieldName of MENTAL_MODEL_FIELDS) {
-            if (baseline[fieldName] !== final[fieldName]) {
-                changedFields.push(fieldName);
-            }
-        }
-    }
     const confidenceOrder: Record<DecisionConfidence, number> = { low: 0, medium: 1, high: 2 };
     const impactOrder: Record<DecisionImpact, number> = { high: 0, medium: 1, low: 2 };
     decisions.sort((left, right) => {
@@ -1509,24 +509,10 @@ function readReviewPacketFromStore(store: IStore, taskId: string): IReviewPacket
     });
     return {
         taskId: validTaskId,
-        baseline,
-        final,
-        changedFields,
         decisionCount: decisions.length,
         unresolvedDecisionIds: decisions.filter((decision) => decision.status === "unresolved").map((decision) => decision.decisionId),
         decisions
     };
-}
-
-/**
- * Require the task to have one successfully processed mental-model snapshot.
- * @param store Open project store.
- * @param taskId Task whose review contract is required.
- */
-function requireMentalModel(store: IStore, taskId: string): IReviewPacket {
-    const reviewPacket = readReviewPacketFromStore(store, taskId);
-    assertCondition(reviewPacket.baseline, `Review contract is missing for ${taskId}; record and process a mental model first.`);
-    return reviewPacket;
 }
 
 /**
@@ -1772,24 +758,6 @@ function applyDependencyEvent(store: IStore, task: ITaskRow, payload: IEventPayl
 }
 
 /**
- * Record one complete mental-model snapshot without mutating prior snapshots.
- * @param store Open project store.
- * @param task Current task row.
- * @param payload Mental-model event payload.
- */
-function applyMentalModelEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
-    assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record a mental model for ${task.task_id} from ${task.state}; request rework first when the task is in REVIEW.`);
-    const reviewPacket = readReviewPacketFromStore(store, task.task_id);
-    validateMentalModelPayload(payload);
-    store.database.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-    return {
-        action: "MENTAL_MODEL_RECORDED",
-        task: serializeTask(requireTask(store, task.task_id)),
-        baseline: reviewPacket.baseline === null
-    };
-}
-
-/**
  * Record one stable task-local macro decision in the append-only event log.
  * @param store Open project store.
  * @param task Current task row.
@@ -1797,7 +765,7 @@ function applyMentalModelEvent(store: IStore, task: ITaskRow, payload: IEventPay
  */
 function applyDecisionEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
     assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record a decision for ${task.task_id} from ${task.state}; request rework first when the task is in REVIEW.`);
-    const reviewPacket = requireMentalModel(store, task.task_id);
+    const reviewPacket = readReviewPacketFromStore(store, task.task_id);
     const validPayload = validateDecisionPayload(payload);
     if (validPayload.supersedesDecisionId) {
         requireCurrentDecision(reviewPacket, validPayload.supersedesDecisionId);
@@ -1878,21 +846,18 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         store.database.prepare("UPDATE tasks SET awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         return { action: "USER_INPUT_RECEIVED", task: serializeTask(requireTask(store, task.task_id)) };
     }
-    if (event.kind === "MENTAL_MODEL_RECORDED") {
-        return applyMentalModelEvent(store, task, payload);
-    }
     if (event.kind === "DECISION_RECORDED") {
         return applyDecisionEvent(store, task, payload);
     }
     if (event.kind === "REVIEW_REQUESTED") {
         if (task.state === "APPROVED" || task.state === "DONE") {
-            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: requireMentalModel(store, task.task_id) };
+            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: readReviewPacketFromStore(store, task.task_id) };
         }
         if (task.state === "REVIEW") {
-            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: requireMentalModel(store, task.task_id) };
+            return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: readReviewPacketFromStore(store, task.task_id) };
         }
         assertCondition(task.state === "RUNNING", `Cannot request review for ${task.task_id} from ${task.state}.`);
-        const reviewPacket = requireMentalModel(store, task.task_id);
+        const reviewPacket = readReviewPacketFromStore(store, task.task_id);
         store.database.prepare("UPDATE tasks SET state = 'REVIEW', awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "REVIEW_READY", task: serializeTask(refreshedTask), summary: payload.summary || null, reviewPacket };
@@ -1925,7 +890,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         const exclusionRequested = payload.cancelSource === "exclude";
         if (task.state === "CANCELED") {
             if (exclusionRequested) {
-                store.database.prepare("INSERT OR IGNORE INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(task.thread_id, payload.exclusionReason, currentTimestamp());
+                store.database.prepare("INSERT OR IGNORE INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(task.thread_id, validateCompactText(payload.exclusionReason, "Exclusion reason", 200, true)!, currentTimestamp());
             }
             return { action: "CANCELLATION_ALREADY_RECORDED", task: serializeTask(task), excluded: exclusionRequested, userRequestId: payload.userRequestId };
         }
@@ -1942,7 +907,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
             WHERE task_id = ?
         `).run(timestamp, task.task_id);
         if (exclusionRequested) {
-            store.database.prepare("INSERT OR IGNORE INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(task.thread_id, payload.exclusionReason, timestamp);
+            store.database.prepare("INSERT OR IGNORE INTO task_exclusions (thread_id, reason, created_at) VALUES (?, ?, ?)").run(task.thread_id, validateCompactText(payload.exclusionReason, "Exclusion reason", 200, true)!, timestamp);
         }
         const activeRows = store.database.prepare(`
             SELECT task_id FROM tasks
@@ -1983,7 +948,7 @@ function processPendingEvents(options: IControlRoomOptions): Record<string, unkn
             FROM events
             WHERE processed_at IS NULL
             ORDER BY sequence
-        `).all() as IEventRow[];
+        `).all() as unknown as IEventRow[];
         for (const event of pendingEvents) {
             beginTransaction(store.database);
             try {
@@ -1995,6 +960,9 @@ function processPendingEvents(options: IControlRoomOptions): Record<string, unkn
                 const previousTask = requireTask(store, event.task_id);
                 const result = applyPendingEvent(store, event);
                 const updatedTask = requireTask(store, event.task_id);
+                if (updatedTask.state !== "RUNNING") {
+                    store.database.prepare("UPDATE activation_deliveries SET state = 'CANCELED', updated_at = ? WHERE task_id = ? AND state IN ('PENDING', 'CLAIMED')").run(currentTimestamp(), updatedTask.task_id);
+                }
                 if (previousTask.handoff_sender_task_id && updatedTask.state !== "RUNNING") {
                     store.database.prepare("UPDATE tasks SET handoff_sender_task_id = NULL WHERE task_id = ?").run(updatedTask.task_id);
                     const sender = requireTask(store, previousTask.handoff_sender_task_id);
@@ -2049,7 +1017,7 @@ function dependenciesAreDone(store: IStore, taskId: string): boolean {
  * @param store Open project store.
  * @param taskId Task being activated.
  */
-function readActivationRequest(store: IStore, taskId: string): Record<string, unknown> | null {
+function readActivationRequest(store: IStore, taskId: string): IActivationRequest | null {
     const event = store.database.prepare(`
         SELECT event_key, kind, payload_json, created_at
         FROM events
@@ -2071,15 +1039,6 @@ function readActivationRequest(store: IStore, taskId: string): Record<string, un
         userRequestId: payload.userRequestId || null,
         requestedAt: event.created_at
     };
-}
-
-/**
- * Resolve the deterministic repository-local worktree path for one task.
- * @param projectRoot Canonical project root.
- * @param taskId Control Room task identifier.
- */
-function isolatedWorktreePathForTask(projectRoot: string, taskId: string): string {
-    return path.join(projectRoot, ".control-room", "worktrees", validateTaskId(taskId));
 }
 
 /**
@@ -2130,7 +1089,7 @@ function validateRecoverableIsolatedWorktree(projectRoot: string, worktreePath: 
  * @param options Project and optional state-root settings.
  * @param taskId Task requested for isolated activation.
  */
-function activateIsolatedTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
+function activateIsolatedTask(options: IControlRoomOptions, taskId: string): IActivationResult {
     const store = openStore(options);
     let createdWorktreePath: string | null = null;
     let createdWorkerBranch: string | null = null;
@@ -2172,20 +1131,10 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): Rec
         const runningTask = requireTask(store, task.task_id);
         const reviewPacket = readReviewPacketFromStore(store, task.task_id);
         const activationRequest = readActivationRequest(store, task.task_id);
-        const mentalModelRequired = reviewPacket.baseline === null;
         const titleUpdates = readQueuedTitleUpdates(store, task.queue_position || 1);
-        const instruction = mentalModelRequired ?
-            "Inspect the task context, record and settle a complete mental model, then use workspacePath for every file read, edit, command, and verification. Do not stage or commit; leave changes uncommitted for review." :
-            "Use workspacePath for every file read, edit, command, and verification. Do not stage or commit; leave changes uncommitted for review.";
-        commitTransaction(store.database);
-        return {
-            activated: true,
-            isolated: true,
-            recoveredActivation,
-            controlRoomTitle: titleForControlRoom(),
-            task: serializeTask(runningTask),
-            titleUpdates,
-            executionBrief: {
+        const instruction = "Use workspacePath for every file read, edit, command, and verification. Do not stage or commit; leave changes uncommitted for review.";
+        const executionBrief: IExecutionBrief = {
+                activationKey: nodeCrypto.randomUUID(),
                 taskId: runningTask.task_id,
                 threadId: runningTask.thread_id,
                 semanticName: runningTask.semantic_name,
@@ -2197,9 +1146,18 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): Rec
                 workerBranch,
                 dependencies: readTaskDependencies(store, runningTask.task_id),
                 reviewPacket,
-                mentalModelRequired,
                 instruction
-            }
+            };
+        persistActivation(store, executionBrief);
+        commitTransaction(store.database);
+        return {
+            activated: true,
+            isolated: true,
+            recoveredActivation,
+            controlRoomTitle: titleForControlRoom(),
+            task: serializeTask(runningTask),
+            titleUpdates,
+            executionBrief
         };
     } catch (error) {
         rollbackTransaction(store.database);
@@ -2222,18 +1180,18 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): Rec
  * Activate the first eligible queued task when the project is idle.
  * @param options Project and optional state-root settings.
  */
-function activateNextTask(options: IControlRoomOptions): Record<string, unknown> {
+function activateNextTask(options: IControlRoomOptions): IActivationResult {
     const store = openStore(options);
     try {
         beginTransaction(store.database);
         const project = requireProject(store);
-        const exclusiveTask = store.database.prepare("SELECT task_id, state FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as Record<string, unknown> | undefined;
+        const exclusiveTask = store.database.prepare("SELECT task_id, state FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as { task_id: string; state: TaskState } | undefined;
         if (exclusiveTask) {
             const controlRoomTitle = titleForControlRoom();
             commitTransaction(store.database);
             return { activated: false, controlRoomTitle, reason: "ACTIVE_TASK_PRESENT", taskId: exclusiveTask.task_id, state: exclusiveTask.state };
         }
-        const queuedTasks = store.database.prepare("SELECT * FROM tasks WHERE state = 'QUEUED' AND workspace_mode = 'shared' ORDER BY queue_position, task_number").all() as ITaskRow[];
+        const queuedTasks = store.database.prepare("SELECT * FROM tasks WHERE state = 'QUEUED' AND workspace_mode = 'shared' ORDER BY queue_position, task_number").all() as unknown as ITaskRow[];
         let selectedTask: ITaskRow | undefined;
         for (const queuedTask of queuedTasks) {
             if (dependenciesAreDone(store, queuedTask.task_id)) {
@@ -2247,7 +1205,6 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
             return { activated: false, controlRoomTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
         }
         const reviewPacket = readReviewPacketFromStore(store, selectedTask.task_id);
-        const mentalModelRequired = reviewPacket.baseline === null;
         const workerBranch = workerBranchForTask(selectedTask.task_id);
         const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
         const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
@@ -2303,16 +1260,9 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
         const activationRequest = readActivationRequest(store, selectedTask.task_id);
         const titleUpdates = readQueuedTitleUpdates(store, selectedTask.queue_position || 1);
         const controlRoomTitle = titleForControlRoom();
-        const instruction =
-            mentalModelRequired ? "Inspect the task context, record and settle a complete mental model before modifying project files, then implement on the active worker branch without staging or committing. Leave all changes uncommitted for review." :
-            "Implement on the active worker branch without staging or committing. Leave all changes uncommitted for review.";
-        commitTransaction(store.database);
-        return {
-            activated: true,
-            controlRoomTitle,
-            task: serializeTask(runningTask),
-            titleUpdates,
-            executionBrief: {
+        const instruction = "Implement on the active worker branch without staging or committing. Leave all changes uncommitted for review.";
+        const executionBrief: IExecutionBrief = {
+                activationKey: nodeCrypto.randomUUID(),
                 taskId: runningTask.task_id,
                 threadId: runningTask.thread_id,
                 semanticName: runningTask.semantic_name,
@@ -2321,12 +1271,19 @@ function activateNextTask(options: IControlRoomOptions): Record<string, unknown>
                 activationRequest,
                 baseCommit: runningTask.base_commit,
                 baseBranch: project.base_branch,
-                workerBranch: runningTask.branch_name,
+                workerBranch,
                 dependencies: readTaskDependencies(store, runningTask.task_id),
                 reviewPacket,
-                mentalModelRequired,
                 instruction
-            }
+            };
+        persistActivation(store, executionBrief);
+        commitTransaction(store.database);
+        return {
+            activated: true,
+            controlRoomTitle,
+            task: serializeTask(runningTask),
+            titleUpdates,
+            executionBrief
         };
     } catch (error) {
         rollbackTransaction(store.database);
@@ -2382,344 +1339,6 @@ function resumeTask(options: IControlRoomOptions, taskId: string): Record<string
 }
 
 /**
- * Run a Git command with fixed executable and argument boundaries.
- * @param projectRoot Canonical repository root used as working directory.
- * @param argumentsList Git arguments passed without a shell.
- */
-function runGit(projectRoot: string, argumentsList: string[]): IGitResult {
-    const result = childProcess.spawnSync("git", argumentsList, {
-        cwd: projectRoot,
-        encoding: "utf8",
-        maxBuffer: 1024 * 1024,
-        shell: false
-    });
-    return {
-        status: result.status,
-        stdout: typeof result.stdout === "string" ? result.stdout.trim() : "",
-        stderr: typeof result.stderr === "string" ? result.stderr.trim() : ""
-    };
-}
-
-/**
- * Require a successful Git command and return its standard output.
- * @param projectRoot Canonical repository root used as working directory.
- * @param argumentsList Git arguments passed without a shell.
- * @param operation Human-readable operation used in failures.
- */
-function requireGit(projectRoot: string, argumentsList: string[], operation: string): string {
-    const result = runGit(projectRoot, argumentsList);
-    assertCondition(result.status === 0, `${operation} failed: ${result.stderr || result.stdout || `exit ${String(result.status)}`}`);
-    return result.stdout;
-}
-
-/**
- * Require a named branch to be the current checkout and return HEAD.
- * @param projectRoot Canonical repository root used as working directory.
- * @param branchName Expected current branch.
- */
-function requireBranchCheckout(projectRoot: string, branchName: string): string {
-    const validBranchName = validateBranchName(branchName);
-    const repositoryRoot = requireGit(projectRoot, ["rev-parse", "--show-toplevel"], "Resolve Git repository");
-    assertCondition(fs.realpathSync(repositoryRoot) === projectRoot, "Git repository root does not match the Control Room project root.");
-    const currentBranch = requireGit(projectRoot, ["branch", "--show-current"], "Resolve current branch");
-    assertCondition(currentBranch === validBranchName, `ControlRoom requires branch ${validBranchName}; found ${currentBranch || "detached HEAD"}.`);
-    return validateCommitId(requireGit(projectRoot, ["rev-parse", "HEAD"], "Resolve current head"));
-}
-
-/**
- * Require the configured base branch to be the current checkout and return HEAD.
- * @param projectRoot Canonical repository root used as working directory.
- * @param baseBranch Configured shared base branch.
- */
-function requireBaseCheckout(projectRoot: string, baseBranch: string): string {
-    return requireBranchCheckout(projectRoot, baseBranch);
-}
-
-/**
- * Read staged, unstaged, and untracked working-tree changes.
- * @param projectRoot Canonical repository root used as working directory.
- */
-function readWorkingTreeStatus(projectRoot: string): string {
-    return requireGit(projectRoot, ["status", "--porcelain", "--untracked-files=all"], "Inspect working tree");
-}
-
-/**
- * Resolve the current commit or return null when HEAD is unborn.
- * @param projectRoot Canonical repository root used as working directory.
- */
-function resolveCurrentHeadIfExists(projectRoot: string): string | null {
-    const result = runGit(projectRoot, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-    assertCondition(result.status === 0 || result.status === 1, `Resolve current head failed: ${result.stderr || result.stdout || `exit ${String(result.status)}`}`);
-    return result.status === 0 ? validateCommitId(result.stdout) : null;
-}
-
-/**
- * Resolve a local branch commit or return null when the branch is unborn or absent.
- * @param projectRoot Canonical repository root used as working directory.
- * @param branchName Local branch name without a refs prefix.
- */
-function resolveLocalBranchHeadIfExists(projectRoot: string, branchName: string): string | null {
-    const validBranchName = validateBranchName(branchName);
-    const branchResult = runGit(projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${validBranchName}`]);
-    assertCondition(branchResult.status === 0 || branchResult.status === 1, `Inspect local branch ${validBranchName} failed: ${branchResult.stderr || branchResult.stdout || `exit ${String(branchResult.status)}`}`);
-    return branchResult.status === 0 ? resolveLocalBranchHead(projectRoot, validBranchName) : null;
-}
-
-/**
- * Resolve an unambiguous local branch head commit.
- * @param projectRoot Canonical repository root used as working directory.
- * @param branchName Local branch name without a refs prefix.
- */
-function resolveLocalBranchHead(projectRoot: string, branchName: string): string {
-    const validBranchName = validateBranchName(branchName);
-    const branchReference = `refs/heads/${validBranchName}^{commit}`;
-    return validateCommitId(requireGit(projectRoot, ["rev-parse", "--verify", branchReference], `Resolve local branch ${validBranchName}`));
-}
-
-/**
- * Determine whether a commit has exactly the expected parent, including a root commit.
- * @param projectRoot Canonical repository root used as working directory.
- * @param commitId Commit whose parent list should be inspected.
- * @param expectedParentCommit Expected sole parent, or null for a root commit.
- */
-function commitHasExpectedParent(projectRoot: string, commitId: string, expectedParentCommit: string | null): boolean {
-    const validCommitId = validateCommitId(commitId);
-    const parentsResult = runGit(projectRoot, ["rev-list", "--parents", "--max-count=1", validCommitId]);
-    if (parentsResult.status !== 0) {
-        return false;
-    }
-    const commitParts = parentsResult.stdout.split(/\s+/u);
-    if (commitParts[0] !== validCommitId) {
-        return false;
-    }
-    if (expectedParentCommit === null) {
-        return commitParts.length === 1;
-    }
-    return commitParts.length === 2 && commitParts[1] === validateCommitId(expectedParentCommit);
-}
-
-/**
- * Determine whether a commit is the single approval commit expected after a recorded parent.
- * @param projectRoot Canonical repository root used as working directory.
- * @param commitId Candidate approval commit.
- * @param parentCommitId Recorded pre-approval parent commit, or null for an unborn repository.
- * @param expectedSubject Expected approval commit subject.
- */
-function commitMatchesApproval(projectRoot: string, commitId: string, parentCommitId: string | null, expectedSubject: string): boolean {
-    if (parentCommitId && commitId === parentCommitId) {
-        return false;
-    }
-    if (!commitHasExpectedParent(projectRoot, commitId, parentCommitId)) {
-        return false;
-    }
-    const subjectResult = runGit(projectRoot, ["log", "-1", "--format=%s", commitId]);
-    return subjectResult.status === 0 && subjectResult.stdout === expectedSubject;
-}
-
-/**
- * Create the first base branch ref at an approved commit.
- * @param projectRoot Canonical repository root used as working directory.
- * @param baseBranch Configured base branch.
- * @param commitId Approved commit used as the initial base tip.
- */
-function createInitialBaseBranch(projectRoot: string, baseBranch: string, commitId: string): void {
-    const validBaseBranch = validateBranchName(baseBranch);
-    const validCommitId = validateCommitId(commitId);
-    assertCondition(resolveLocalBranchHeadIfExists(projectRoot, validBaseBranch) === null, `Base branch ${validBaseBranch} was created concurrently.`);
-    requireGit(projectRoot, ["branch", validBaseBranch, validCommitId], `Create initial base branch ${validBaseBranch}`);
-}
-
-/**
- * Read the first meaningful commit subject accepted for a task.
- * @param store Open project store.
- * @param task Approved task whose commit subject is required.
- */
-function readApprovalCommitMessage(store: IStore, task: ITaskRow): string {
-    const approvalEvents = task.approval_event_key ?
-        store.database.prepare(`
-            SELECT payload_json, result_json
-            FROM events
-            WHERE task_id = ? AND event_key = ? AND kind = 'APPROVAL_REQUESTED' AND processed_at IS NOT NULL
-            ORDER BY sequence
-        `).all(task.task_id, task.approval_event_key) as Array<{ payload_json: string; result_json: string | null }> :
-        store.database.prepare(`
-            SELECT payload_json, result_json
-            FROM events
-            WHERE task_id = ? AND kind = 'APPROVAL_REQUESTED' AND processed_at IS NOT NULL
-            ORDER BY sequence
-        `).all(task.task_id) as Array<{ payload_json: string; result_json: string | null }>;
-    for (const approvalEvent of approvalEvents) {
-        if (!approvalEvent.result_json) {
-            continue;
-        }
-        const approvalResult = JSON.parse(approvalEvent.result_json) as { action?: string };
-        if (approvalResult.action !== "APPROVED" && approvalResult.action !== "APPROVAL_ALREADY_RECORDED") {
-            continue;
-        }
-        const approvalPayload = JSON.parse(approvalEvent.payload_json) as IEventPayload;
-        if (approvalPayload.commitMessage !== undefined) {
-            return validateApprovalCommitMessage(task, approvalPayload.commitMessage);
-        }
-    }
-    throw new Error(`${task.task_id} has no successful approval event with a commit message.`);
-}
-
-/**
- * Compact active queue positions after a task leaves the active queue.
- * @param store Open project store.
- */
-function compactActiveQueue(store: IStore): ITitleUpdate[] {
-    const rows = store.database.prepare(`
-        SELECT task_id FROM tasks
-        WHERE state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
-        ORDER BY queue_position IS NULL, queue_position, task_number
-    `).all() as Array<{ task_id: string }>;
-    const taskIds: string[] = [];
-    for (const row of rows) {
-        taskIds.push(row.task_id);
-    }
-    return writeQueueOrder(store, taskIds);
-}
-
-/**
- * Resolve and validate the working directory owned by one active task.
- * @param store Open project store.
- * @param task Active task row.
- */
-function resolveTaskWorkspace(store: IStore, task: ITaskRow): string {
-    if (task.workspace_mode === "shared") {
-        return store.projectRoot;
-    }
-    assertCondition(task.worktree_path, `${task.task_id} has no isolated worktree path.`);
-    const expectedPath = isolatedWorktreePathForTask(store.projectRoot, task.task_id);
-    assertCondition(path.resolve(task.worktree_path) === expectedPath, `Stored worktree path is invalid for ${task.task_id}: ${task.worktree_path}`);
-    assertCondition(!pathIsSymbolicLink(path.join(store.projectRoot, ".control-room")), `ControlRoom directory cannot be a symbolic link: ${path.join(store.projectRoot, ".control-room")}`);
-    assertCondition(!pathIsSymbolicLink(path.join(store.projectRoot, ".control-room", "worktrees")), `ControlRoom worktrees directory cannot be a symbolic link: ${path.join(store.projectRoot, ".control-room", "worktrees")}`);
-    assertCondition(fs.existsSync(expectedPath) && fs.statSync(expectedPath).isDirectory(), `Isolated worktree is missing for ${task.task_id}: ${expectedPath}`);
-    assertCondition(!pathIsSymbolicLink(expectedPath), `Isolated worktree cannot be a symbolic link: ${expectedPath}`);
-    const repositoryRoot = requireGit(expectedPath, ["rev-parse", "--show-toplevel"], `Resolve isolated repository for ${task.task_id}`);
-    assertCondition(fs.realpathSync(repositoryRoot) === fs.realpathSync(expectedPath), `Isolated repository root does not match ${task.task_id}.`);
-    const commonDirectory = requireGit(expectedPath, ["rev-parse", "--git-common-dir"], `Resolve isolated common Git directory for ${task.task_id}`);
-    assertCondition(fs.realpathSync(path.resolve(expectedPath, commonDirectory)) === fs.realpathSync(path.join(store.projectRoot, ".git")), `Isolated worktree does not belong to ${store.projectRoot}.`);
-    assertCondition(task.branch_name, `${task.task_id} has no worker branch.`);
-    requireBranchCheckout(expectedPath, task.branch_name);
-    return expectedPath;
-}
-
-/**
- * Remove a clean isolated worktree and delete its exact worker branch ref.
- * @param store Open project store.
- * @param task Isolated task being finalized.
- * @param workerCommit Expected worker branch commit.
- */
-function removeIsolatedWorkspace(store: IStore, task: ITaskRow, workerCommit: string): void {
-    assertCondition(task.workspace_mode === "isolated" && task.worktree_path && task.branch_name, `${task.task_id} has no removable isolated workspace.`);
-    assertCondition(readWorkingTreeStatus(task.worktree_path).length === 0, `Cannot remove dirty isolated worktree for ${task.task_id}.`);
-    assertCondition(resolveLocalBranchHead(store.projectRoot, task.branch_name) === validateCommitId(workerCommit), `Worker branch moved before cleanup for ${task.task_id}.`);
-    requireGit(store.projectRoot, ["worktree", "remove", task.worktree_path], `Remove isolated worktree for ${task.task_id}`);
-    requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete worker branch ${task.branch_name}`);
-}
-
-/**
- * Release an unchanged shared worker branch after approval.
- * @param store Open project store.
- * @param project Initialized project record.
- * @param task Approved shared task releasing its workspace.
- */
-function releaseSharedWorkerBranch(store: IStore, project: IProjectRow, task: ITaskRow): boolean {
-    if (task.workspace_mode !== "shared" || !task.branch_name || task.branch_name === project.base_branch) {
-        return false;
-    }
-    const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch before releasing workspace");
-    assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Cannot release ${task.task_id} while the primary checkout is on unrelated branch ${currentBranch || "detached HEAD"}.`);
-    const workerCommit = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
-    if (!workerCommit) {
-        assertCondition(task.base_commit === null && currentBranch === task.branch_name, `Worker branch ${task.branch_name} disappeared before ${task.task_id} released its workspace.`);
-        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} for ${task.task_id}.`);
-        requireGit(store.projectRoot, ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], `Restore unborn base branch ${project.base_branch}`);
-        return true;
-    }
-    assertCondition(workerCommit === task.base_commit, `Worker branch ${task.branch_name} contains commits that were not integrated for ${task.task_id}.`);
-    if (currentBranch === task.branch_name) {
-        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} for ${task.task_id}.`);
-        requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
-    }
-    requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete released worker branch ${task.branch_name}`);
-    return true;
-}
-
-/**
- * Clean up one canceled isolated task only when its workspace is unchanged.
- * @param options Project and optional state-root settings.
- * @param taskId Canceled isolated task identifier.
- */
-function cleanupCanceledIsolatedTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
-    const store = openStore(options);
-    try {
-        requireProject(store);
-        const task = requireTask(store, taskId);
-        assertCondition(task.state === "CANCELED" && task.workspace_mode === "isolated", `${task.task_id} is not a canceled isolated task.`);
-        if (!task.worktree_path && !task.branch_name) {
-            return { taskId: task.task_id, removed: false, alreadyCleaned: true };
-        }
-        assertCondition(task.worktree_path && task.branch_name, `${task.task_id} has incomplete isolated workspace metadata.`);
-        const workspaceExists = fs.existsSync(task.worktree_path);
-        const branchCommit = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
-        if (!workspaceExists && !branchCommit) {
-            beginTransaction(store.database);
-            store.database.prepare("UPDATE tasks SET branch_name = NULL, worktree_path = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-            commitTransaction(store.database);
-            return { taskId: task.task_id, removed: true, recoveredMetadata: true };
-        }
-        if (!workspaceExists && branchCommit === task.base_commit) {
-            requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, branchCommit], `Complete canceled branch cleanup for ${task.task_id}`);
-            beginTransaction(store.database);
-            store.database.prepare("UPDATE tasks SET branch_name = NULL, worktree_path = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-            commitTransaction(store.database);
-            return { taskId: task.task_id, removed: true, recoveredMetadata: true };
-        }
-        if (!workspaceExists || !branchCommit) {
-            return { taskId: task.task_id, removed: false, preserved: true, reason: "INCOMPLETE_WORKSPACE", worktreePath: task.worktree_path, branchName: task.branch_name };
-        }
-        const workspacePath = resolveTaskWorkspace(store, task);
-        if (readWorkingTreeStatus(workspacePath).length > 0) {
-            return { taskId: task.task_id, removed: false, preserved: true, reason: "DIRTY_WORKSPACE", worktreePath: workspacePath, branchName: task.branch_name };
-        }
-        if (branchCommit !== task.base_commit) {
-            return { taskId: task.task_id, removed: false, preserved: true, reason: "TASK_COMMITS_PRESENT", worktreePath: workspacePath, branchName: task.branch_name };
-        }
-        removeIsolatedWorkspace(store, task, branchCommit);
-        beginTransaction(store.database);
-        const change = store.database.prepare("UPDATE tasks SET branch_name = NULL, worktree_path = NULL, updated_at = ? WHERE task_id = ? AND state = 'CANCELED'").run(currentTimestamp(), task.task_id);
-        assertCondition(Number(change.changes) === 1, `${task.task_id} changed state during isolated cleanup.`);
-        commitTransaction(store.database);
-        return { taskId: task.task_id, removed: true, recoveredMetadata: false };
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
-    } finally {
-        store.database.close();
-    }
-}
-
-/**
- * Reconcile every canceled isolated workspace after event processing.
- * @param options Project and optional state-root settings.
- */
-function cleanupCanceledIsolatedTasks(options: IControlRoomOptions): Record<string, unknown>[] {
-    const store = openStore(options);
-    let taskIds: string[];
-    try {
-        requireProject(store);
-        const rows = store.database.prepare("SELECT task_id FROM tasks WHERE state = 'CANCELED' AND workspace_mode = 'isolated' AND (worktree_path IS NOT NULL OR branch_name IS NOT NULL) ORDER BY task_number").all() as Array<{ task_id: string }>;
-        taskIds = rows.map((row) => row.task_id);
-    } finally {
-        store.database.close();
-    }
-    return taskIds.map((taskId) => cleanupCanceledIsolatedTask(options, taskId));
-}
-
-/**
  * Read dependency-eligible isolated tasks that still require activation.
  * @param options Project and optional state-root settings.
  */
@@ -2727,379 +1346,8 @@ function readEligibleIsolatedTaskIds(options: IControlRoomOptions): string[] {
     const store = openStore(options);
     try {
         requireProject(store);
-        const queuedTasks = store.database.prepare("SELECT * FROM tasks WHERE state = 'QUEUED' AND workspace_mode = 'isolated' ORDER BY queue_position, task_number").all() as ITaskRow[];
+        const queuedTasks = store.database.prepare("SELECT * FROM tasks WHERE state = 'QUEUED' AND workspace_mode = 'isolated' ORDER BY queue_position, task_number").all() as unknown as ITaskRow[];
         return queuedTasks.filter((task) => dependenciesAreDone(store, task.task_id)).map((task) => task.task_id);
-    } finally {
-        store.database.close();
-    }
-}
-
-/**
- * Create a linear integration commit on the latest base without changing a working tree.
- * @param projectRoot Canonical project root.
- * @param baseCommit Latest base branch commit.
- * @param approvedCommit Approved worker branch commit.
- * @param commitMessage Approved commit subject.
- */
-function buildLinearIntegrationCommit(projectRoot: string, baseCommit: string, approvedCommit: string, commitMessage: string): Record<string, unknown> {
-    const ancestorResult = runGit(projectRoot, ["merge-base", "--is-ancestor", baseCommit, approvedCommit]);
-    assertCondition(ancestorResult.status === 0 || ancestorResult.status === 1, `Inspect integration ancestry failed: ${ancestorResult.stderr || ancestorResult.stdout}`);
-    if (ancestorResult.status === 0) {
-        return { integrated: true, commitId: approvedCommit };
-    }
-    const mergeResult = runGit(projectRoot, ["merge-tree", "--write-tree", "--messages", baseCommit, approvedCommit]);
-    if (mergeResult.status === 1) {
-        return { integrated: false, details: mergeResult.stdout || mergeResult.stderr || "Git reported an integration conflict." };
-    }
-    assertCondition(mergeResult.status === 0, `Build integration tree failed: ${mergeResult.stderr || mergeResult.stdout}`);
-    const treeId = mergeResult.stdout.split(/\r?\n/u)[0];
-    assertCondition(COMMIT_PATTERN.test(treeId), `Git returned an invalid integration tree: ${treeId}`);
-    const integratedCommit = validateCommitId(requireGit(projectRoot, ["commit-tree", treeId, "-p", baseCommit, "-m", commitMessage], "Create linear integration commit"));
-    return { integrated: true, commitId: integratedCommit };
-}
-
-/**
- * Advance the configured base branch atomically without disturbing an active shared worker.
- * @param store Open project store.
- * @param project Initialized project row.
- * @param baseCommit Expected current base commit.
- * @param integratedCommit New linear base commit.
- */
-function advanceBaseBranch(store: IStore, project: IProjectRow, baseCommit: string, integratedCommit: string): void {
-    const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve primary checkout branch");
-    if (currentBranch === project.base_branch) {
-        assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === baseCommit, `${project.base_branch} moved before integration.`);
-        requireGit(store.projectRoot, ["merge", "--ff-only", integratedCommit], `Advance ${project.base_branch}`);
-        return;
-    }
-    const activeSharedTask = store.database.prepare("SELECT branch_name FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as { branch_name: string | null } | undefined;
-    assertCondition(activeSharedTask?.branch_name === currentBranch, `Cannot advance ${project.base_branch} while the primary checkout is on unrelated branch ${currentBranch || "detached HEAD"}.`);
-    requireGit(store.projectRoot, ["update-ref", `refs/heads/${project.base_branch}`, integratedCommit, baseCommit], `Advance ${project.base_branch}`);
-}
-
-/**
- * Block a task after a conflict while preserving its committed worker branch and worktree.
- * @param store Open project store.
- * @param task Conflicting approved task.
- * @param approvedCommit Commit that could not be integrated.
- * @param details Git conflict details.
- */
-function recordIntegrationConflict(store: IStore, task: ITaskRow, approvedCommit: string, details: string): Record<string, unknown> {
-    beginTransaction(store.database);
-    try {
-        const project = requireProject(store);
-        assertCondition(project.integration_task_id === task.task_id, `Commit lease for ${task.task_id} was lost.`);
-        store.database.prepare(`
-            UPDATE tasks
-            SET state = 'BLOCKED', blocked_from_state = 'RUNNING', awaiting_user = 0,
-                approved_commit = ?, integrated_commit = NULL, updated_at = ?
-            WHERE task_id = ?
-        `).run(approvedCommit, currentTimestamp(), task.task_id);
-        store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-        const blockedTask = requireTask(store, task.task_id);
-        commitTransaction(store.database);
-        return {
-            committed: true,
-            integrated: false,
-            integrationConflict: true,
-            conflictDetails: details,
-            controlRoomTitle: titleForControlRoom(),
-            gitMode: GIT_MODE,
-            task: serializeTask(blockedTask),
-            instruction: "Resume the blocked task, resolve the conflict against the latest base in the preserved task workspace, then request review and approval again."
-        };
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
-    }
-}
-
-/**
- * Finalize a successful approved commit in persistent state.
- * @param store Open project store.
- * @param taskId Approved task identifier.
- * @param committedCommit Commit created by approval.
- * @param merged Whether approval fast-forwarded the base branch.
- * @param branchDeleted Whether approval deleted the worker branch.
- */
-function finalizeApprovedCommit(store: IStore, taskId: string, committedCommit: string, merged: boolean, branchDeleted: boolean): Record<string, unknown> {
-    beginTransaction(store.database);
-    try {
-        const project = requireProject(store);
-        const task = requireTask(store, taskId);
-        assertCondition(project.integration_task_id === task.task_id, `Commit lease for ${task.task_id} was lost.`);
-        assertCondition(task.state === "APPROVED", `Cannot finalize ${task.task_id} from ${task.state}.`);
-        const finalState = task.approval_target;
-        if (branchDeleted || finalState === "PAUSED") {
-            store.database.prepare(`
-                UPDATE tasks
-                SET state = ?, branch_name = NULL, worktree_path = NULL, awaiting_user = 0,
-                    integrated_commit = ?, queue_position = NULL, updated_at = ?
-                WHERE task_id = ?
-            `).run(finalState, committedCommit, currentTimestamp(), task.task_id);
-        } else {
-            store.database.prepare(`
-                UPDATE tasks
-                SET state = ?, awaiting_user = 0, integrated_commit = ?, queue_position = NULL, updated_at = ?
-                WHERE task_id = ?
-            `).run(finalState, committedCommit, currentTimestamp(), task.task_id);
-        }
-        store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-        const titleUpdates = compactActiveQueue(store);
-        const completedTask = requireTask(store, task.task_id);
-        commitTransaction(store.database);
-        return { committed: true, merged, branchDeleted, approvalTarget: finalState, controlRoomTitle: titleForControlRoom(), gitMode: GIT_MODE, task: serializeTask(completedTask), titleUpdates };
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
-    }
-}
-
-/**
- * Complete an approved task, committing dirty changes on the current task or base branch when needed.
- * @param options Project and optional state-root settings.
- * @param taskId Approved task identifier.
- */
-function commitApprovedTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
-    const store = openStore(options);
-    let leaseAcquired = false;
-    try {
-        beginTransaction(store.database);
-        const project = requireProject(store);
-        const task = requireTask(store, taskId);
-        if (task.state === "DONE" || task.state === "PAUSED") {
-            commitTransaction(store.database);
-            return {
-                committed: false,
-                alreadyFinalized: true,
-                alreadyCompleted: task.state === "DONE",
-                alreadyCommitted: Boolean(task.integrated_commit),
-                controlRoomTitle: titleForControlRoom(),
-                gitMode: GIT_MODE,
-                task: serializeTask(task)
-            };
-        }
-        assertCondition(task.state === "APPROVED", `Cannot commit ${task.task_id} from ${task.state}.`);
-        assertCondition(!project.integration_task_id, `Commit lease is already held by ${project.integration_task_id}; use recover-commit only after confirming the prior process ended.`);
-        const workspacePath = resolveTaskWorkspace(store, task);
-        const currentHead = resolveCurrentHeadIfExists(workspacePath);
-        const workingTreeStatus = readWorkingTreeStatus(workspacePath);
-        const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Resolve current branch");
-        const commitsOnBase = currentBranch === project.base_branch;
-        assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
-        const workerBranchHasCommits = currentBranch === task.branch_name && currentHead !== task.base_commit;
-        if (workingTreeStatus.length === 0 && !task.approved_commit && !workerBranchHasCommits) {
-            if (task.workspace_mode === "isolated") {
-                assertCondition(currentHead, `${task.task_id} has no worktree commit.`);
-                removeIsolatedWorkspace(store, task, currentHead);
-            } else if (task.approval_target === "PAUSED" || !commitsOnBase) {
-                releaseSharedWorkerBranch(store, project, task);
-            }
-            const releaseWorkspace = task.workspace_mode === "isolated" || task.approval_target === "PAUSED" || !commitsOnBase;
-            store.database.prepare("UPDATE tasks SET state = ?, branch_name = CASE WHEN ? THEN NULL ELSE branch_name END, worktree_path = NULL, awaiting_user = 0, queue_position = NULL, updated_at = ? WHERE task_id = ?").run(task.approval_target, Number(releaseWorkspace), currentTimestamp(), task.task_id);
-            const titleUpdates = compactActiveQueue(store);
-            const completedTask = requireTask(store, task.task_id);
-            commitTransaction(store.database);
-            return {
-                committed: false,
-                dequeued: true,
-                noUncommittedChanges: true,
-                approvalTarget: task.approval_target,
-                controlRoomTitle: titleForControlRoom(),
-                gitMode: GIT_MODE,
-                task: serializeTask(completedTask),
-                titleUpdates
-            };
-        }
-        const commitMessage = readApprovalCommitMessage(store, task);
-        const timestamp = currentTimestamp();
-        store.database.prepare("UPDATE tasks SET reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(currentHead, timestamp, task.task_id);
-        store.database.prepare("UPDATE projects SET integration_task_id = ?, integration_started_at = ?, updated_at = ? WHERE project_key = ?").run(task.task_id, timestamp, timestamp, store.projectKey);
-        commitTransaction(store.database);
-        leaseAcquired = true;
-
-        let committedCommit = task.approved_commit;
-        if (workingTreeStatus.length > 0) {
-            requireGit(workspacePath, ["add", "-A", "--", "."], "Stage approved changes");
-            const stagedDifference = currentHead ? runGit(workspacePath, ["diff", "--cached", "--quiet", "HEAD", "--"]) : runGit(workspacePath, ["diff", "--cached", "--quiet", "--"]);
-            assertCondition(stagedDifference.status === 1, stagedDifference.status === 0 ? "Approval produced no staged changes." : `Inspect staged changes failed: ${stagedDifference.stderr || stagedDifference.stdout}`);
-            requireGit(workspacePath, ["commit", "--message", commitMessage], "Commit approved changes");
-            committedCommit = validateCommitId(requireGit(workspacePath, ["rev-parse", "HEAD"], "Resolve approved commit"));
-            assertCondition(commitHasExpectedParent(workspacePath, committedCommit, currentHead), currentHead ? `Approved commit does not have expected parent ${currentHead}.` : "Approved initial commit is not a root commit.");
-        } else if (workerBranchHasCommits) {
-            committedCommit = currentHead;
-        }
-        assertCondition(committedCommit, `${task.task_id} has no approved commit to integrate.`);
-        beginTransaction(store.database);
-        store.database.prepare("UPDATE tasks SET approved_commit = ?, updated_at = ? WHERE task_id = ?").run(committedCommit, currentTimestamp(), task.task_id);
-        commitTransaction(store.database);
-        if (commitsOnBase) {
-            const branchDeleted = task.approval_target === "PAUSED" ? releaseSharedWorkerBranch(store, project, task) : false;
-            return finalizeApprovedCommit(store, task.task_id, committedCommit, false, branchDeleted);
-        }
-        assertCondition(task.branch_name, `${task.task_id} has no worker branch.`);
-        const currentBaseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
-        if (!currentBaseCommit) {
-            assertCondition(task.workspace_mode === "shared", "Isolated execution requires an existing base commit.");
-            createInitialBaseBranch(store.projectRoot, project.base_branch, committedCommit);
-            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out initial base branch ${project.base_branch}`);
-            assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === committedCommit, `${project.base_branch} did not reach initial approved commit ${committedCommit}.`);
-            requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, committedCommit], `Delete worker branch ${task.branch_name}`);
-            return finalizeApprovedCommit(store, task.task_id, committedCommit, true, true);
-        }
-        const integration = buildLinearIntegrationCommit(store.projectRoot, currentBaseCommit, committedCommit, commitMessage);
-        if (!integration.integrated) {
-            return recordIntegrationConflict(store, requireTask(store, task.task_id), committedCommit, String(integration.details));
-        }
-        const integratedCommit = validateCommitId(String(integration.commitId));
-        beginTransaction(store.database);
-        store.database.prepare("UPDATE tasks SET integrated_commit = ?, updated_at = ? WHERE task_id = ?").run(integratedCommit, currentTimestamp(), task.task_id);
-        commitTransaction(store.database);
-        advanceBaseBranch(store, project, currentBaseCommit, integratedCommit);
-        if (task.workspace_mode === "isolated") {
-            removeIsolatedWorkspace(store, task, committedCommit);
-        } else {
-            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
-            requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, committedCommit], `Delete worker branch ${task.branch_name}`);
-        }
-        return finalizeApprovedCommit(store, task.task_id, integratedCommit, true, true);
-    } catch (error) {
-        rollbackTransaction(store.database);
-        const message = error instanceof Error ? error.message : String(error);
-        if (leaseAcquired) {
-            throw new Error(`${message} The commit lease remains active; run recover-commit only after confirming this process ended.`);
-        }
-        throw error;
-    } finally {
-        store.database.close();
-    }
-}
-
-/**
- * Recover a commit lease after confirming the previous commit process ended.
- * @param options Project and optional state-root settings.
- * @param taskId Task holding the stale commit lease.
- */
-function recoverCommit(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
-    const store = openStore(options);
-    try {
-        const project = requireProject(store);
-        const task = requireTask(store, taskId);
-        if (task.state === "DONE" || task.state === "PAUSED") {
-            return {
-                recovered: false,
-                alreadyFinalized: true,
-                alreadyCompleted: task.state === "DONE",
-                alreadyCommitted: Boolean(task.integrated_commit),
-                controlRoomTitle: titleForControlRoom(),
-                task: serializeTask(task)
-            };
-        }
-        assertCondition(project.integration_task_id === task.task_id, `${task.task_id} does not hold the commit lease.`);
-        const hasRecoverableAnchor = Boolean(task.base_commit && task.reviewed_commit) || task.base_commit === null;
-        assertCondition(task.state === "APPROVED" && hasRecoverableAnchor, `${task.task_id} does not have a recoverable approval.`);
-        if (task.workspace_mode === "isolated") {
-            assertCondition(task.branch_name && task.worktree_path, `${task.task_id} has no recoverable isolated workspace.`);
-            const currentBaseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
-            const expectedSubject = readApprovalCommitMessage(store, task);
-            if (task.integrated_commit && currentBaseCommit === task.integrated_commit) {
-                if (fs.existsSync(task.worktree_path)) {
-                    const workerCommit = resolveLocalBranchHead(store.projectRoot, task.branch_name);
-                    removeIsolatedWorkspace(store, task, workerCommit);
-                } else {
-                    const remainingBranch = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
-                    if (remainingBranch) {
-                        requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, remainingBranch], `Delete recovered worker branch ${task.branch_name}`);
-                    }
-                }
-                const finalized = finalizeApprovedCommit(store, task.task_id, task.integrated_commit, true, true);
-                return { ...finalized, recovered: true, finalized: true };
-            }
-            const workerCommit = resolveLocalBranchHead(store.projectRoot, task.branch_name);
-            const detectedApprovedCommit = task.approved_commit || (commitMatchesApproval(store.projectRoot, workerCommit, task.reviewed_commit, expectedSubject) ? workerCommit : null);
-            beginTransaction(store.database);
-            if (!detectedApprovedCommit) {
-                assertCondition(workerCommit === task.reviewed_commit, `Git history does not contain the approved commit expected for ${task.task_id}.`);
-                store.database.prepare("UPDATE tasks SET reviewed_commit = NULL, approved_commit = NULL, integrated_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-            } else {
-                store.database.prepare("UPDATE tasks SET approved_commit = ?, integrated_commit = NULL, updated_at = ? WHERE task_id = ?").run(detectedApprovedCommit, currentTimestamp(), task.task_id);
-            }
-            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-            commitTransaction(store.database);
-            if (!detectedApprovedCommit) {
-                return { recovered: true, finalized: false, retryCommit: true, controlRoomTitle: titleForControlRoom(), task: serializeTask(requireTask(store, task.task_id)) };
-            }
-            const retried = commitApprovedTask(options, task.task_id);
-            return { ...retried, recovered: true, finalized: Boolean(retried.task && ["DONE", "PAUSED"].includes(String((retried.task as Record<string, unknown>).state))) };
-        }
-        const workerBranchResult = task.branch_name ?
-            runGit(store.projectRoot, ["rev-parse", "--verify", `refs/heads/${task.branch_name}^{commit}`]) :
-            { status: 128, stdout: "", stderr: "" };
-        assertCondition(workerBranchResult.status === 0 || workerBranchResult.status === 128, `Resolve worker branch ${String(task.branch_name)} failed: ${workerBranchResult.stderr || workerBranchResult.stdout}`);
-        const workerCommit = workerBranchResult.status === 0 ? validateCommitId(workerBranchResult.stdout) : null;
-        const currentBaseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
-        const expectedSubject = readApprovalCommitMessage(store, task);
-        const workerCommitIsApproval = Boolean(workerCommit && commitMatchesApproval(store.projectRoot, workerCommit, task.reviewed_commit, expectedSubject));
-        const baseCommitIsApproval = Boolean(currentBaseCommit && commitMatchesApproval(store.projectRoot, currentBaseCommit, task.reviewed_commit, expectedSubject));
-        const noCommitWasCreated = task.reviewed_commit === null ?
-            workerCommit === null && currentBaseCommit === null :
-            workerCommit === task.reviewed_commit || currentBaseCommit === task.reviewed_commit;
-        if (!workerCommitIsApproval && !baseCommitIsApproval && noCommitWasCreated) {
-            const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
-            assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
-            beginTransaction(store.database);
-            const lockedProject = requireProject(store);
-            assertCondition(lockedProject.integration_task_id === task.task_id, `Commit lease for ${task.task_id} changed during recovery.`);
-            store.database.prepare("UPDATE tasks SET reviewed_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-            const retryTask = requireTask(store, task.task_id);
-            commitTransaction(store.database);
-            return { recovered: true, finalized: false, retryCommit: true, controlRoomTitle: titleForControlRoom(), task: serializeTask(retryTask) };
-        }
-        assertCondition(workerCommitIsApproval || baseCommitIsApproval, `Git history does not contain the approved commit expected for ${task.task_id}.`);
-        if (baseCommitIsApproval && workerCommit !== currentBaseCommit) {
-            const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
-            if (currentBranch !== project.base_branch) {
-                assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot restore ${project.base_branch} with a dirty working tree.`);
-                requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
-            }
-            let workerBranchWasDeleted = Boolean(task.branch_name && !workerCommit);
-            if (task.approval_target === "PAUSED" && task.branch_name && workerCommit) {
-                workerBranchWasDeleted = releaseSharedWorkerBranch(store, project, task);
-            }
-            const result = finalizeApprovedCommit(store, task.task_id, currentBaseCommit, workerBranchWasDeleted, workerBranchWasDeleted);
-            return { ...result, recovered: true, finalized: true };
-        }
-        assertCondition(workerCommit && task.branch_name, `${task.task_id} has no recoverable worker commit.`);
-        const approvedCommit = workerCommit;
-        const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
-        if (!currentBaseCommit) {
-            assertCondition(task.base_commit === null, `Configured base branch ${project.base_branch} disappeared after activation.`);
-            assertCondition(currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
-            createInitialBaseBranch(store.projectRoot, project.base_branch, approvedCommit);
-            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out initial base branch ${project.base_branch}`);
-            assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === approvedCommit, `${project.base_branch} did not reach recovered initial commit ${approvedCommit}.`);
-            requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete recovered worker branch ${task.branch_name}`);
-            const result = finalizeApprovedCommit(store, task.task_id, approvedCommit, true, true);
-            return { ...result, recovered: true, finalized: true };
-        }
-        if (currentBranch !== project.base_branch) {
-            assertCondition(currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
-            requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
-        }
-        const baseCommit = requireBaseCheckout(store.projectRoot, project.base_branch);
-        if (baseCommit !== approvedCommit) {
-            requireGit(store.projectRoot, ["merge", "--ff-only", approvedCommit], `Recover fast-forward of ${project.base_branch}`);
-        }
-        assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === approvedCommit, `${project.base_branch} did not reach recovered commit ${approvedCommit}.`);
-        if (workerCommit) {
-            requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete recovered worker branch ${task.branch_name}`);
-        }
-        const result = finalizeApprovedCommit(store, task.task_id, approvedCommit, true, true);
-        return { ...result, recovered: true, finalized: true };
-    } catch (error) {
-        rollbackTransaction(store.database);
-        throw error;
     } finally {
         store.database.close();
     }
@@ -3111,7 +1359,8 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): Record<str
  * @param taskId Task identifier to read.
  */
 function getReviewPacket(options: IControlRoomOptions, taskId: string): IReviewPacket {
-    const store = openStore(options);
+    const store = openReadStore(options);
+    assertCondition("database" in store, "Cannot read the review packet: state is missing or requires migration. Run $control-room init.");
     try {
         requireProject(store);
         const task = requireTask(store, taskId);
@@ -3130,7 +1379,10 @@ function getReviewPacket(options: IControlRoomOptions, taskId: string): IReviewP
 function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: string): Record<string, unknown> {
     assertCondition(!(taskId && threadId), "Status accepts either a task ID or a thread ID, not both.");
     const validThreadId = threadId ? validateThreadId(threadId) : null;
-    const store = openStore(options);
+    const store = openReadStore(options);
+    if (!("database" in store)) {
+        return { ...store };
+    }
     try {
         const project = requireProject(store);
         if (taskId) {
@@ -3186,14 +1438,17 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
  * @param options Project and optional state-root settings.
  */
 function getQueue(options: IControlRoomOptions): Record<string, unknown> {
-    const store = openStore(options);
+    const store = openReadStore(options);
+    if (!("database" in store)) {
+        return { ...store, queue: [] };
+    }
     try {
         requireProject(store);
         const tasks = store.database.prepare(`
             ${TASK_WITH_QUEUED_POSITION_SELECT}
             WHERE task.state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
             ORDER BY task.queue_position IS NULL, task.queue_position, task.task_number
-        `).all() as ITaskRow[];
+        `).all() as unknown as ITaskRow[];
         const queue: Record<string, unknown>[] = [];
         for (const task of tasks) {
             queue.push({ ...serializeTask(task), dependencies: readTaskDependencies(store, task.task_id) });
@@ -3245,7 +1500,7 @@ function addSettlementTitleUpdateList(updates: Map<string, ITitleUpdate>, candid
  * @param activation Shared activation result.
  * @param isolatedActivations Isolated activation results.
  */
-function collectSettlementTitleUpdates(processed: Record<string, unknown>, completions: Record<string, unknown>[], activation: Record<string, unknown> | null, isolatedActivations: Record<string, unknown>[]): ITitleUpdate[] {
+function collectSettlementTitleUpdates(processed: Record<string, unknown>, completions: IApprovalResult[], activation: IActivationResult | null, isolatedActivations: IActivationResult[]): ITitleUpdate[] {
     const updates = new Map<string, ITitleUpdate>();
     const results = Array.isArray(processed.results) ? processed.results : [];
     for (const result of results) {
@@ -3295,10 +1550,11 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
             completions: [],
             isolatedActivations: [],
             isolatedCancellations,
+            pendingActivations: getPendingActivations(options),
             titleUpdates: collectSettlementTitleUpdates(processed, [], null, [])
         };
     }
-    const completions: Record<string, unknown>[] = [];
+    const completions: IApprovalResult[] = [];
     while (!status.commitTaskId) {
         const activeQueue = getQueue(options).queue as Record<string, unknown>[];
         const approvedTasks = activeQueue.filter((task) => task.state === "APPROVED");
@@ -3308,13 +1564,13 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         completions.push(commitApprovedTask(options, String(approvedTasks[0].taskId)));
         status = getStatus(options);
     }
-    const isolatedActivations: Record<string, unknown>[] = [];
+    const isolatedActivations: IActivationResult[] = [];
     for (const requestedTaskId of readEligibleIsolatedTaskIds(options)) {
         isolatedActivations.push(activateIsolatedTask(options, requestedTaskId));
     }
-    let activation: Record<string, unknown>;
+    let activation: IActivationResult;
     if (status.commitTaskId) {
-        activation = { activated: false, reason: "COMMIT_RECOVERY_REQUIRED", commitTaskId: status.commitTaskId };
+        activation = { activated: false, controlRoomTitle: titleForControlRoom(), reason: "COMMIT_RECOVERY_REQUIRED" };
     } else {
         activation = activateNextTask(options);
     }
@@ -3331,6 +1587,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         activation,
         isolatedActivations,
         isolatedCancellations,
+        pendingActivations: getPendingActivations(options),
         queue: activeQueue,
         reviewPacket: reviewPackets[0] || null,
         reviewPackets,
@@ -3338,7 +1595,207 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
     };
 }
 
-module.exports = {
+/**
+ * Persist the handoff in the same transaction that reserves its workspace.
+ * @param store Open project store with an active activation transaction.
+ * @param brief Exact execution brief to deliver.
+ */
+function persistActivation(store: IStore, brief: IExecutionBrief): void {
+    const timestamp = currentTimestamp();
+    store.database.prepare("INSERT INTO activation_deliveries (activation_key, task_id, brief_json, state, created_at, updated_at) VALUES (?, ?, ?, 'PENDING', ?, ?)").run(brief.activationKey, brief.taskId, JSON.stringify(brief), timestamp, timestamp);
+}
+
+/**
+ * Read unconfirmed handoffs without replaying or claiming a delivery.
+ * @param options Project and optional state-root settings.
+ */
+function getPendingActivations(options: IControlRoomOptions): IActivationDelivery[] {
+    const store = openReadStore(options);
+    if (!("database" in store)) {
+        return [];
+    }
+    try {
+        const rows = store.database.prepare("SELECT delivery.* FROM activation_deliveries AS delivery JOIN tasks AS task ON task.task_id = delivery.task_id WHERE delivery.state IN ('PENDING', 'CLAIMED') AND task.state = 'RUNNING' ORDER BY delivery.created_at, delivery.activation_key").all() as unknown as IDeliveryRow[];
+        return rows.map((row) => ({ activationKey: row.activation_key, state: row.state as "PENDING" | "CLAIMED", claimToken: row.claim_token, executionBrief: JSON.parse(row.brief_json) as IExecutionBrief }));
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Claim one handoff so concurrent settlements cannot both send it.
+ * @param options Project and optional state-root settings.
+ * @param activationKey Persisted activation identifier.
+ * @param retryUserRequestId New direct authorization for retrying an uncertain delivery.
+ */
+function claimActivation(options: IControlRoomOptions, activationKey: string, retryUserRequestId?: string): { claimed: boolean; reason?: string; claimToken?: string; executionBrief?: IExecutionBrief } {
+    const validKey = validateEventKey(activationKey);
+    const retryRequest = retryUserRequestId === undefined ? null : validateCompactText(retryUserRequestId, "Direct retry request ID", 200, true)!;
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        requireProject(store);
+        const row = store.database.prepare("SELECT * FROM activation_deliveries WHERE activation_key = ?").get(validKey) as IDeliveryRow | undefined;
+        assertCondition(row, `Unknown activation: ${validKey}`);
+        if (row.state === "DELIVERED" || row.state === "CANCELED" || (row.state === "CLAIMED" && (!retryRequest || retryRequest === row.retry_request_id))) {
+            commitTransaction(store.database);
+            return { claimed: false, reason: row.state === "CLAIMED" ? "DELIVERY_UNCONFIRMED" : row.state };
+        }
+        const task = requireTask(store, row.task_id);
+        assertCondition(task.state === "RUNNING" && task.branch_name, `${task.task_id} no longer owns this activation.`);
+        const brief = JSON.parse(row.brief_json) as IExecutionBrief;
+        const workspacePath = resolveTaskWorkspace(store, task);
+        assertCondition(brief.activationKey === validKey && brief.taskId === task.task_id && brief.threadId === task.thread_id && brief.projectRoot === store.projectRoot && brief.workspacePath === workspacePath && brief.workerBranch === task.branch_name, "Activation target or workspace no longer matches the stored brief.");
+        // The shared workspace resolver intentionally accepts base-branch approvals; delivery must use the worker checkout.
+        const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Verify activation checkout");
+        assertCondition(currentBranch === task.branch_name, `Activation checkout changed for ${task.task_id}.`);
+        const claimToken = nodeCrypto.randomUUID();
+        store.database.prepare("UPDATE activation_deliveries SET state = 'CLAIMED', claim_token = ?, retry_request_id = ?, updated_at = ? WHERE activation_key = ?").run(claimToken, retryRequest, currentTimestamp(), validKey);
+        commitTransaction(store.database);
+        return { claimed: true, claimToken, executionBrief: brief };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Confirm a successful send or a verified direct start against its exact claim.
+ * @param options Project and optional state-root settings.
+ * @param activationKey Persisted activation identifier.
+ * @param claimToken Token returned by the successful claim.
+ * @param receipt App message ID or direct-start request reference.
+ */
+function confirmActivation(options: IControlRoomOptions, activationKey: string, claimToken: string, receipt: string): { confirmed: boolean; alreadyConfirmed?: boolean; reason?: string } {
+    const validKey = validateEventKey(activationKey);
+    const validToken = validateEventKey(claimToken);
+    const validReceipt = validateCompactText(receipt, "Delivery receipt", 500, true)!;
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        requireProject(store);
+        const row = store.database.prepare("SELECT * FROM activation_deliveries WHERE activation_key = ?").get(validKey) as IDeliveryRow | undefined;
+        assertCondition(row, `Unknown activation: ${validKey}`);
+        assertCondition(row.claim_token === validToken, "Activation claim changed; a stale confirmation cannot acknowledge another delivery attempt.");
+        if (row.state === "CANCELED") {
+            commitTransaction(store.database);
+            return { confirmed: false, reason: "ACTIVATION_SUPERSEDED" };
+        }
+        if (row.state === "DELIVERED") {
+            assertCondition(row.receipt === validReceipt, "Activation was already confirmed with another receipt.");
+            commitTransaction(store.database);
+            return { confirmed: true, alreadyConfirmed: true };
+        }
+        assertCondition(row.state === "CLAIMED", "Activation must be claimed before confirmation.");
+        assertCondition(requireTask(store, row.task_id).state === "RUNNING", "Activation is no longer running.");
+        store.database.prepare("UPDATE activation_deliveries SET state = 'DELIVERED', receipt = ?, updated_at = ? WHERE activation_key = ?").run(validReceipt, currentTimestamp(), validKey);
+        commitTransaction(store.database);
+        return { confirmed: true };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Diagnose runtime, repository, queue, cleanup and delivery problems without repairs.
+ * @param options Project and optional state-root settings.
+ * @param taskId Optional task whose execution blockers should be explained.
+ */
+function doctorProject(options: IControlRoomOptions, taskId?: string): import("./control-room-types.ts").IDoctorResult {
+    const checks: import("./control-room-types.ts").IDoctorCheck[] = [];
+    let store: IStore | undefined;
+    let projectRoot = path.resolve(options.projectRoot);
+    try {
+        const [major, minor] = process.versions.node.split(".").map(Number);
+        const supportedNode = major > 22 || (major === 22 && minor >= 18);
+        checks.push({ code: "NODE_VERSION", level: supportedNode ? "ok" : "error", message: `Node.js ${process.versions.node}; requires 22.18 or newer.` });
+        projectRoot = canonicalizeProjectRoot(options.projectRoot);
+        const gitVersion = requireGit(projectRoot, ["--version"], "Inspect Git version");
+        const mergeHelp = runGit(projectRoot, ["merge-tree", "-h"]);
+        const supportsMergeTree = `${mergeHelp.stdout}\n${mergeHelp.stderr}`.includes("--write-tree");
+        checks.push({ code: "GIT_CAPABILITIES", level: supportsMergeTree ? "ok" : "error", message: `${gitVersion}; merge-tree --write-tree ${supportsMergeTree ? "available" : "unavailable"}.`, ...(!supportsMergeTree ? { nextAction: "Install Git with merge-tree --write-tree support (2.38 or newer)." } : {}) });
+        const opened = openReadStore(options);
+        if (!("database" in opened)) {
+            checks.push({ code: opened.reason, level: "warning", message: opened.reason === "NOT_INITIALIZED" ? "ControlRoom is not initialized for this project." : `State schema ${opened.schemaVersion} requires migration to ${opened.expectedSchemaVersion}.`, nextAction: "Run $control-room init to initialize or migrate the project." });
+            return { healthy: false, projectRoot, checks };
+        }
+        store = opened;
+        const project = requireProject(store);
+        const integrity = store.database.prepare("PRAGMA quick_check").all();
+        const foreignKeys = store.database.prepare("PRAGMA foreign_key_check").all();
+        checks.push({ code: "STATE_INTEGRITY", level: integrity.every((row) => row.quick_check === "ok") && foreignKeys.length === 0 ? "ok" : "error", message: integrity.every((row) => row.quick_check === "ok") && foreignKeys.length === 0 ? "SQLite integrity and foreign keys are valid." : "SQLite integrity or foreign key checks failed; preserve the database before recovery." });
+        const baseCommit = resolveLocalBranchHeadIfExists(projectRoot, project.base_branch);
+        const unborn = resolveCurrentHeadIfExists(projectRoot) === null;
+        checks.push({ code: "BASE_BRANCH", level: baseCommit || unborn ? "ok" : "error", message: baseCommit ? `Base branch ${project.base_branch} exists.` : unborn ? `Base branch ${project.base_branch} is unborn; isolated execution needs a first commit.` : `Base branch ${project.base_branch} is missing.`, ...(!baseCommit && !unborn ? { nextAction: "Restore the configured base branch after inspecting Git history." } : {}) });
+        const agentsPath = resolveProjectAgentsPath(projectRoot);
+        const routing = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, "utf8") : "";
+        const routingPresent = routing.includes("<!-- control-room:start -->") && routing.includes("<!-- control-room:end -->");
+        checks.push({ code: "PROJECT_ROUTING", level: routingPresent ? "ok" : "warning", message: routingPresent ? "Managed project routing is present." : "Managed project routing is missing.", ...(!routingPresent ? { nextAction: "Run $control-room init to repair project routing." } : {}) });
+        const ignored = runGit(projectRoot, ["check-ignore", "--quiet", "--no-index", "--", ".control-room/worktrees/T9999"]).status === 0;
+        checks.push({ code: "WORKTREE_IGNORE", level: ignored ? "ok" : "warning", message: ignored ? "ControlRoom worktrees are ignored by Git." : "ControlRoom worktrees are not ignored by Git.", ...(!ignored ? { nextAction: "Run $control-room init to repair .gitignore." } : {}) });
+        if (project.integration_task_id) {
+            checks.push({ code: "COMMIT_RECOVERY_REQUIRED", level: "warning", taskId: project.integration_task_id, message: `Approval or cleanup lease held since ${project.integration_started_at}.`, nextAction: `Verify that the prior process has ended before running recover-commit for ${project.integration_task_id}.` });
+        }
+        const tasks = taskId ? [requireTask(store, taskId)] : store.database.prepare("SELECT * FROM tasks WHERE state NOT IN ('DONE', 'CANCELED') ORDER BY task_number").all() as unknown as ITaskRow[];
+        const shared = store.database.prepare("SELECT task_id FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED')").all() as Array<{ task_id: string }>;
+        if (shared.length > 1) {
+            checks.push({ code: "MULTIPLE_SHARED_WORKERS", level: "error", message: "More than one task owns the shared checkout.", nextAction: "Inspect task state and workspace ownership before continuing." });
+        }
+        const currentBranch = requireGit(projectRoot, ["branch", "--show-current"], "Inspect shared checkout");
+        if (shared.length === 0 && currentBranch !== project.base_branch) {
+            checks.push({ code: "SHARED_CHECKOUT_UNASSIGNED", level: "warning", message: `The shared checkout is on ${currentBranch || "detached HEAD"} without an active shared owner.`, nextAction: "Inspect pending activation or cancellation state and preserve local work before restoring the base checkout." });
+        }
+        for (const task of tasks) {
+            const unmet = store.database.prepare("SELECT prerequisite.task_id, prerequisite.state FROM dependencies JOIN tasks AS prerequisite ON prerequisite.task_id = dependencies.depends_on_id WHERE dependencies.task_id = ? AND prerequisite.state <> 'DONE'").all(task.task_id) as Array<{ task_id: string; state: TaskState }>;
+            if (unmet.length > 0) {
+                checks.push({ code: "DEPENDENCIES_PENDING", level: "warning", taskId: task.task_id, message: unmet.map((dependency) => `${dependency.task_id}: ${dependency.state}`).join(", "), nextAction: "Complete the prerequisites, or explicitly remove an obsolete dependency." });
+            }
+            if (task.state === "QUEUED" && task.workspace_mode === "shared" && shared.length > 0) {
+                checks.push({ code: "SHARED_CHECKOUT_BUSY", level: "warning", taskId: task.task_id, message: `Waiting for ${shared[0].task_id} to release the shared checkout.`, nextAction: "Complete or pause the active task through its normal approval flow." });
+            }
+            if (task.state === "BLOCKED") {
+                const blocked = store.database.prepare("SELECT payload_json FROM events WHERE task_id = ? AND kind = 'BLOCKED_REPORTED' AND json_extract(result_json, '$.action') = 'BLOCKED' ORDER BY sequence DESC LIMIT 1").get(task.task_id) as { payload_json: string } | undefined;
+                const reason = blocked ? (JSON.parse(blocked.payload_json) as IEventPayload).reason : null;
+                checks.push({ code: "TASK_BLOCKED", level: "warning", taskId: task.task_id, message: reason || `Task is blocked from ${task.blocked_from_state}.`, nextAction: "Inspect the preserved workspace and the latest task failure, then Resume when resolved." });
+            }
+            if (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED") {
+                if (task.cleanup_pending) {
+                    checks.push({ code: "CLEANUP_PENDING", level: "warning", taskId: task.task_id, message: "Approved no-change cleanup has not been finalized.", nextAction: "After confirming the previous process ended, run recover-commit." });
+                } else {
+                    try {
+                        const workspace = resolveTaskWorkspace(store, task);
+                        const branch = requireGit(workspace, ["branch", "--show-current"], "Inspect task checkout");
+                        assertCondition(branch === task.branch_name || (task.workspace_mode === "shared" && branch === project.base_branch), `Unexpected branch ${branch || "detached HEAD"}.`);
+                    } catch (error) {
+                        checks.push({ code: "WORKSPACE_MISMATCH", level: "error", taskId: task.task_id, message: error instanceof Error ? error.message : String(error), nextAction: "Inspect Git worktrees and the task's recorded workspace; preserve uncommitted work." });
+                    }
+                }
+            }
+        }
+        for (const delivery of getPendingActivations(options)) {
+            if (!taskId || delivery.executionBrief.taskId === taskId) {
+                checks.push({ code: delivery.state === "PENDING" ? "ACTIVATION_PENDING" : "DELIVERY_UNCONFIRMED", level: "warning", taskId: delivery.executionBrief.taskId, activationKey: delivery.activationKey, message: delivery.state === "PENDING" ? "The activation brief has not been claimed for delivery." : "Delivery was claimed but has no receipt; it may already have reached the destination.", nextAction: delivery.state === "PENDING" ? "Verify the original start authorization, then claim and deliver this exact activation." : "Inspect the destination history and confirm a verified receipt. Retry only with new direct user authorization." });
+            }
+        }
+        return { healthy: checks.every((check) => check.level === "ok"), projectRoot, checks };
+    } catch (error) {
+        checks.push({ code: "DIAGNOSTIC_FAILED", level: "error", message: error instanceof Error ? error.message : String(error), nextAction: "Resolve this diagnostic error before attempting state changes." });
+        return { healthy: false, projectRoot, checks };
+    } finally {
+        store?.database.close();
+    }
+}
+
+const api = {
+    doctorProject,
+    claimActivation,
+    confirmActivation,
+    getPendingActivations,
     activateIsolatedTask,
     activateNextTask,
     commitApprovedTask,
@@ -3358,3 +1815,6 @@ module.exports = {
     titleForControlRoom,
     titleForTask
 };
+
+module.exports = api;
+export interface IControlRoomApi extends Readonly<typeof api> {}

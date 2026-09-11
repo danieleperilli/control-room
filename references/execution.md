@@ -49,7 +49,6 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Move first`, `Move to 3`, `Move before T0005`, or `Move after T0005`: submit `MOVE_REQUESTED` with the matching destination.
 - `Depends on T0005`: submit `DEPENDENCY_ADD_REQUESTED`.
 - `Remove dependency T0005`: submit `DEPENDENCY_REMOVE_REQUESTED`.
-- `Independent review`: accept only in `REVIEW` after the user explicitly chooses it. Run the single fresh-context, read-only reviewer described in [review.md](review.md) without changing ControlRoom state.
 - `Approve`: follow [Approve the current work](review.md#approve-the-current-work), including the required message ID, commit-subject limits and complete command. Then apply the returned titles and deliver any pending activation as described below.
 - `Approve and pause`: follow the same [approval procedure](review.md#approve-the-current-work) using `request-approve-and-pause`; settlement targets `PAUSED` with `⏸️` and leaves dependents unsatisfied.
 - `Resume`: for `PAUSED`, run `resume` to return the same `T_ID` to `PLANNING`, preserve dependencies and review history, reset the execution and approval anchors for the next checkpoint, apply the returned `⚪️` title, and settle. For `BLOCKED`, retain the existing recovery behavior that restores its recorded prior state.

@@ -35,7 +35,7 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 - Planning, queued and paused workers do not modify project files. Start only through a direct `Enqueue`, `Run now` or `Run isolated now`, followed by settlement. A direct enqueue authorizes later activation of that exact task and one handoff to its recorded thread within the same implementation scope.
 - Normal execution is serial in the shared checkout. Concurrent isolated execution requires an explicit request for each task and uses `.control-room/worktrees/<T_ID>`; every file operation uses the returned `workspacePath`.
 - An activated worker may modify project files immediately inside its assigned workspace. Read [review.md](references/review.md) before recording material decisions, requesting review or processing approval.
-- Keep changes uncommitted during implementation and review. New implementation feedback in `REVIEW` first records rework. A direct `Approve` or `Approve and pause` is final authorization from `RUNNING` or `REVIEW`; do not ask for another confirmation or repeat the independent-review offer.
+- Keep changes uncommitted during implementation and review. New implementation feedback in `REVIEW` first records rework. A direct `Approve` or `Approve and pause` is final authorization from `RUNNING` or `REVIEW`; do not ask for another confirmation.
 - Dependencies require `DONE`; an approved checkpoint ends in `PAUSED`, releases its workspace and remains unsatisfied. `Resume` returns that same identity to planning.
 - Submit events with stable retry keys and settle in the requesting task. Apply every returned title update before the final response. Routine success is concise; surface actual failures and missing delivery confirmations.
 - Activation and delivery are separate. The CLI persists each brief before returning it. Follow the claim/send/confirm workflow in [execution.md](references/execution.md); a `RUNNING` state alone does not prove delivery. An uncertain claim must not be resent automatically.
@@ -47,7 +47,7 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 | --- | --- |
 | [registration.md](references/registration.md) | Initializing, registering, joining, excluding or explicitly creating a top-level task |
 | [execution.md](references/execution.md) | Queue commands, activation delivery, rework, task titles or user-attention markers |
-| [review.md](references/review.md) | Decisions, review, optional independent review or approval |
+| [review.md](references/review.md) | Decisions, review or approval |
 | [recovery.md](references/recovery.md) | An interrupted approval/cleanup, uncertain delivery or diagnostic failure needs recovery |
 | [protocol.md](references/protocol.md) | Exact event semantics, storage or an unfamiliar lower-level CLI operation |
 

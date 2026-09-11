@@ -4,7 +4,7 @@
 
 Use this procedure for a direct `Approve` or `Approve and pause`, including clear language equivalents, in the current worker. Reuse the instructions already loaded and the task status read for this turn. Do not reopen the implementation, repeat tests or review, or reconstruct the full conversation unless new changes, failures or unresolved evidence require it.
 
-1. Accept `RUNNING` or `REVIEW`. Approval from `RUNNING` authorizes the current assigned workspace without a synthetic review transition or proof of an interrupted turn. Keep retries from `APPROVED`, `PAUSED` or `DONE` idempotent. Reject `PLANNING`, `QUEUED`, `BLOCKED` or `CANCELED` once with the exact state and required next action. Direct approval is final authorization; do not repeat the independent-review offer or request confirmation of the commit or integration.
+1. Accept `RUNNING` or `REVIEW`. Approval from `RUNNING` authorizes the current assigned workspace without a synthetic review transition or proof of an interrupted turn. Keep retries from `APPROVED`, `PAUSED` or `DONE` idempotent. Reject `PLANNING`, `QUEUED`, `BLOCKED` or `CANCELED` once with the exact state and required next action. Direct approval is final authorization; do not request confirmation of the commit or integration.
 2. Resolve the actual current direct-user message ID as described below. It is required by `--user-request-id`; never substitute the thread ID, an event key or an invented ID.
 3. Prepare a meaningful English imperative commit subject describing the final implementation: one line, **8 to 72 characters**, with no tabs or line breaks. Check its length before submission. Do not copy the task's semantic name or decorated title. Generate one stable event key for this request and keep it for retries.
 4. Submit the complete command below. Only after successful registration, run `settle` in this same worker. A successful submission with `processed: false` means the event is stored and still needs settlement. If settlement alone needs a retry, reuse the recorded approval instead of submitting another event.
@@ -45,18 +45,17 @@ node <skill-dir>/scripts/control-room.ts record-decision \
 
 Do not record routine edits or low-level coding steps. Decision events are append-only: correct an earlier decision by recording a new one with `--supersedes`, never by rewriting history. A task may have no decisions. Process these events through normal settlement before relying on them.
 
-## Present review and offer independent review
+## Present review
 
 Before requesting review, record and process every material decision not yet captured. Submit `REVIEW_REQUESTED`, settle, and present a compact summary from the returned `reviewPacket` without requiring the user to inspect code:
 
 1. Summarize the outcome and verification in one short paragraph.
 2. Show unresolved or `low`-confidence current decisions. Collapse all other current decisions to a count and omit superseded decisions unless they affect a remaining risk.
 3. Call out remaining uncertainty; omit the section when there is none.
-4. Ask once whether the user wants an independent review by a second agent. Do not start one automatically and do not block direct approval or an approved checkpoint when the user declines or says `Approve` or `Approve and pause` immediately. Show the complete packet only when the user asks or requests `Status`.
 
-If the user explicitly accepts the independent review, delegate exactly one bounded, read-only review pass to a second agent with fresh context and no inherited conversation. Give it only the canonical request, acceptance criteria, repository location, changed-file scope, and relevant verification commands. Do not give it the implementer's decision log, conclusions, or reasoning. The reviewer inspects the implementation and returns a verdict, concrete findings with evidence, verification performed, and residual risks. It must not edit files, stage changes, commit, register as a ControlRoom task, or receive a `T_ID`.
+Show the complete packet only when the user asks or requests `Status`.
 
-Present that report to the user; it is advisory, is not persisted in SQLite, and is not an approval gate. Findings do not trigger rework automatically. If the user requests changes, follow the normal `REWORK_REQUESTED` flow. On a later return to `REVIEW`, ask again instead of launching another reviewer automatically. If a genuinely fresh second agent is unavailable, say so rather than presenting a same-context review as independent.
+Do not offer or automatically start an independent review, including after rework. The user may request one directly without a dedicated ControlRoom command. Such a review is advisory, does not change ControlRoom state, and adds no approval gate. If the user requests changes afterward, follow the normal `REWORK_REQUESTED` flow.
 
 Do not call `process`, `activate-next`, or `commit-approved` separately during normal operation; `settle` owns their sequence. Use `recover-commit` only after confirming that a previous approval process ended unexpectedly, then settle again. Never run recovery concurrently with a live commit.
 

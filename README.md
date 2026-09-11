@@ -73,7 +73,7 @@ Discuss each change in its own Local task. Change requests and concrete implemen
 
 Send `Enqueue` to authorize the task to start when eligible. Use `Run now` when the shared checkout is idle, or explicitly request `Run isolated now` for a dedicated repository-local worktree. Queue order and dependencies are separate: moving a task does not change its prerequisites.
 
-Implementation remains uncommitted through review. `Approve` integrates the current assigned workspace and finishes the task. `Approve and pause` integrates a checkpoint and releases the workspace; `Resume` returns that same task to planning. A paused prerequisite remains unsatisfied until it reaches `DONE`. Direct approval is final authorization, including recovery from a turn interrupted before recording review. Independent review is optional and adds no approval gate.
+Implementation remains uncommitted through review. `Approve` integrates the current assigned workspace and finishes the task. `Approve and pause` integrates a checkpoint and releases the workspace; `Resume` returns that same task to planning. A paused prerequisite remains unsatisfied until it reaches `DONE`. Direct approval is final authorization, including recovery from a turn interrupted before recording review. Independent review is left to the user's own request and adds no approval gate.
 
 ## Commands
 
@@ -96,7 +96,6 @@ Implementation remains uncommitted through review. `Approve` integrates the curr
 | `Move after T0005` | Move the current queued task immediately after `T0005`. |
 | `Depends on T0005` | Require `T0005` to be done before the current task can start. |
 | `Remove dependency T0005` | Remove that requirement from the current task. |
-| `Independent review` | Run one optional read-only review with a fresh second agent after the task enters review. |
 | `Approve` | Approve the current task when it is in review. |
 | `Approve and pause` | Approve and integrate the current checkpoint, then leave the unfinished task paused outside the queue. |
 | `Resume` | Return a paused task to planning, or restore a blocked task to its recorded prior state. |

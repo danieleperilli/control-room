@@ -53,9 +53,11 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Approve and pause`: follow the same [approval procedure](review.md#approve-the-current-work) using `request-approve-and-pause`; settlement targets `PAUSED` with `⏸️` and leaves dependents unsatisfied.
 - `Resume`: for `PAUSED`, run `resume` to return the same `T_ID` to `PLANNING`, preserve dependencies and review history, reset the execution and approval anchors for the next checkpoint, apply the returned `⚪️` title, and settle. For `BLOCKED`, retain the existing recovery behavior that restores its recorded prior state.
 - `Cancel`: submit an idempotent cancellation request from the current worker.
+- `Reopen`: run `reopen --project-root <root> --task <T_ID>` for a `DONE` task. Preserve its identity, decisions and event history while resetting execution and approval anchors. An undelivered successor attached to its pending handoff returns to the queue only when delivery is still `PENDING` and both checkout and worker branch are unchanged; claimed/delivered activations and changed workspaces are refused. Apply returned titles. If the same request asks to implement the follow-up, submit `request-run-now` before settlement; otherwise settle with the reopened task in planning. Never cancel or interrupt a running successor to force reopening.
 - `$control-room exclude`: persist an unregistered opt-out, or submit `request-exclude` and settle for a `PLANNING` or `QUEUED` worker. Apply the undecorated canceled title and every renumbered queued title before continuing outside Control Room.
 - `Status`: read the current task snapshot.
 - `Queue status` or `$control-room queue`: read the project queue.
+- `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status`: follow [autopilot.md](autopilot.md) from any project chat before worker role handling. Mode changes do not register the caller; status is read-only.
 - `$control-room doctor`: diagnose state and blockers without registration, repairs or settlement.
 - `$control-room help`: show commands without changing state.
 

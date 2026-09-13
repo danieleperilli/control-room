@@ -27,6 +27,9 @@ export interface IUnavailableState {
 }
 
 export interface IEventPayload {
+    autopilotEventKey?: string;
+    reviewEventKey?: string;
+    verification?: string;
     afterTaskId?: string;
     approvalTarget?: ApprovalTarget;
     alternatives?: string;
@@ -63,7 +66,7 @@ export interface IEventPayloadByKind {
     DECISION_RECORDED: Required<Pick<IEventPayload, "decision" | "rationale" | "confidence" | "impact" | "evidence" | "status">> & Pick<IEventPayload, "alternatives" | "uncertainty" | "supersedesDecisionId">;
     REVIEW_REQUESTED: Pick<IEventPayload, "summary">;
     REWORK_REQUESTED: Pick<IEventPayload, "summary">;
-    APPROVAL_REQUESTED: Required<Pick<IEventPayload, "commitMessage" | "userRequestId">> & Pick<IEventPayload, "approvalTarget">;
+    APPROVAL_REQUESTED: Required<Pick<IEventPayload, "commitMessage">> & Pick<IEventPayload, "userRequestId" | "approvalTarget" | "autopilotEventKey" | "reviewEventKey" | "verification">;
     CANCEL_REQUESTED: Required<Pick<IEventPayload, "userRequestId">> & Pick<IEventPayload, "cancelSource" | "exclusionReason">;
     BLOCKED_REPORTED: Required<Pick<IEventPayload, "reason">>;
 }
@@ -84,6 +87,7 @@ export interface IDecision {
 
 export interface IReviewPacket {
     taskId: string;
+    reviewEventKey?: string | null;
     decisionCount: number;
     unresolvedDecisionIds: string[];
     decisions: IDecision[];
@@ -105,6 +109,14 @@ export interface IProjectRow {
     next_task_number: number;
     integration_task_id: string | null;
     integration_started_at: string | null;
+}
+
+export interface IAutopilotStatus {
+    enabled: boolean;
+    eventKey: string | null;
+    userRequestId: string | null;
+    threadId: string | null;
+    updatedAt: string | null;
 }
 
 export interface ITaskRow {

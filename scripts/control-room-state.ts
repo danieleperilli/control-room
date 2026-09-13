@@ -1,4 +1,4 @@
-import type { ISerializedTask, TaskState, IStore, IProjectRow, ITaskRow, ITitleUpdate } from "./control-room-types.ts";
+import type { IAutopilotStatus, ISerializedTask, TaskState, IStore, IProjectRow, ITaskRow, ITitleUpdate } from "./control-room-types.ts";
 const { currentTimestamp, validateTaskId }: import("./control-room-validation.ts").IValidationApi = require("./control-room-validation.ts");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 
@@ -47,6 +47,48 @@ function requireTask(store: IStore, taskId: string): ITaskRow {
     const row = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.task_id = ?`).get(validTaskId) as ITaskRow | undefined;
     assertCondition(row, `Unknown task: ${validTaskId}`);
     return row;
+}
+
+/**
+ * Read the latest project-wide autopilot authorization, defaulting to manual mode.
+ * @param store Open project store.
+ */
+function readAutopilotStatus(store: IStore): IAutopilotStatus {
+    const request = store.database.prepare("SELECT * FROM autopilot_requests ORDER BY sequence DESC LIMIT 1").get() as { enabled: number; event_key: string; user_request_id: string; thread_id: string; created_at: string } | undefined;
+    return {
+        enabled: Boolean(request?.enabled),
+        eventKey: request?.event_key || null,
+        userRequestId: request?.user_request_id || null,
+        threadId: request?.thread_id || null,
+        updatedAt: request?.created_at || null
+    };
+}
+
+/**
+ * Find active work whose unresolved attention or failure stops automatic progression.
+ * @param store Open project store.
+ */
+function readAutopilotBlocker(store: IStore): string | null {
+    const blocker = store.database.prepare("SELECT task_id FROM tasks WHERE awaiting_user = 1 OR handoff_sender_task_id IS NOT NULL OR (state = 'BLOCKED' AND blocked_from_state IN ('RUNNING', 'REVIEW')) ORDER BY task_number LIMIT 1").get() as { task_id: string } | undefined;
+    return blocker?.task_id || null;
+}
+
+/**
+ * Reject stale review evidence or newer pending instructions before automatic completion.
+ * @param store Open project store inside the approval or integration transaction.
+ * @param taskId Task being approved or integrated.
+ * @param reviewEventKey Review event covered by the verification evidence.
+ */
+function assertAutopilotReviewCurrent(store: IStore, taskId: string, reviewEventKey: string | undefined): void {
+    const latestReview = store.database.prepare("SELECT event_key FROM events WHERE task_id = ? AND kind = 'REVIEW_REQUESTED' AND processed_at IS NOT NULL AND json_extract(result_json, '$.action') IN ('REVIEW_READY', 'REVIEW_ALREADY_RECORDED') ORDER BY sequence DESC LIMIT 1").get(taskId) as { event_key: string } | undefined;
+    assertCondition(latestReview && latestReview.event_key === reviewEventKey, "Autopilot approval requires the latest successful review event.");
+    const pending = store.database.prepare(`
+        SELECT event_key FROM events WHERE task_id = ? AND processed_at IS NULL
+            AND (kind IN ('REWORK_REQUESTED', 'REVIEW_REQUESTED', 'BLOCKED_REPORTED', 'CANCEL_REQUESTED')
+                OR (kind = 'APPROVAL_REQUESTED' AND json_extract(payload_json, '$.autopilotEventKey') IS NULL))
+        ORDER BY sequence LIMIT 1
+    `).get(taskId) as { event_key: string } | undefined;
+    assertCondition(!pending, "New task instructions are pending; reassess before automatic approval.");
 }
 
 /**
@@ -214,6 +256,6 @@ function compactActiveQueue(store: IStore): ITitleUpdate[] {
     return writeQueueOrder(store, taskIds);
 }
 
-const api = { requireProject, requireTask, queuePositionMarker, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES };
+const api = { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, queuePositionMarker, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES };
 module.exports = api;
 export interface IStateApi extends Readonly<typeof api> {}

@@ -272,6 +272,7 @@ test("returns the user command list for the created Control Room console", () =>
     assert.equal(result.routing.installed, true);
     assert.equal(result.routing.updated, true);
     assert.deepEqual(result.userCommands, [
+        "autopilot | autopilot on | autopilot off | autopilot status",
         "$control-room init",
         "$control-room join",
         "$control-room exclude",
@@ -284,7 +285,7 @@ test("returns the user command list for the created Control Room console", () =>
         "Run isolated now | Run T0002 isolated now",
         "Move first | Move to 3 | Move before T0002 | Move after T0002",
         "Depends on T0002 | Remove dependency T0002",
-        "Approve | Approve and pause | Resume | Cancel | Status | Queue status"
+        "Approve | Approve and pause | Resume | Reopen | Cancel | Status | Queue status"
     ]);
     const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
@@ -677,7 +678,7 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 18);
+    assert.equal(version, 19);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
@@ -735,7 +736,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -780,7 +781,7 @@ test("removes legacy mental-model events and persisted fields", () => {
     const eventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     const persistedResult = JSON.parse(migratedDatabase.prepare("SELECT result_json FROM events WHERE event_key = 'legacy-result'").get().result_json);
     const persistedBrief = JSON.parse(migratedDatabase.prepare("SELECT brief_json FROM activation_deliveries WHERE activation_key = 'legacy-activation'").get().brief_json);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
     assert.doesNotMatch(eventSql, /MENTAL_MODEL_RECORDED/);
     assert.equal(migratedDatabase.prepare("SELECT COUNT(*) AS count FROM events WHERE event_key = 'legacy-mental'").get().count, 0);
     assert.deepEqual(persistedResult.reviewPacket, { decisionCount: 0 });
@@ -827,7 +828,7 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
@@ -920,7 +921,7 @@ test("migrates version 14 tasks to PAUSED without losing events or dependencies"
     const taskSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get().sql;
     const migratedTask = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const dependency = migratedDatabase.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = 'T0002'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
     assert.match(taskSql, /'PAUSED'/);
     assert.equal(migratedTask.reviewed_tree, '{"legacy":true}');
     assert.equal(dependency.depends_on_id, "T0001");
@@ -1414,7 +1415,7 @@ test("migrates version 15 without changing running tasks or their ordinary atten
     assert.equal(after.handoffSenderTaskId, null);
     assert.deepEqual(after.pendingHandoffTaskIds, []);
     const migrated = new DatabaseSync(databasePath);
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 18);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 19);
     migrated.close();
 });
 
@@ -1531,6 +1532,85 @@ test("approve and pause commits a checkpoint without satisfying dependencies", (
     assert.equal(core.getReviewPacket(options, "T0001").decisionCount, 0);
     assert.throws(() => core.resumeTask(options, "T0001"), /is not resumable/);
 });
+
+test("reopening completed work retains its identity and approved history", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Reopen approved work", "first-start");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "completed.txt"), "approved\n");
+    approveTask(options, "T0001", "first", "Save the approved implementation");
+    const completed = core.settleProject(options).completion;
+    const reopened = runCli(["reopen", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001"]);
+    assert.equal(reopened.status, 0, reopened.stderr);
+    assert.equal(JSON.parse(reopened.stdout).task.state, "PLANNING");
+    assert.equal(core.resumeTask(options, "T0001", true).reopened, false);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "main"]), completed.task.committedCommit);
+    core.submitEvent(options, "reopened-start", "T0001", "RUN_NOW_REQUESTED", {});
+    const restarted = core.settleProject(options);
+    assert.equal(restarted.activation.task.taskId, "T0001");
+    assert.equal(restarted.activation.task.baseCommit, completed.task.committedCommit);
+    assert.throws(() => core.resumeTask(options, "T0001", true), /Cannot reopen/);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "follow-up.txt"), "follow-up\n");
+    approveTask(options, "T0001", "second", "Save the approved follow-up");
+    assert.equal(core.settleProject(options).completion.task.state, "DONE");
+    assert.equal(runGit(fixture.repositoryRoot, ["log", "-2", "--format=%s"]), "Save the approved follow-up\nSave the approved implementation");
+});
+
+test("reopening releases an unchanged worker retained by direct-base approval", () => {
+    const fixture = createFixture();
+    initializeFixture(fixture);
+    const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+    activateTask(options, "thread-one", "Direct base approval", "direct-start");
+    runGit(fixture.repositoryRoot, ["checkout", "main"]);
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "approved.txt"), "approved\n");
+    approveTask(options, "T0001", "direct", "Save directly approved work");
+    assert.equal(core.settleProject(options).completion.task.state, "DONE");
+    const head = runGit(fixture.repositoryRoot, ["rev-parse", "main"]);
+    assert.equal(core.resumeTask(options, "T0001", true).task.state, "PLANNING");
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--format=%(refname:short)"]), "main");
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "main"]), head);
+});
+
+for (const protection of ["clean", "dirty", "committed", "claimed", "delivered"]) {
+    test(`reopening handles a ${protection} successor without losing work`, () => {
+        const fixture = createFixture();
+        initializeFixture(fixture);
+        const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
+        activateTask(options, "thread-one", "Completed predecessor", "first-start");
+        registerTask(options, "thread-two", "Waiting successor");
+        core.submitEvent(options, "second-start", "T0002", "ENQUEUE_REQUESTED", {});
+        approveTask(options, "T0001", "first", "Save the approved predecessor");
+        const activated = core.settleProject(options).activation;
+        core.submitEvent(options, "handoff-blocked", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" });
+        core.settleProject(options);
+        if (protection === "dirty" || protection === "committed") fs.writeFileSync(path.join(fixture.repositoryRoot, "successor.txt"), "must survive\n");
+        if (protection === "committed") {
+            runGit(fixture.repositoryRoot, ["add", "successor.txt"]);
+            runGit(fixture.repositoryRoot, ["commit", "-m", "Successor checkpoint"]);
+        }
+        if (protection === "claimed" || protection === "delivered") {
+            const claim = core.claimActivation(options, activated.executionBrief.activationKey);
+            if (protection === "delivered") core.confirmActivation(options, activated.executionBrief.activationKey, claim.claimToken, "actual-delivery");
+        }
+        if (protection !== "clean") {
+            assert.throws(() => core.resumeTask(options, "T0001", true), /Cannot defer|changed/);
+            assert.equal(core.getStatus(options, "T0001").task.state, "DONE");
+            assert.equal(core.getStatus(options, "T0002").task.state, "RUNNING");
+            assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
+            if (protection === "dirty" || protection === "committed") assert.equal(fs.readFileSync(path.join(fixture.repositoryRoot, "successor.txt"), "utf8"), "must survive\n");
+            return;
+        }
+        const reopened = core.resumeTask(options, "T0001", true);
+        assert.deepEqual(reopened.deferredTaskIds, ["T0002"]);
+        assert.equal(core.getStatus(options, "T0002").task.state, "QUEUED");
+        assert.equal(core.getStatus(options, "T0002").task.handoffSenderTaskId, null);
+        assert.equal(core.getPendingActivations(options).length, 0);
+        assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
+        core.submitEvent(options, "reopened-start", "T0001", "RUN_NOW_REQUESTED", {});
+        assert.equal(core.settleProject(options).activation.task.taskId, "T0001");
+    });
+}
 
 test("a resumed checkpoint uses the new approval subject and can finish", () => {
     const fixture = createFixture();

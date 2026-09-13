@@ -12,7 +12,7 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Runs tasks serially in the shared checkout by default, with explicit concurrent isolation when requested.
 - Leaves changes uncommitted during implementation and review.
 - Creates a worker branch only when a queued task starts running.
-- Creates a commit only after direct user approval and only when uncommitted changes exist.
+- Creates a commit after direct user approval or an explicitly enabled project autopilot, and only when uncommitted changes exist.
 - Can approve and integrate an intermediate checkpoint into `PAUSED`, then resume the same task later with `⏸️`.
 - Creates isolated worktrees only on demand below the repository-local `.control-room/worktrees/` directory.
 - Deletes successfully integrated worker branches and isolated worktrees, but never pushes, creates a pull request, or rewrites Git history.
@@ -79,6 +79,9 @@ Implementation remains uncommitted through review. `Approve` integrates the curr
 
 | Command | Result |
 | --- | --- |
+| `autopilot` or `autopilot on` | Enable automatic approval and continuation for explicitly started or queued work in this project. |
+| `autopilot off` | Return to manual approval while preserving running work. |
+| `autopilot status` | Show current mode and a snapshot of project progress. |
 | `$control-room init` | Initialize the project and create a separate manual `⚫️ Control Room` console. |
 | `$control-room join` | Explicitly register an existing top-level task when automatic registration did not run. |
 | `$control-room exclude` | Exclude an unregistered task, or cancel and remove a planning/queued task while restoring its semantic title. |
@@ -104,6 +107,16 @@ Implementation remains uncommitted through review. `Approve` integrates the curr
 | `Queue status` | Show the ordered project queue. |
 
 English commands are canonical; equivalent natural-language requests are accepted. Use explicit task IDs when issuing project-wide commands from the manual console.
+
+### Autopilot
+
+Use `autopilot` (or `autopilot on`) in any chat associated with an initialized project to enable automatic approval and continuation. Use `autopilot off` to return to manual approval, and `autopilot status` for a read-only progress snapshot. Commands also work in excluded tasks and side chats without registering them; a chat without an identifiable project must name the project first.
+
+The setting persists for that project, including tasks enqueued later, until disabled. Planning tasks still need an explicit start or enqueue. Workers complete relevant verification and review before automatic approval, local integration, and the normal handoff to the next eligible task. Failed checks, unresolved decisions, user attention, and recovery needs stop automatic completion. Existing reviews need actual successful verification evidence.
+
+Off preserves running work and returns unleased automatic approvals to review. An integration already started may finish or recover. This is a return to manual approval, not a pause of the queue: later manual approval still starts eligible queued work. No background service or changes to Codex tool permissions are required.
+
+Control Room can show enabled/disabled mode, completed/total task counts, active states, dependencies and recent completions from persisted state. This is a snapshot on request; it does not continuously update an earlier chat message.
 
 ## Exclusions and task identity
 

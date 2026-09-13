@@ -7,7 +7,7 @@ const { pathIsSymbolicLink, openStore, beginTransaction, commitTransaction, roll
 const fs: typeof import("node:fs") = require("node:fs");
 const path: typeof import("node:path") = require("node:path");
 
-const { requireProject, requireTask, titleForControlRoom, serializeTask, compactActiveQueue }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
+const { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, titleForControlRoom, serializeTask, compactActiveQueue }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
 const GIT_MODE = "local-approval-commit";
 
 /**
@@ -306,9 +306,21 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
         }
         assertCondition(task.state === "APPROVED", `Cannot commit ${task.task_id} from ${task.state}.`);
         assertCondition(!project.integration_task_id, `Commit lease is already held by ${project.integration_task_id}; use recover-commit only after confirming the prior process ended.`);
+        const approval = store.database.prepare("SELECT payload_json FROM events WHERE event_key = ?").get(task.approval_event_key) as { payload_json: string } | undefined;
+        const approvalPayload = approval ? JSON.parse(approval.payload_json) as IEventPayload : null;
+        if (approvalPayload?.autopilotEventKey && !task.approved_commit) {
+            const autopilot = readAutopilotStatus(store);
+            assertCondition(autopilot.enabled && autopilot.eventKey === approvalPayload.autopilotEventKey, "Autopilot authorization was revoked before integration.");
+            const blocker = readAutopilotBlocker(store);
+            assertCondition(!blocker, `Autopilot is waiting for user attention or recovery on ${blocker}.`);
+            assertAutopilotReviewCurrent(store, task.task_id, approvalPayload.reviewEventKey);
+        }
         const workspacePath = resolveTaskWorkspace(store, task);
         const currentHead = resolveCurrentHeadIfExists(workspacePath);
         const workingTreeStatus = readWorkingTreeStatus(workspacePath);
+        if (approvalPayload?.autopilotEventKey && task.approved_commit) {
+            assertCondition(workingTreeStatus.length === 0 && currentHead === task.approved_commit, "Automatic approval recovery requires unchanged committed work; preserve new changes for review.");
+        }
         const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Resolve current branch");
         const commitsOnBase = currentBranch === project.base_branch;
         assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
@@ -436,6 +448,22 @@ function finalizeUnchangedApproval(store: IStore, taskId: string): IApprovalResu
 }
 
 /**
+ * Release an interrupted lease without retrying an automatic approval that was revoked.
+ * @param store Open project store inside the recovery transaction.
+ * @param task Task whose approved commit was not created.
+ */
+function resetUncommittedApproval(store: IStore, task: ITaskRow): IRecoveryResult {
+    const approval = store.database.prepare("SELECT payload_json FROM events WHERE event_key = ?").get(task.approval_event_key) as { payload_json: string } | undefined;
+    const authorizationKey = approval ? (JSON.parse(approval.payload_json) as IEventPayload).autopilotEventKey : undefined;
+    const autopilot = readAutopilotStatus(store);
+    const revoked = Boolean(authorizationKey && (!autopilot.enabled || autopilot.eventKey !== authorizationKey));
+    store.database.prepare("UPDATE tasks SET state = ?, approval_event_key = ?, reviewed_commit = NULL, approved_commit = NULL, integrated_commit = NULL, updated_at = ? WHERE task_id = ?").run(revoked ? "REVIEW" : "APPROVED", revoked ? null : task.approval_event_key, currentTimestamp(), task.task_id);
+    store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
+    const refreshedTask = serializeTask(requireTask(store, task.task_id));
+    return { recovered: true, finalized: false, retryCommit: !revoked, controlRoomTitle: titleForControlRoom(), task: refreshedTask, titleUpdates: revoked ? [{ taskId: task.task_id, threadId: task.thread_id, title: refreshedTask.title }] : [] };
+}
+
+/**
  * Recover a commit lease after confirming the previous commit process ended.
  * @param options Project and optional state-root settings.
  * @param taskId Task holding the stale commit lease.
@@ -492,15 +520,14 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
             beginTransaction(store.database);
             if (!detectedApprovedCommit) {
                 assertCondition(workerCommit === task.reviewed_commit, `Git history does not contain the approved commit expected for ${task.task_id}.`);
-                store.database.prepare("UPDATE tasks SET reviewed_commit = NULL, approved_commit = NULL, integrated_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+                const recovery = resetUncommittedApproval(store, task);
+                commitTransaction(store.database);
+                return recovery;
             } else {
                 store.database.prepare("UPDATE tasks SET approved_commit = ?, integrated_commit = NULL, updated_at = ? WHERE task_id = ?").run(detectedApprovedCommit, currentTimestamp(), task.task_id);
             }
             store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
             commitTransaction(store.database);
-            if (!detectedApprovedCommit) {
-                return { recovered: true, finalized: false, retryCommit: true, controlRoomTitle: titleForControlRoom(), task: serializeTask(requireTask(store, task.task_id)) };
-            }
             const retried = commitApprovedTask(options, task.task_id);
             return { ...retried, recovered: true, finalized: retried.task.state === "DONE" || retried.task.state === "PAUSED" };
         }
@@ -522,11 +549,9 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
             beginTransaction(store.database);
             const lockedProject = requireProject(store);
             assertCondition(lockedProject.integration_task_id === task.task_id, `Commit lease for ${task.task_id} changed during recovery.`);
-            store.database.prepare("UPDATE tasks SET reviewed_commit = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
-            store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
-            const retryTask = requireTask(store, task.task_id);
+            const recovery = resetUncommittedApproval(store, task);
             commitTransaction(store.database);
-            return { recovered: true, finalized: false, retryCommit: true, controlRoomTitle: titleForControlRoom(), task: serializeTask(retryTask) };
+            return recovery;
         }
         assertCondition(workerCommitIsApproval || baseCommitIsApproval, `Git history does not contain the approved commit expected for ${task.task_id}.`);
         if (baseCommitIsApproval && workerCommit !== currentBaseCommit) {

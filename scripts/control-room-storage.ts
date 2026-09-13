@@ -6,7 +6,7 @@ const path: typeof import("node:path") = require("node:path");
 const { DatabaseSync }: typeof import("node:sqlite") = require("node:sqlite");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const CURRENT_SCHEMA_VERSION = 18;
+const CURRENT_SCHEMA_VERSION = 19;
 
 /**
  * Create a secure directory if needed and restrict its mode.
@@ -319,7 +319,17 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
                 WHERE json_valid(brief_json);
             `);
         }
-        database.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+        database.exec(`
+            CREATE TABLE IF NOT EXISTS autopilot_requests (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                user_request_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};
+        `);
         commitTransaction(database);
     } catch (error) {
         rollbackTransaction(database);

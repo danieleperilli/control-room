@@ -6,6 +6,7 @@ interface IParsedArguments {
 }
 
 const USER_COMMANDS = [
+    "autopilot | autopilot on | autopilot off | autopilot status",
     "$control-room init",
     "$control-room join",
     "$control-room exclude",
@@ -18,7 +19,7 @@ const USER_COMMANDS = [
     "Run isolated now | Run T0002 isolated now",
     "Move first | Move to 3 | Move before T0002 | Move after T0002",
     "Depends on T0002 | Remove dependency T0002",
-    "Approve | Approve and pause | Resume | Cancel | Status | Queue status"
+    "Approve | Approve and pause | Resume | Reopen | Cancel | Status | Queue status"
 ];
 
 /**
@@ -108,6 +109,7 @@ User commands:
 ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 
 Commands:
+  autopilot --project-root ROOT --mode (on|off) --event-key KEY --user-request-id ID --thread-id ID [--state-root PATH]
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   install-routing --project-root ROOT [--state-root PATH]
   exclude --project-root ROOT --thread-id ID --reason TEXT [--state-root PATH]
@@ -126,6 +128,7 @@ Commands:
   request-rework --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
   request-approve-and-pause --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
+  request-autopilot-approve --project-root ROOT --task T0001 --event-key KEY --autopilot-event-key KEY --review-event-key KEY --verification TEXT --commit-message SUBJECT [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-exclude --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --reason TEXT [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
@@ -134,6 +137,7 @@ Commands:
   activate-next --project-root ROOT [--state-root PATH]
   recover-commit --project-root ROOT --task T0001 [--state-root PATH]
   resume --project-root ROOT --task T0001 [--state-root PATH]
+  reopen --project-root ROOT --task T0001 [--state-root PATH]
   commit-approved --project-root ROOT --task T0001 [--state-root PATH]
   doctor --project-root ROOT [--task T0001] [--state-root PATH]
   claim-activation --project-root ROOT --activation-key KEY [--retry-user-request-id ID] [--state-root PATH]
@@ -155,6 +159,14 @@ function executeCommand(parsed: IParsedArguments): unknown {
         return null;
     }
     const core: import("./control-room-core.ts").IControlRoomApi = require("./control-room-core.ts");
+    if (parsed.command === "autopilot") {
+        validateOptions(values, ["project-root", "mode", "event-key", "user-request-id", "thread-id", "state-root"]);
+        const mode = requireOption(values, "mode");
+        if (mode !== "on" && mode !== "off") {
+            throw new Error("--mode must be on or off.");
+        }
+        return core.setAutopilot(buildOptions(values), mode === "on", requireOption(values, "event-key"), requireOption(values, "user-request-id"), requireOption(values, "thread-id"));
+    }
     if (parsed.command === "init") {
         validateOptions(values, ["project-root", "control-room-thread", "base-branch", "state-root"]);
         const options = buildOptions(values);
@@ -285,6 +297,15 @@ function executeCommand(parsed: IParsedArguments): unknown {
             userRequestId: requireOption(values, "user-request-id")
         });
     }
+    if (parsed.command === "request-autopilot-approve") {
+        validateOptions(values, ["project-root", "task", "event-key", "autopilot-event-key", "review-event-key", "verification", "commit-message", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "APPROVAL_REQUESTED", {
+            autopilotEventKey: requireOption(values, "autopilot-event-key"),
+            reviewEventKey: requireOption(values, "review-event-key"),
+            verification: requireOption(values, "verification"),
+            commitMessage: requireOption(values, "commit-message")
+        });
+    }
     if (parsed.command === "request-approve-and-pause") {
         validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "commit-message", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "APPROVAL_REQUESTED", {
@@ -332,6 +353,10 @@ function executeCommand(parsed: IParsedArguments): unknown {
     if (parsed.command === "resume") {
         validateOptions(values, ["project-root", "task", "state-root"]);
         return core.resumeTask(buildOptions(values), requireOption(values, "task"));
+    }
+    if (parsed.command === "reopen") {
+        validateOptions(values, ["project-root", "task", "state-root"]);
+        return core.resumeTask(buildOptions(values), requireOption(values, "task"), true);
     }
     if (parsed.command === "commit-approved") {
         validateOptions(values, ["project-root", "task", "state-root"]);

@@ -1,5 +1,5 @@
 const { isolatedWorktreePathForTask }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const { requireProject, requireTask, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
+const { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
 const { resolveTaskWorkspace, cleanupCanceledIsolatedTasks, commitApprovedTask, recoverCommit }: import("./control-room-integration.ts").IIntegrationApi = require("./control-room-integration.ts");
 import type { IApprovalResult, IEventPayloadByKind, IActivationRequest, IActivationDelivery, IDeliveryRow, IExecutionBrief, IActivationResult, TaskState, EventKind, DecisionConfidence, DecisionImpact, DecisionInputStatus, IControlRoomOptions, IEventPayload, IDecision, IReviewPacket, IStore, IProjectRow, ITaskRow, ITaskExclusionRow, IEventRow, ITitleUpdate } from "./control-room-types.ts";
 const { currentTimestamp, validateThreadId, validateSemanticName, validateTaskId, validateBranchName, workerBranchForTask, validateEventKey, validateCompactText, validateDecisionId, validateDecisionPayload, validateApprovalCommitMessage, validateQueuePosition, validateEventPayload }: import("./control-room-validation.ts").IValidationApi = require("./control-room-validation.ts");
@@ -10,7 +10,7 @@ const nodeCrypto: typeof import("node:crypto") = require("node:crypto");
 const fs: typeof import("node:fs") = require("node:fs");
 const path: typeof import("node:path") = require("node:path");
 
-const TITLE_CHANGING_EVENT_ACTIONS = new Set(["RETURNED_TO_PLANNING", "ENQUEUED", "REENQUEUED", "USER_INPUT_REQUESTED", "USER_INPUT_RECEIVED", "REVIEW_READY", "REWORK_STARTED", "APPROVED", "CANCELED", "BLOCKED"]);
+const TITLE_CHANGING_EVENT_ACTIONS = new Set(["RETURNED_TO_PLANNING", "ENQUEUED", "REENQUEUED", "USER_INPUT_REQUESTED", "USER_INPUT_RECEIVED", "REVIEW_READY", "REVIEW_ALREADY_RECORDED", "REWORK_STARTED", "APPROVED", "CANCELED", "BLOCKED"]);
 const GIT_MODE = "local-approval-commit";
 const ROUTING_FILE_LIMIT_BYTES = 1024 * 1024;
 const WORKTREE_IGNORE_PATTERN = ".control-room/";
@@ -161,6 +161,7 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "- Persistently exclude an unregistered task before automatic registration when it invokes or triggers `$brand-forge`, or when its message contains the exact standalone `$control-room exclude` directive.",
         "- For a registered PLANNING or QUEUED task, route `$control-room exclude` through cancellation and settlement so it leaves the queue and regains its undecorated semantic title.",
         "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
+        "- Route a direct `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status` command to the project before worker registration or exclusion handling, including from side chats. Autopilot authorizes automatic completion of explicitly started or queued work until disabled; it does not enqueue planning tasks. Follow the skill's autopilot reference for approval and progress.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
         "- Treat a direct user `Enqueue` command as advance authorization for that exact registered task to start automatically when it becomes the first dependency-eligible queued worker. After settlement activates it, send one activation brief to its recorded thread without asking for another confirmation merely because a different task's approval freed the queue. This authorization never covers another task, thread, project, or implementation scope.",
         "- Apply every ControlRoom task title update before replying.",
@@ -359,7 +360,12 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
     try {
         beginTransaction(store.database);
         requireProject(store);
-        const task = requireTask(store, validTaskId);
+        let task = requireTask(store, validTaskId);
+        if (kind === "APPROVAL_REQUESTED" && validPayload.autopilotEventKey) {
+            const authorization = store.database.prepare("SELECT user_request_id FROM autopilot_requests WHERE event_key = ? AND enabled = 1").get(validPayload.autopilotEventKey) as { user_request_id: string } | undefined;
+            assertCondition(authorization, "Unknown autopilot authorization.");
+            validPayload.userRequestId = authorization.user_request_id;
+        }
         const payloadJson = JSON.stringify(validPayload);
         const existingEvent = store.database.prepare("SELECT event_key, task_id, kind, payload_json, processed_at FROM events WHERE event_key = ?").get(validEventKey) as Record<string, unknown> | undefined;
         if (existingEvent) {
@@ -370,6 +376,14 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
                 processed: Boolean(existingEvent.processed_at),
                 eventKey: validEventKey
             };
+        }
+        const replacesAutomaticApproval = ["REWORK_REQUESTED", "REVIEW_REQUESTED", "BLOCKED_REPORTED", "CANCEL_REQUESTED"].includes(kind) || (kind === "APPROVAL_REQUESTED" && !validPayload.autopilotEventKey);
+        if (task.state === "APPROVED" && replacesAutomaticApproval && requireProject(store).integration_task_id !== task.task_id) {
+            const automatic = store.database.prepare("SELECT 1 FROM events WHERE event_key = ? AND json_extract(payload_json, '$.autopilotEventKey') IS NOT NULL").get(task.approval_event_key);
+            if (automatic) {
+                store.database.prepare("UPDATE tasks SET state = 'REVIEW', approval_event_key = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
+                task = requireTask(store, validTaskId);
+            }
         }
         if (kind === "PLANNING_REQUESTED") {
             assertCondition(task.state === "QUEUED" || task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
@@ -421,9 +435,13 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record review context for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
+            assertCondition(!task.awaiting_user || !readAutopilotStatus(store).enabled, "Resolve awaited user input before autopilot review.");
         } else if (kind === "REWORK_REQUESTED") {
             assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
+            if (validPayload.autopilotEventKey) {
+                validateAutopilotApproval(store, task, validPayload);
+            }
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
         } else if (kind === "CANCEL_REQUESTED") {
@@ -451,6 +469,71 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
     } finally {
         store.database.close();
     }
+}
+
+/**
+ * Record a project-wide mode change without registering or interrupting the caller.
+ * @param options Project and optional state-root settings.
+ * @param enabled Whether automatic approval is authorized.
+ * @param eventKey Stable retry key for this command.
+ * @param userRequestId Actual direct-user message authorizing the mode change.
+ * @param threadId Task or side chat containing that user message.
+ */
+function setAutopilot(options: IControlRoomOptions, enabled: boolean, eventKey: string, userRequestId: string, threadId: string): Record<string, unknown> {
+    assertCondition(typeof enabled === "boolean", "Autopilot mode must be a boolean.");
+    const validEventKey = validateEventKey(eventKey);
+    const validRequestId = validateCompactText(userRequestId, "Direct user request ID", 200, true)!;
+    const validThreadId = validateThreadId(threadId);
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        const project = requireProject(store);
+        const existing = store.database.prepare("SELECT * FROM autopilot_requests WHERE event_key = ?").get(validEventKey) as { enabled: number; user_request_id: string; thread_id: string } | undefined;
+        const titleUpdates: ITitleUpdate[] = [];
+        if (existing) {
+            assertCondition(Boolean(existing.enabled) === enabled && existing.user_request_id === validRequestId && existing.thread_id === validThreadId, "Autopilot event key already exists with different content.");
+        } else {
+            const timestamp = currentTimestamp();
+            store.database.prepare("INSERT INTO autopilot_requests (event_key, enabled, user_request_id, thread_id, created_at) VALUES (?, ?, ?, ?, ?)").run(validEventKey, Number(enabled), validRequestId, validThreadId, timestamp);
+            // An integration that already holds its lease must finish or recover normally.
+            const revoked = store.database.prepare(`
+                SELECT task.task_id FROM tasks AS task JOIN events ON events.event_key = task.approval_event_key
+                WHERE task.state = 'APPROVED' AND task.task_id <> COALESCE(?, '')
+                    AND json_extract(events.payload_json, '$.autopilotEventKey') IS NOT NULL
+            `).all(project.integration_task_id) as Array<{ task_id: string }>;
+            for (const task of revoked) {
+                store.database.prepare("UPDATE tasks SET state = 'REVIEW', approval_event_key = NULL, approval_target = 'DONE', updated_at = ? WHERE task_id = ?").run(timestamp, task.task_id);
+                const refreshed = requireTask(store, task.task_id);
+                titleUpdates.push({ taskId: refreshed.task_id, threadId: refreshed.thread_id, title: titleForTask(refreshed) });
+            }
+        }
+        const autopilot = readAutopilotStatus(store);
+        commitTransaction(store.database);
+        return { changed: !existing, autopilot, controlRoomThreadId: project.coordinator_thread_id, integrationTaskId: project.integration_task_id, titleUpdates };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Bind an automatic approval to the current authorization and successful review.
+ * @param store Open project store inside the event transaction.
+ * @param task Task proposed for automatic completion.
+ * @param payload Validated automatic approval and verification evidence.
+ */
+function validateAutopilotApproval(store: IStore, task: ITaskRow, payload: IEventPayload): void {
+    const autopilot = readAutopilotStatus(store);
+    assertCondition(autopilot.enabled && autopilot.eventKey === payload.autopilotEventKey && autopilot.userRequestId === payload.userRequestId, "Autopilot authorization is disabled or superseded.");
+    assertCondition(task.state === "REVIEW", `Autopilot requires ${task.task_id} to be in REVIEW.`);
+    assertCondition(!requireProject(store).integration_task_id, "Finish the pending integration before automatic approval.");
+    const blocker = readAutopilotBlocker(store);
+    assertCondition(!blocker, `Autopilot is waiting for user attention or recovery on ${blocker}.`);
+    assertAutopilotReviewCurrent(store, task.task_id, payload.reviewEventKey);
+    const reviewPacket = readReviewPacketFromStore(store, task.task_id);
+    assertCondition(!reviewPacket.decisions.some((decision) => decision.status !== "superseded" && (decision.status === "unresolved" || decision.confidence === "low")), "Resolve pending or low-confidence decisions before automatic approval.");
 }
 
 /**
@@ -507,8 +590,10 @@ function readReviewPacketFromStore(store: IStore, taskId: string): IReviewPacket
         const rightSuperseded = right.status === "superseded" ? 1 : 0;
         return leftSuperseded - rightSuperseded || confidenceOrder[left.confidence] - confidenceOrder[right.confidence] || impactOrder[left.impact] - impactOrder[right.impact] || left.decisionId.localeCompare(right.decisionId, "en-US");
     });
+    const latestReview = store.database.prepare("SELECT event_key FROM events WHERE task_id = ? AND kind = 'REVIEW_REQUESTED' AND processed_at IS NOT NULL AND json_extract(result_json, '$.action') IN ('REVIEW_READY', 'REVIEW_ALREADY_RECORDED') ORDER BY sequence DESC LIMIT 1").get(validTaskId) as { event_key: string } | undefined;
     return {
         taskId: validTaskId,
+        reviewEventKey: latestReview?.event_key || null,
         decisionCount: decisions.length,
         unresolvedDecisionIds: decisions.filter((decision) => decision.status === "unresolved").map((decision) => decision.decisionId),
         decisions
@@ -850,6 +935,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return applyDecisionEvent(store, task, payload);
     }
     if (event.kind === "REVIEW_REQUESTED") {
+        assertCondition(!task.awaiting_user || !readAutopilotStatus(store).enabled, "Resolve awaited user input before autopilot review.");
         if (task.state === "APPROVED" || task.state === "DONE") {
             return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: readReviewPacketFromStore(store, task.task_id) };
         }
@@ -872,6 +958,9 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return { action: "REWORK_STARTED", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
     if (event.kind === "APPROVAL_REQUESTED") {
+        if (payload.autopilotEventKey) {
+            validateAutopilotApproval(store, task, payload);
+        }
         if (task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE") {
             const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
             return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId, commitMessage, approvalTarget: task.approval_target };
@@ -883,7 +972,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         const approvalTarget = payload.approvalTarget || "DONE";
         store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, approval_event_key = ?, approval_target = ?, updated_at = ? WHERE task_id = ?").run(event.event_key, approvalTarget, currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage, approvalTarget };
+        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage, approvalTarget, approvalMode: payload.autopilotEventKey ? "autopilot" : "manual" };
     }
     if (event.kind === "CANCEL_REQUESTED") {
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Cancellation requires a direct user request ID.");
@@ -1185,6 +1274,11 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
     try {
         beginTransaction(store.database);
         const project = requireProject(store);
+        const autopilotBlocker = readAutopilotStatus(store).enabled ? readAutopilotBlocker(store) : null;
+        if (autopilotBlocker) {
+            commitTransaction(store.database);
+            return { activated: false, controlRoomTitle: titleForControlRoom(), reason: "AUTOPILOT_WAITING", taskId: autopilotBlocker };
+        }
         const exclusiveTask = store.database.prepare("SELECT task_id, state FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as { task_id: string; state: TaskState } | undefined;
         if (exclusiveTask) {
             const controlRoomTitle = titleForControlRoom();
@@ -1294,18 +1388,51 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
 }
 
 /**
- * Resume a paused task to planning or a blocked task to its recorded prior state.
+ * Resume a paused or explicitly reopened completed task, or restore a blocked task.
  * @param options Project and optional state-root settings.
- * @param taskId Paused or blocked task identifier.
+ * @param taskId Task identifier.
+ * @param reopen Whether the user explicitly requested reopening completed work.
  */
-function resumeTask(options: IControlRoomOptions, taskId: string): Record<string, unknown> {
+function resumeTask(options: IControlRoomOptions, taskId: string, reopen = false): Record<string, unknown> {
     const store = openStore(options);
     try {
         beginTransaction(store.database);
-        requireProject(store);
+        const project = requireProject(store);
         const task = requireTask(store, taskId);
-        if (task.state === "PAUSED") {
+        if (reopen && task.state === "PLANNING") {
+            commitTransaction(store.database);
+            return { reopened: false, task: serializeTask(task), titleUpdates: [{ taskId: task.task_id, threadId: task.thread_id, title: titleForTask(task) }] };
+        }
+        if (reopen) assertCondition(task.state === "DONE", `Cannot reopen ${task.task_id} from ${task.state}.`);
+        if (task.state === "PAUSED" || reopen) {
+            assertCondition(!project.integration_task_id, "Approval integration must finish before resuming or reopening work.");
+            if (reopen && task.workspace_mode === "shared" && task.branch_name && !task.worktree_path) {
+                const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
+                assertCondition(!workerHead || workerHead === task.base_commit, "Completed worker branch changed; preserve its work.");
+                const branch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read completed worker branch");
+                if (branch === task.branch_name) {
+                    assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Completed worker checkout changed; preserve its work.");
+                    requireGit(store.projectRoot, ["checkout", project.base_branch], "Return completed worker to base");
+                }
+                if (workerHead) requireGit(store.projectRoot, ["branch", "-d", task.branch_name], "Release unchanged completed worker branch");
+                task.branch_name = null;
+            }
             assertCondition(!task.branch_name && !task.worktree_path, `${task.task_id} still owns a workspace and cannot return to PLANNING safely.`);
+            const deferred = store.database.prepare("SELECT * FROM tasks WHERE handoff_sender_task_id = ?").all(task.task_id) as unknown as ITaskRow[];
+            assertCondition(reopen || deferred.length === 0, "Resolve the pending activation handoff before resuming.");
+            assertCondition(deferred.length <= 1, "Resolve multiple pending handoffs before reopening.");
+            for (const destination of deferred) {
+                const delivery = store.database.prepare("SELECT state FROM activation_deliveries WHERE task_id = ? AND state IN ('PENDING', 'CLAIMED')").get(destination.task_id) as { state: string } | undefined;
+                assertCondition(destination.state === "RUNNING" && destination.workspace_mode === "shared" && !destination.worktree_path && destination.branch_name && delivery?.state === "PENDING", `Cannot defer ${destination.task_id}: its activation may already have been delivered.`);
+                assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Cannot defer a changed shared checkout.");
+                const branch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read pending activation branch");
+                const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, destination.branch_name);
+                assertCondition((branch === destination.branch_name || branch === project.base_branch) && (!workerHead || workerHead === destination.base_commit) && resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch) === destination.base_commit, "Pending activation or base branch changed; preserve its workspace.");
+                if (branch !== project.base_branch) requireGit(store.projectRoot, destination.base_commit ? ["checkout", project.base_branch] : ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], "Return undelivered activation to base");
+                if (workerHead) requireGit(store.projectRoot, ["branch", "-d", destination.branch_name], "Remove unchanged undelivered branch");
+                store.database.prepare("UPDATE activation_deliveries SET state = 'CANCELED', updated_at = ? WHERE task_id = ? AND state = 'PENDING'").run(currentTimestamp(), destination.task_id);
+                store.database.prepare("UPDATE tasks SET state = 'QUEUED', base_commit = NULL, branch_name = NULL, handoff_sender_task_id = NULL, awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), destination.task_id);
+            }
             store.database.prepare(`
                 UPDATE tasks
                 SET state = 'PLANNING', blocked_from_state = NULL, awaiting_user = 0,
@@ -1317,7 +1444,7 @@ function resumeTask(options: IControlRoomOptions, taskId: string): Record<string
             `).run(currentTimestamp(), task.task_id);
             const resumedTask = requireTask(store, task.task_id);
             commitTransaction(store.database);
-            return { resumed: true, resumedFrom: "PAUSED", task: serializeTask(resumedTask), titleUpdates: [{ taskId: resumedTask.task_id, threadId: resumedTask.thread_id, title: titleForTask(resumedTask) }] };
+            return { resumed: true, resumedFrom: task.state, deferredTaskIds: deferred.map((destination) => destination.task_id), task: serializeTask(resumedTask), titleUpdates: [{ taskId: resumedTask.task_id, threadId: resumedTask.thread_id, title: titleForTask(resumedTask) }, ...readQueuedTitleUpdates(store, 1)] };
         }
         assertCondition(task.state === "BLOCKED" && task.blocked_from_state, `${task.task_id} is not resumable.`);
         if (task.workspace_mode === "shared" && (task.blocked_from_state === "RUNNING" || task.blocked_from_state === "REVIEW")) {
@@ -1385,11 +1512,13 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
     }
     try {
         const project = requireProject(store);
+        const autopilot = readAutopilotStatus(store);
         if (taskId) {
             const task = requireTask(store, taskId);
             const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE";
             return {
                 projectRoot: store.projectRoot,
+                autopilot,
                 controlRoomTitle: titleForControlRoom(),
                 task: serializeTask(task),
                 ...(includesReviewPacket ? { reviewPacket: readReviewPacketFromStore(store, task.task_id) } : {})
@@ -1397,7 +1526,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         }
         if (validThreadId) {
             if (validThreadId === project.coordinator_thread_id) {
-                return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
+                return { projectRoot: store.projectRoot, autopilot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
             }
             const task = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.thread_id = ?`).get(validThreadId) as ITaskRow | undefined;
             const exclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
@@ -1405,6 +1534,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
             const includesReviewPacket = task && (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE");
             return {
                 projectRoot: store.projectRoot,
+                autopilot,
                 controlRoomTitle: titleForControlRoom(),
                 controlRoomThreadId: project.coordinator_thread_id,
                 role: isExcluded ? "EXCLUDED" : task ? "WORKER" : "UNREGISTERED",
@@ -1420,6 +1550,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         }
         return {
             projectRoot: store.projectRoot,
+            autopilot,
             controlRoomTitle: titleForControlRoom(),
             controlRoomThreadId: project.coordinator_thread_id,
             baseBranch: project.base_branch,
@@ -1443,7 +1574,7 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
         return { ...store, queue: [] };
     }
     try {
-        requireProject(store);
+        const project = requireProject(store);
         const tasks = store.database.prepare(`
             ${TASK_WITH_QUEUED_POSITION_SELECT}
             WHERE task.state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
@@ -1453,7 +1584,10 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
         for (const task of tasks) {
             queue.push({ ...serializeTask(task), dependencies: readTaskDependencies(store, task.task_id) });
         }
-        return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), queue };
+        const progress = store.database.prepare("SELECT COUNT(CASE WHEN state = 'DONE' THEN 1 END) AS completed, COUNT(*) AS total FROM tasks WHERE state NOT IN ('PLANNING', 'PAUSED', 'CANCELED')").get() as { completed: number; total: number };
+        const completedTasks = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.state = 'DONE' ORDER BY task.updated_at DESC, task.task_number DESC LIMIT 5`).all() as unknown as ITaskRow[];
+        const pendingActivations = store.database.prepare("SELECT task_id AS taskId, activation_key AS activationKey, state FROM activation_deliveries WHERE state IN ('PENDING', 'CLAIMED') ORDER BY created_at, task_id").all();
+        return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), autopilot: readAutopilotStatus(store), integrationTaskId: project.integration_task_id, pendingActivations, capturedAt: currentTimestamp(), progress: { ...progress }, completedTasks: completedTasks.map((task) => serializeTask(task)), queue };
     } finally {
         store.database.close();
     }
@@ -1540,6 +1674,8 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         const activeQueue = queue.queue as Record<string, unknown>[];
         return {
             settled: false,
+            autopilot: queue.autopilot,
+            progress: queue.progress,
             reason: "COMMIT_RECOVERY_REQUIRED",
             commitTaskId: status.commitTaskId,
             controlRoomTitle: titleForControlRoom(),
@@ -1580,6 +1716,8 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
     const reviewPackets = reviewTasks.map((task) => getReviewPacket(options, String(task.taskId)));
     return {
         settled: !status.commitTaskId,
+        autopilot: queue.autopilot,
+        progress: queue.progress,
         controlRoomTitle: titleForControlRoom(),
         processed,
         completion: completions[0] || null,
@@ -1811,6 +1949,7 @@ const api = {
     registerTask,
     resumeTask,
     settleProject,
+    setAutopilot,
     submitEvent,
     titleForControlRoom,
     titleForTask

@@ -76,6 +76,10 @@ node <skill-dir>/scripts/control-room.ts request-rework --project-root <root> --
 
 ## State machine
 
+Autopilot is a project setting, defaulting to off. Schema 19 adds append-only `autopilot_requests` with stable command keys and originating user/thread references. `autopilot --mode on|off` changes it without a worker ID. Automatic `APPROVAL_REQUESTED` events carry `autopilotEventKey`, `reviewEventKey`, and successful `verification`; their `userRequestId` is derived from the recorded on command. Processing requires current authorization, `REVIEW`, the latest successful review, and no blocking attention or decisions. Off or renewal revokes automatic approvals that have not acquired an integration lease. Status, queue, and settlement expose mode; queue also exposes project completion counts and recent completed tasks. See [autopilot.md](autopilot.md).
+
+`reopen --project-root <root> --task <T_ID>` explicitly returns `DONE -> PLANNING` with the same identity and retained review/event history. It resets execution/approval anchors like paused resumption. Only an unchanged, unclaimed successor attached to a pending handoff can be returned to the queue; the CLI preserves changed or potentially delivered work. See [execution.md](execution.md) for immediate follow-up execution.
+
 ```text
 PLANNING -> QUEUED -> RUNNING <-> REVIEW
 RUNNING, REVIEW -> APPROVED -> DONE

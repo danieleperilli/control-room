@@ -232,6 +232,18 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
     if (kind === "APPROVAL_REQUESTED") {
         const approvalTarget = payload.approvalTarget || "DONE";
         assertCondition(approvalTarget === "DONE" || approvalTarget === "PAUSED", "Approval target must be DONE or PAUSED.");
+        if (payload.autopilotEventKey !== undefined) {
+            assertCondition(approvalTarget === "DONE", "Autopilot can only approve completed work.");
+            assertCondition(payload.userRequestId === undefined, "Autopilot approval derives its user request from the recorded authorization.");
+            return {
+                approvalTarget,
+                commitMessage: validateCommitMessage(payload.commitMessage),
+                autopilotEventKey: validateEventKey(payload.autopilotEventKey),
+                reviewEventKey: validateEventKey(payload.reviewEventKey || ""),
+                verification: validateCompactText(payload.verification, "Successful verification summary", 2000, true)
+            };
+        }
+        assertCondition(payload.reviewEventKey === undefined && payload.verification === undefined, "Autopilot evidence requires an autopilot authorization key.");
         return {
             approvalTarget,
             commitMessage: validateCommitMessage(payload.commitMessage),

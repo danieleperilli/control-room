@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate Codex project tasks with a deterministic queue, explicit isolated execution, review and approval-only Git integration. Use for $control-room init, join, exclude, queue, help or doctor; project turns after ControlRoom initialization; and lifecycle commands such as Enqueue, Run now, Run isolated now, Approve, Approve and pause, Resume or Cancel. Keep read-only requests, excluded tasks, subagents and side chats outside automatic registration. An explicitly created top-level task registers itself.
+description: Coordinate Codex project tasks with a deterministic queue, optional autopilot, explicit isolated execution, review and authorized Git integration. Use for autopilot on/off/status in any project chat; $control-room init, join, exclude, queue, help or doctor; project turns after initialization; and lifecycle commands such as Enqueue, Run now, Approve, Resume or Cancel. Keep read-only requests, excluded tasks, subagents and side chats outside automatic registration.
 ---
 
 # ControlRoom
@@ -14,6 +14,7 @@ Preserve the complete user message. Never consume the substantive request while 
 - `$control-room help`: run CLI `help`; no project is required.
 - `$control-room queue`: run `queue --project-root <canonical-root>`.
 - `$control-room doctor`: run `doctor --project-root <canonical-root> [--task <T_ID>]`. Explain the reported blockers and next actions; do not repair state, send messages, register tasks or update titles.
+- A direct `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status` (also with `$control-room`): read [autopilot.md](references/autopilot.md) before ordinary role routing. The command applies to the selected project from any user chat, including an excluded task or side chat, without registering the caller. Discussion or quoted commands do not change the mode.
 - For initialization, explicit join/exclusion, or explicit side-chat creation of a top-level task, read [registration.md](references/registration.md).
 - Subagents and side chats never receive a `T_ID` or mutate queue state on their own behalf. A side chat creates a separate top-level **Local** task only when the user explicitly asks, preserving the delegated request while removing the task-creation wrapper.
 
@@ -36,7 +37,9 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 - Normal execution is serial in the shared checkout. Concurrent isolated execution requires an explicit request for each task and uses `.control-room/worktrees/<T_ID>`; every file operation uses the returned `workspacePath`.
 - An activated worker may modify project files immediately inside its assigned workspace. Read [review.md](references/review.md) before recording material decisions, requesting review or processing approval.
 - Keep changes uncommitted during implementation and review. New implementation feedback in `REVIEW` first records rework. A direct `Approve` or `Approve and pause` is final authorization from `RUNNING` or `REVIEW`; do not ask for another confirmation.
+- After recording review, read current project status. If autopilot is enabled, follow [autopilot.md](references/autopilot.md) to complete verified work and deliver the next activation in the same turn. Use the stored explicit authorization; never fabricate a new direct approval or treat cached mode as current.
 - Dependencies require `DONE`; an approved checkpoint ends in `PAUSED`, releases its workspace and remains unsatisfied. `Resume` returns that same identity to planning.
+- An explicit `Reopen` returns a completed task to planning with the same identity and history. Follow the reopening procedure in [execution.md](references/execution.md); a request to implement the follow-up also authorizes its immediate `Run now` request.
 - Submit events with stable retry keys and settle in the requesting task. Apply every returned title update before the final response. Routine success is concise; surface actual failures and missing delivery confirmations.
 - Activation and delivery are separate. The CLI persists each brief before returning it. Follow the claim/send/confirm workflow in [execution.md](references/execution.md); a `RUNNING` state alone does not prove delivery. An uncertain claim must not be resent automatically.
 - Never push, open a pull request, rebase or force-update history through this workflow. Preserve changed workspaces on cancellation or integration conflicts.
@@ -48,6 +51,7 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 | [registration.md](references/registration.md) | Initializing, registering, joining, excluding or explicitly creating a top-level task |
 | [execution.md](references/execution.md) | Queue commands, activation delivery, rework, task titles or user-attention markers |
 | [review.md](references/review.md) | Decisions, review or approval |
+| [autopilot.md](references/autopilot.md) | Project-wide automatic approval, on/off commands or progress display |
 | [recovery.md](references/recovery.md) | An interrupted approval/cleanup, uncertain delivery or diagnostic failure needs recovery |
 | [protocol.md](references/protocol.md) | Exact event semantics, storage or an unfamiliar lower-level CLI operation |
 

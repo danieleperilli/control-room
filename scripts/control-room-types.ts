@@ -16,6 +16,7 @@ export interface IStoreLocation {
     projectKey: string;
     projectRoot: string;
     databasePath: string;
+    legacyDatabasePath?: string;
 }
 
 export interface IUnavailableState {

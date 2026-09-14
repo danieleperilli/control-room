@@ -211,6 +211,14 @@ function installWorktreeIgnore(options: IControlRoomOptions): Record<string, unk
     } finally {
         store.database.close();
     }
+    return installWorktreeIgnoreAtRoot(projectRoot);
+}
+
+/**
+ * Exclude runtime state and worktrees before creating or relocating project data.
+ * @param projectRoot Validated canonical project root.
+ */
+function installWorktreeIgnoreAtRoot(projectRoot: string): Record<string, unknown> {
     const ignorePath = path.join(projectRoot, ".gitignore");
     if (fs.existsSync(ignorePath)) {
         const ignoreStatus = fs.lstatSync(ignorePath);
@@ -1944,6 +1952,7 @@ const api = {
     initializeProject,
     installProjectRouting,
     installWorktreeIgnore,
+    installWorktreeIgnoreAtRoot,
     processPendingEvents,
     recoverCommit,
     registerTask,

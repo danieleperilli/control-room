@@ -57,3 +57,11 @@ Run `doctor --project-root <root> [--task T0001]` to inspect runtime capabilitie
 Doctor does not repair, migrate, deliver messages or change titles. State reads return `NOT_INITIALIZED` without creating directories or a database. Older schemas return `MIGRATION_REQUIRED` without migration. For a requested state-changing operation in an existing project, run `install-routing` to migrate and repair the existing registration, then read status again. Do not create another console. Unsupported future schemas and unsafe symbolic links fail explicitly.
 
 For `ACTIVATION_PENDING` or `DELIVERY_UNCONFIRMED`, follow [execution.md](execution.md). A claimed brief may already be delivered; first inspect the destination history. Existing enqueue authorization still covers the initial handoff, but an uncertain retry requires a new direct user authorization. Doctor itself grants no permission to send or recover a still-running process.
+
+## Storage relocation
+
+The default database is `<project-root>/.control-room/state.sqlite`. Reads continue to recognize an existing database in the historical Codex-home location. The first mutating command moves it automatically and keeps the same console, tasks, queue, approvals and delivery history. `--state-root` is an explicit override and is not relocated.
+
+If relocation reports a busy database, finish the other legacy SQLite commands and retry the same operation. Use the updated CLI for every caller; older processes and direct access to the historical file do not participate in the relocation lock. A process interruption leaves a receipt in `.control-room/state-migration.json`; retrying resumes the transfer. Do not delete the receipt or `.state-migration-lock`. The latter is a persistent lock file whose operating-system locks disappear when its process exits.
+
+If both locations exist without a receipt, or a recorded digest no longer matches, preserve both databases and inspect the conflict before resuming. Never initialize another console, overwrite a copy or discard a WAL file to bypass these errors. Removing the legacy file during migration may require one final authorization to write outside the project. Subsequent state writes use the project directory.

@@ -342,21 +342,34 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
  * @param options Project and optional state-root settings.
  */
 function openStore(options: IControlRoomOptions): IStore {
-    const { projectRoot, projectKey, databasePath } = resolveStoreLocation(options);
-    ensurePrivateDirectory(path.dirname(path.dirname(databasePath)));
+    const location = resolveStoreLocation(options);
+    if (!options.stateRoot) {
+        const { migrateProjectStore }: import("./control-room-storage-migration.ts").IStorageMigrationApi = require("./control-room-storage-migration.ts");
+        migrateProjectStore(location);
+    } else {
+        ensurePrivateDirectory(path.dirname(path.dirname(location.databasePath)));
+    }
+    const { projectRoot, projectKey, databasePath } = location;
     ensurePrivateDirectory(path.dirname(databasePath));
-    const database = new DatabaseSync(databasePath);
-    try {
-        database.exec("PRAGMA busy_timeout = 5000");
-        database.exec("PRAGMA foreign_keys = ON");
-        database.exec("PRAGMA journal_mode = WAL");
-        database.exec("PRAGMA synchronous = FULL");
-        initializeSchema(database);
-        fs.chmodSync(databasePath, 0o600);
-        return { database, databasePath, projectKey, projectRoot };
-    } catch (error) {
-        database.close();
-        throw error;
+    const deadline = Date.now() + 5000;
+    while (true) {
+        const database = new DatabaseSync(databasePath);
+        try {
+            database.exec("PRAGMA busy_timeout = 5000");
+            database.exec("PRAGMA foreign_keys = ON");
+            database.exec("PRAGMA journal_mode = WAL");
+            database.exec("PRAGMA synchronous = FULL");
+            initializeSchema(database);
+            fs.chmodSync(databasePath, 0o600);
+            return { database, databasePath, projectKey, projectRoot };
+        } catch (error) {
+            database.close();
+            if (!error || typeof error !== "object" || !("errcode" in error) || (Number(error.errcode) & 0xff) !== 5 || Date.now() >= deadline) {
+                throw error;
+            }
+            // Journal-mode transitions can return SQLITE_BUSY without invoking busy_timeout.
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        }
     }
 }
 
@@ -368,18 +381,37 @@ function resolveStoreLocation(options: IControlRoomOptions): IStoreLocation {
     const projectRoot = canonicalizeProjectRoot(options.projectRoot);
     const stateRoot = options.stateRoot ? path.resolve(options.stateRoot) : path.join(resolveCodexHome(), "control-room", "projects");
     const projectKey = nodeCrypto.createHash("sha256").update(projectRoot).digest("hex").slice(0, 24);
-    const projectDirectory = path.join(stateRoot, projectKey);
+    const projectDirectory = options.stateRoot ? path.join(stateRoot, projectKey) : path.join(projectRoot, ".control-room");
     const databasePath = path.join(projectDirectory, "state.sqlite");
-    for (const directory of [stateRoot, projectDirectory]) {
-        assertCondition(!pathIsSymbolicLink(directory), `State directory cannot be a symbolic link: ${directory}`);
-        if (fs.existsSync(directory)) {
-            assertCondition(fs.lstatSync(directory).isDirectory(), `State path is not a directory: ${directory}`);
-        }
+    const legacyDatabasePath = options.stateRoot ? undefined : path.join(stateRoot, projectKey, "state.sqlite");
+    for (const directory of options.stateRoot ? [stateRoot, projectDirectory] : [projectDirectory, stateRoot, path.dirname(legacyDatabasePath!)]) {
+        const status = fs.lstatSync(directory, { throwIfNoEntry: false });
+        assertCondition(!status?.isSymbolicLink(), `State directory cannot be a symbolic link: ${directory}`);
+        assertCondition(!status || status.isDirectory(), `State path is not a directory: ${directory}`);
     }
-    for (const target of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
-        assertCondition(!pathIsSymbolicLink(target), `State database cannot be a symbolic link: ${target}`);
+    for (const target of [databasePath, legacyDatabasePath].filter((value): value is string => Boolean(value)).flatMap((value) => [value, `${value}-wal`, `${value}-shm`, `${value}-journal`])) {
+        const status = fs.lstatSync(target, { throwIfNoEntry: false });
+        assertCondition(!status?.isSymbolicLink(), `State database cannot be a symbolic link: ${target}`);
+        assertCondition(!status || status.isFile(), `State database is not a regular file: ${target}`);
     }
-    return { projectRoot, projectKey, databasePath };
+    return { projectRoot, projectKey, databasePath, ...(legacyDatabasePath ? { legacyDatabasePath } : {}) };
+}
+
+/**
+ * Read the verified receipt for an interrupted transfer without changing state.
+ * @param location Validated paths for the canonical project.
+ */
+function readMigrationDigest(location: IStoreLocation): string | undefined {
+    const receiptPath = path.join(path.dirname(location.databasePath), "state-migration.json");
+    assertCondition(!pathIsSymbolicLink(receiptPath), `Migration receipt cannot be a symbolic link: ${receiptPath}`);
+    if (!fs.existsSync(receiptPath)) {
+        return undefined;
+    }
+    const status = fs.lstatSync(receiptPath);
+    assertCondition(status.isFile() && status.size <= 4096, "Invalid ControlRoom storage migration receipt.");
+    const receipt: unknown = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    assertCondition(receipt !== null && typeof receipt === "object" && "source" in receipt && receipt.source === location.legacyDatabasePath && "sha256" in receipt && typeof receipt.sha256 === "string" && /^[a-f0-9]{64}$/u.test(receipt.sha256), "Invalid ControlRoom storage migration receipt.");
+    return receipt.sha256;
 }
 
 /**
@@ -388,31 +420,67 @@ function resolveStoreLocation(options: IControlRoomOptions): IStoreLocation {
  */
 function openReadStore(options: IControlRoomOptions): IStore | IUnavailableState {
     const location = resolveStoreLocation(options);
-    if (!fs.existsSync(location.databasePath)) {
-        return { initialized: false, reason: "NOT_INITIALIZED", projectRoot: location.projectRoot };
-    }
-    const database = new DatabaseSync(location.databasePath, { readOnly: true });
+    const localDatabasePath = location.databasePath;
+    const lockPath = path.join(path.dirname(location.databasePath), ".state-migration-lock");
+    assertCondition(!pathIsSymbolicLink(lockPath), `Migration lock cannot be a symbolic link: ${lockPath}`);
+    const migrationLock = !options.stateRoot && fs.existsSync(lockPath) ? new DatabaseSync(lockPath, { readOnly: true }) : undefined;
     try {
-        database.exec("PRAGMA busy_timeout = 5000");
-        database.exec("PRAGMA query_only = ON");
-        const schemaVersion = Number(database.prepare("PRAGMA user_version").get()?.user_version);
-        assertCondition(schemaVersion >= 0 && schemaVersion <= CURRENT_SCHEMA_VERSION, `Unsupported Control Room schema version: ${schemaVersion}`);
-        if (schemaVersion !== CURRENT_SCHEMA_VERSION) {
-            database.close();
-            return { initialized: false, reason: "MIGRATION_REQUIRED", projectRoot: location.projectRoot, schemaVersion, expectedSchemaVersion: CURRENT_SCHEMA_VERSION };
+        if (migrationLock) {
+            migrationLock.exec("PRAGMA busy_timeout = 5000; BEGIN");
+            migrationLock.prepare("SELECT count(*) FROM sqlite_master").get();
         }
-        const project = database.prepare("SELECT project_root FROM projects WHERE project_key = ?").get(location.projectKey);
-        if (!project) {
-            database.close();
-            return { initialized: false, reason: "NOT_INITIALIZED", projectRoot: location.projectRoot };
+        if (location.legacyDatabasePath) {
+            const pendingDigest = readMigrationDigest(location);
+            if (fs.existsSync(location.legacyDatabasePath)) {
+                assertCondition(!fs.existsSync(location.databasePath) || pendingDigest !== undefined, "Both local and legacy ControlRoom databases exist; preserve both and resolve the storage conflict before continuing.");
+                location.databasePath = location.legacyDatabasePath;
+            } else {
+                assertCondition(pendingDigest === undefined || fs.existsSync(location.databasePath), "Interrupted ControlRoom migration is missing both databases; preserve the receipt for recovery.");
+            }
         }
-        assertCondition(project.project_root === location.projectRoot, "Stored project root does not match the canonical project root.");
-        return { ...location, database };
-    } catch (error) {
-        if (database.isOpen) {
-            database.close();
+        if (!fs.existsSync(location.databasePath)) {
+            if (location.databasePath === location.legacyDatabasePath && fs.existsSync(localDatabasePath)) {
+                location.databasePath = localDatabasePath;
+            } else {
+                return { initialized: false, reason: "NOT_INITIALIZED", projectRoot: location.projectRoot };
+            }
         }
-        throw error;
+        let database: import("node:sqlite").DatabaseSync;
+        try {
+            database = new DatabaseSync(location.databasePath, { readOnly: true });
+        } catch (error) {
+            if (location.databasePath !== location.legacyDatabasePath || fs.existsSync(location.databasePath) || !fs.existsSync(localDatabasePath)) {
+                throw error;
+            }
+            // A reader may resolve the legacy path just before the first migration lock is created.
+            location.databasePath = localDatabasePath;
+            database = new DatabaseSync(location.databasePath, { readOnly: true });
+        }
+        try {
+            database.exec("PRAGMA busy_timeout = 5000");
+            database.exec("PRAGMA query_only = ON");
+            database.exec("BEGIN");
+            const schemaVersion = Number(database.prepare("PRAGMA user_version").get()?.user_version);
+            assertCondition(schemaVersion >= 0 && schemaVersion <= CURRENT_SCHEMA_VERSION, `Unsupported Control Room schema version: ${schemaVersion}`);
+            if (schemaVersion !== CURRENT_SCHEMA_VERSION) {
+                database.close();
+                return { initialized: false, reason: "MIGRATION_REQUIRED", projectRoot: location.projectRoot, schemaVersion, expectedSchemaVersion: CURRENT_SCHEMA_VERSION };
+            }
+            const project = database.prepare("SELECT project_root FROM projects WHERE project_key = ?").get(location.projectKey);
+            if (!project) {
+                database.close();
+                return { initialized: false, reason: "NOT_INITIALIZED", projectRoot: location.projectRoot };
+            }
+            assertCondition(project.project_root === location.projectRoot, "Stored project root does not match the canonical project root.");
+            return { ...location, database };
+        } catch (error) {
+            if (database.isOpen) {
+                database.close();
+            }
+            throw error;
+        }
+    } finally {
+        migrationLock?.close();
     }
 }
 
@@ -444,6 +512,6 @@ function rollbackTransaction(database: import("node:sqlite").DatabaseSync): void
     }
 }
 
-const api = { openReadStore, resolveStoreLocation, ensurePrivateDirectory, pathIsSymbolicLink, resolveCodexHome, databaseHasColumn, initializeSchema, openStore, beginTransaction, commitTransaction, rollbackTransaction, CURRENT_SCHEMA_VERSION };
+const api = { openReadStore, resolveStoreLocation, readMigrationDigest, ensurePrivateDirectory, pathIsSymbolicLink, resolveCodexHome, databaseHasColumn, initializeSchema, openStore, beginTransaction, commitTransaction, rollbackTransaction, CURRENT_SCHEMA_VERSION };
 module.exports = api;
 export interface IStorageApi extends Readonly<typeof api> {}

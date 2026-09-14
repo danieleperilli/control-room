@@ -7,10 +7,12 @@ Read [registration.md](registration.md) for setup and exclusions, [execution.md]
 The CLI stores one SQLite database per canonical repository root:
 
 ```text
-${CODEX_HOME:-~/.codex}/control-room/projects/<project-hash>/state.sqlite
+<project-root>/.control-room/state.sqlite
 ```
 
-SQLite uses foreign keys, WAL, `BEGIN IMMEDIATE` transactions, a busy timeout, unique event keys, and transactional schema migrations tracked with `PRAGMA user_version`. The project hash derives from the canonical root, so repository names and user input never become path segments. Use `--state-root <path>` only for isolated tests or explicit recovery.
+SQLite uses foreign keys, WAL, `BEGIN IMMEDIATE` transactions, a busy timeout, unique event keys, and transactional schema migrations tracked with `PRAGMA user_version`. The project hash still derives from the canonical root and preserves the existing database identity. Use `--state-root <path>` only for isolated tests or explicit recovery; its layout remains `<path>/<project-hash>/state.sqlite` and bypasses automatic relocation.
+
+Read commands also recognize the legacy `${CODEX_HOME:-~/.codex}/control-room/projects/<project-hash>/state.sqlite` without moving it. The first mutating command restores the ignore rule if necessary, checkpoints and closes the legacy database, then transfers it to the project before schema migration. A repository-local SQLite lock serializes transfers and releases automatically on process exit. A durable `state-migration.json` receipt records the original path and SHA-256 digest until publication and source removal complete. Same-filesystem transfers rename the database; cross-filesystem transfers copy, verify and sync before removing the source. Interrupted transfers resume on the next mutation; reads remain available from the surviving database. Busy SQLite connections, changed copies and unrelated destination databases stop migration without discarding either state. Do not run an older CLI or directly open the legacy path during relocation.
 
 The schema retains the internal column name `coordinator_thread_id` for compatibility, but it stores the manual Control Room task ID. That task does not coordinate routine operations. Each worker also records `workspace_mode`, its optional `worktree_path`, and separate approved and integrated commit anchors so isolated integration can be recovered deterministically.
 

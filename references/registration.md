@@ -49,7 +49,7 @@ At the start of every direct user turn in a top-level Local task:
 
 The read-only exemption applies only while a top-level task is unregistered. A read-only follow-up in an existing worker keeps its identity and state unchanged. If a later message in an unregistered conversation requests change work, evaluate registration again on that turn. Explicit `$control-room join` always adopts the task regardless of whether its accompanying request is read-only.
 
-Automatic registration never enqueues the task, creates a branch, or modifies project files. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root and one idempotent `.control-room/` entry in the root `.gitignore`. It does not create the `.control-room` directory until isolated execution is explicitly requested. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
+Automatic registration never enqueues the task, creates a branch, or changes implementation files. Its first use can relocate legacy runtime state and restore the `.control-room/` ignore rule. As an explicit initialization step, `init` installs one idempotent block in the active `AGENTS.md` or `AGENTS.override.md` at the project Git root and one idempotent `.control-room/` entry in the root `.gitignore`. The default store creates `.control-room` during initialization for `state.sqlite`; isolated execution later creates its `worktrees/` subdirectory. Never modify global Codex instructions. Keep `$control-room join` as an idempotent fallback for explicit adoption.
 
 ## Create top-level tasks from side chats
 

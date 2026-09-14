@@ -24,7 +24,7 @@ For other direct user turns in a top-level Local task, resolve the canonical roo
 node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> --thread-id <current-thread-id>
 ```
 
-`status`, `queue`, `review-packet`, and `doctor` do not create state or migrate databases. If status reports `NOT_INITIALIZED`, continue silently outside ControlRoom unless the user requested a ControlRoom operation. If it reports `MIGRATION_REQUIRED`, preserve read-only work; before a requested state change run `install-routing` and read status again. Do not create a new console for an existing database that needs migration.
+`status`, `queue`, `review-packet`, and `doctor` do not create state or migrate databases. They can read the legacy global location; the first mutating command automatically relocates existing state to `<project-root>/.control-room/state.sqlite` before applying schema migrations. If status reports `NOT_INITIALIZED`, continue silently outside ControlRoom unless the user requested a ControlRoom operation. If it reports `MIGRATION_REQUIRED`, preserve read-only work; before a requested state change run `install-routing` and read status again. Do not create a new console for an existing database that needs migration.
 
 - `CONTROL_ROOM`: preserve the console's identity; it does not implement project changes.
 - `EXCLUDED`: continue outside ControlRoom without allocating an ID or changing its title. Only explicit join adopts it.

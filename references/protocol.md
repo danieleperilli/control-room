@@ -63,7 +63,7 @@ node <skill-dir>/scripts/control-room.ts request-user-response --project-root <r
 
 Without `--handoff-task`, `USER_INPUT_REQUESTED` is valid only in `RUNNING`, sets `awaiting_user`, and projects `🟡 T0001 - Semantic name`. Use it only immediately before a blocking question, confirmation, choice, or tool approval. Never set it in `PLANNING` or `REVIEW`; questions in those states retain their normal state icons. `USER_INPUT_RECEIVED` clears the flag on the next direct user message and restores the red running title. Both events preserve state, queue order, dependencies, branches, files, and Git history. Ordinary review approval, optional questions, progress updates, tool output, agent messages, and background activity do not set or clear the flag.
 
-An auto-review denial after approval requires intervention in the approved sender. Submit `request-user-input --task <sender-T_ID> --handoff-task <destination-T_ID>` and settle. The sender must be `DONE` or `PAUSED`; the different destination must be `RUNNING` and must not belong to another pending sender. Schema version 16 persists `handoff_sender_task_id` on the destination. The sender shows `🟡`, and the destination switches from its prematurely assigned `🔴` to `⭕️` with a visible queue position. Following waiting tasks are renumbered. The destination keeps `RUNNING`, its branch, and its reserved workspace, so another shared worker cannot start there. The predecessor's approved integration and final state are unchanged.
+An auto-review denial after approval requires intervention in the approved sender. Submit `request-user-input --task <sender-T_ID> --handoff-task <destination-T_ID>` and settle. The sender must be `DONE`, `PAUSED` or `PR_OPEN`; the different destination must be `RUNNING` and must not belong to another pending sender. Schema version 16 persists `handoff_sender_task_id` on the destination. A `PR_OPEN` sender retains 🔵; other approved senders show `🟡`. The destination switches from its prematurely assigned `🔴` to `⭕️` with a visible queue position. Following waiting tasks are renumbered. The destination keeps `RUNNING`, its branch, and its reserved workspace, so another shared worker cannot start there. The predecessor's approval state is unchanged.
 
 Status exposes `pendingHandoffTaskIds` on the sender and `handoffSenderTaskId` on the destination. Ordinary `awaitingUser` is separate; unrelated direct messages do not resolve this handoff. After an explicitly authorized delivery succeeds, submit `request-user-response --task <sender-T_ID> --handoff-task <destination-T_ID>` and settle. The sender returns to `🟢` or `⏸️`, the destination to `🔴`, and later queued titles are renumbered. A direct user request to start work in the destination can resolve the same relationship before local implementation. A destination leaving `RUNNING`, including through cancellation, clears its relationship and synchronizes the sender. Requests remain idempotent and reject mismatched sender/destination pairs.
 
@@ -78,6 +78,8 @@ node <skill-dir>/scripts/control-room.ts request-rework --project-root <root> --
 
 ## State machine
 
+Integration mode defaults to `merge`. Schema 20 adds project `integration_mode`, append-only `integration_mode_requests`, approval snapshots, repository/PR receipts and the `PR_OPEN` state. `mode --mode pr|merge` requires originating user/thread references and a stable key; `mode --mode status` is read-only. Approval submission captures the mode and retries reuse it. PR-mode publication commits and pushes only the recorded worker, creates or recovers one PR and releases shared execution without moving the base. `sync-prs` and settlement verify remote merge, synchronize the base safely and perform local cleanup before reaching the stored `DONE` or `PAUSED` target. See [integration-mode.md](integration-mode.md).
+
 Autopilot is a project setting, defaulting to off. Schema 19 adds append-only `autopilot_requests` with stable command keys and originating user/thread references. `autopilot --mode on|off` changes it without a worker ID. Automatic `APPROVAL_REQUESTED` events carry `autopilotEventKey`, `reviewEventKey`, and successful `verification`; their `userRequestId` is derived from the recorded on command. Processing requires current authorization, `REVIEW`, the latest successful review, and no blocking attention or decisions. Off or renewal revokes automatic approvals that have not acquired an integration lease. Status, queue, and settlement expose mode; queue also exposes project completion counts and recent completed tasks. See [autopilot.md](autopilot.md).
 
 `reopen --project-root <root> --task <T_ID>` explicitly returns `DONE -> PLANNING` with the same identity and retained review/event history. It resets execution/approval anchors like paused resumption. Only an unchanged, unclaimed successor attached to a pending handoff can be returned to the queue; the CLI preserves changed or potentially delivered work. See [execution.md](execution.md) for immediate follow-up execution.
@@ -86,12 +88,13 @@ Autopilot is a project setting, defaulting to off. Schema 19 adds append-only `a
 PLANNING -> QUEUED -> RUNNING <-> REVIEW
 RUNNING, REVIEW -> APPROVED -> DONE
                           `-> PAUSED -> PLANNING
+                          `-> PR_OPEN -> DONE or PAUSED
 QUEUED -> PLANNING
 QUEUED -> BLOCKED -> QUEUED or PLANNING
 RUNNING -> BLOCKED -> RUNNING
 REVIEW  -> BLOCKED -> REVIEW
 
-PLANNING, QUEUED, RUNNING, REVIEW, PAUSED, BLOCKED -> CANCELED
+PLANNING, QUEUED, RUNNING, REVIEW, PR_OPEN, PAUSED, BLOCKED -> CANCELED
 ```
 
 - Processed events move tasks into `PLANNING` after a safe blocked-waiting demotion, `QUEUED`, `RUNNING` after rework, `REVIEW`, `APPROVED`, `BLOCKED`, or `CANCELED`. Approval finalization may additionally enter `PAUSED`, and `resume` returns it to `PLANNING`.
@@ -99,7 +102,7 @@ PLANNING, QUEUED, RUNNING, REVIEW, PAUSED, BLOCKED -> CANCELED
 - `awaiting_user` overlays `🟡` only on `RUNNING` without changing the state machine and clears on the next direct user message.
 - `handoff_sender_task_id` keeps an undelivered destination's workspace reserved while projecting its queue title and a `🟡` title on the approved sender. It is resolved explicitly after delivery or direct start, or cleared when the destination leaves `RUNNING`.
 - Activation inside settlement moves `QUEUED -> RUNNING`.
-- Approval finalization inside settlement moves `APPROVED -> DONE` for ordinary approval or `APPROVED -> PAUSED` for an approved checkpoint.
+- Merge-mode finalization inside settlement moves `APPROVED -> DONE` for ordinary approval or `APPROVED -> PAUSED` for an approved checkpoint. PR mode first enters `PR_OPEN` (🔵), retains its published branch/worktree and waits for verified remote integration before reaching that same target.
 - Dependencies are satisfied only by `DONE`.
 - `PAUSED` owns no active workspace, remains outside the queue, preserves its task history and dependencies, and resets only execution and approval anchors when resumed to `PLANNING`.
 - `BLOCKED` remembers and can restore its prior state. Only a task blocked from `QUEUED` may instead return to `PLANNING` or be enqueued again.

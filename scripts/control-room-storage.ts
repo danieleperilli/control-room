@@ -6,7 +6,7 @@ const path: typeof import("node:path") = require("node:path");
 const { DatabaseSync }: typeof import("node:sqlite") = require("node:sqlite");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const CURRENT_SCHEMA_VERSION = 19;
+const CURRENT_SCHEMA_VERSION = 20;
 
 /**
  * Create a secure directory if needed and restrict its mode.
@@ -70,6 +70,8 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
     if (schemaVersion === CURRENT_SCHEMA_VERSION) {
         return;
     }
+    // Rebuilding the task state constraint must preserve all child table references.
+    database.exec("PRAGMA foreign_keys = OFF");
     beginTransaction(database);
     try {
         database.exec(`
@@ -293,6 +295,20 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
         if (!databaseHasColumn(database, "tasks", "cleanup_pending")) {
             database.exec("ALTER TABLE tasks ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 0 CHECK (cleanup_pending IN (0, 1))");
         }
+        const taskStateTable = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get() as { sql: string };
+        if (!taskStateTable.sql.includes("'PR_OPEN'")) {
+            const expandedTaskSchema = taskStateTable.sql.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:"tasks"|tasks)/u, "CREATE TABLE tasks_pr_mode").replace("'APPROVED',", "'APPROVED', 'PR_OPEN',");
+            database.exec(expandedTaskSchema);
+            database.exec("INSERT INTO tasks_pr_mode SELECT * FROM tasks; DROP TABLE tasks; ALTER TABLE tasks_pr_mode RENAME TO tasks");
+        }
+        if (!databaseHasColumn(database, "projects", "integration_mode")) {
+            database.exec("ALTER TABLE projects ADD COLUMN integration_mode TEXT NOT NULL DEFAULT 'merge' CHECK (integration_mode IN ('merge', 'pr'))");
+        }
+        if (!databaseHasColumn(database, "tasks", "integration_mode")) {
+            database.exec("ALTER TABLE tasks ADD COLUMN integration_mode TEXT CHECK (integration_mode IN ('merge', 'pr'))");
+            database.exec("UPDATE tasks SET integration_mode = 'merge' WHERE approval_event_key IS NOT NULL");
+            database.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT; ALTER TABLE tasks ADD COLUMN pr_repository TEXT");
+        }
         database.exec(`
             CREATE TABLE IF NOT EXISTS activation_deliveries (
                 activation_key TEXT PRIMARY KEY,
@@ -328,12 +344,23 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
                 thread_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS integration_mode_requests (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                mode TEXT NOT NULL CHECK (mode IN ('merge', 'pr')),
+                user_request_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};
         `);
+        assertCondition(database.prepare("PRAGMA foreign_key_check").all().length === 0, "Schema migration would leave invalid foreign keys.");
         commitTransaction(database);
     } catch (error) {
         rollbackTransaction(database);
         throw error;
+    } finally {
+        database.exec("PRAGMA foreign_keys = ON");
     }
 }
 

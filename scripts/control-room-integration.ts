@@ -9,6 +9,7 @@ const path: typeof import("node:path") = require("node:path");
 
 const { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, titleForControlRoom, serializeTask, compactActiveQueue }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
 const GIT_MODE = "local-approval-commit";
+const { validatePullRequestEnvironment, publishApprovedPullRequest }: import("./control-room-pr.ts").IPullRequestApi = require("./control-room-pr.ts");
 
 /**
  * Read the first meaningful commit subject accepted for a task.
@@ -292,7 +293,7 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
         beginTransaction(store.database);
         const project = requireProject(store);
         const task = requireTask(store, taskId);
-        if (task.state === "DONE" || task.state === "PAUSED") {
+        if (task.state === "DONE" || task.state === "PAUSED" || task.state === "PR_OPEN") {
             commitTransaction(store.database);
             return {
                 committed: false,
@@ -333,6 +334,10 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
             leaseAcquired = true;
             return finalizeUnchangedApproval(store, task.task_id);
         }
+        if (task.integration_mode === "pr") {
+            assertCondition(!commitsOnBase, "PR mode approval must run on the recorded worker branch; preserve base-branch changes and restore the worker first.");
+            validatePullRequestEnvironment(store, task);
+        }
         const commitMessage = readApprovalCommitMessage(store, task);
         const timestamp = currentTimestamp();
         store.database.prepare("UPDATE tasks SET reviewed_commit = ?, updated_at = ? WHERE task_id = ?").run(currentHead, timestamp, task.task_id);
@@ -355,6 +360,9 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
         beginTransaction(store.database);
         store.database.prepare("UPDATE tasks SET approved_commit = ?, updated_at = ? WHERE task_id = ?").run(committedCommit, currentTimestamp(), task.task_id);
         commitTransaction(store.database);
+        if (task.integration_mode === "pr") {
+            return publishApprovedPullRequest(store, requireTask(store, task.task_id), commitMessage);
+        }
         if (commitsOnBase) {
             const branchDeleted = task.approval_target === "PAUSED" ? releaseSharedWorkerBranch(store, project, task) : false;
             return finalizeApprovedCommit(store, task.task_id, committedCommit, false, branchDeleted);
@@ -473,7 +481,7 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
     try {
         const project = requireProject(store);
         const task = requireTask(store, taskId);
-        if (task.state === "DONE" || task.state === "PAUSED") {
+        if (task.state === "DONE" || task.state === "PAUSED" || task.state === "PR_OPEN") {
             return {
                 recovered: false,
                 alreadyFinalized: true,
@@ -489,6 +497,26 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
         }
         const hasRecoverableAnchor = Boolean(task.base_commit && task.reviewed_commit) || task.base_commit === null;
         assertCondition(task.state === "APPROVED" && hasRecoverableAnchor, `${task.task_id} does not have a recoverable approval.`);
+        if (task.integration_mode === "pr") {
+            assertCondition(task.branch_name, "PR recovery requires the recorded worker branch.");
+            const workerHead = resolveLocalBranchHead(store.projectRoot, task.branch_name);
+            const subject = readApprovalCommitMessage(store, task);
+            const approvedCommit = task.approved_commit || (commitMatchesApproval(store.projectRoot, workerHead, task.reviewed_commit, subject) ? workerHead : null);
+            if (!approvedCommit) {
+                assertCondition(workerHead === task.reviewed_commit, "PR recovery found unexpected worker history; preserve its changes.");
+                beginTransaction(store.database);
+                const result = resetUncommittedApproval(store, task);
+                commitTransaction(store.database);
+                return result;
+            }
+            assertCondition(workerHead === approvedCommit, "PR worker moved after approval; preserve it before recovery.");
+            const workspace = resolveTaskWorkspace(store, task);
+            assertCondition(readWorkingTreeStatus(workspace).length === 0, "PR workspace changed after approval; preserve it before recovery.");
+            beginTransaction(store.database);
+            store.database.prepare("UPDATE tasks SET approved_commit = ?, updated_at = ? WHERE task_id = ?").run(approvedCommit, currentTimestamp(), task.task_id);
+            commitTransaction(store.database);
+            return { ...publishApprovedPullRequest(store, requireTask(store, task.task_id), subject), recovered: true, finalized: true };
+        }
         const recordedBase = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
         if (task.integrated_commit && recordedBase === task.integrated_commit) {
             assertCondition(task.branch_name && task.approved_commit, `${task.task_id} has incomplete integration anchors.`);

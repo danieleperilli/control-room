@@ -13,9 +13,12 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Leaves changes uncommitted during implementation and review.
 - Creates a worker branch only when a queued task starts running.
 - Creates a commit after direct user approval or an explicitly enabled project autopilot, and only when uncommitted changes exist.
+- Supports persistent project `merge mode` (default), `PR mode`, and read-only `current mode` commands from any project chat.
 - Can approve and integrate an intermediate checkpoint into `PAUSED`, then resume the same task later with `⏸️`.
 - Creates isolated worktrees only on demand below the repository-local `.control-room/worktrees/` directory.
-- Deletes successfully integrated worker branches and isolated worktrees, but never pushes, creates a pull request, or rewrites Git history.
+- In merge mode, integrates locally and deletes successfully integrated workers without pushing.
+- In PR mode, approval pushes only the worker branch and creates a repository PR on GitHub, GitHub Enterprise or Azure DevOps; the task waits in 🔵 `PR_OPEN` until verified remote merge and local base synchronization, preserving branches and worktrees until cleanup.
+- Never pushes the base branch, remotely merges a PR, force-pushes or rewrites Git history.
 - Settles queue changes directly from the task issuing the command, without waking the Control Room task.
 - Creates one optional manual `⚫️ Control Room` console for project-wide commands and recovery.
 - Persists project state locally in SQLite.
@@ -25,6 +28,7 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Codex with global skill support
 - Git 2.38 or newer with `merge-tree --write-tree` support
 - Node.js 22.18 or newer
+- For PR mode only: matching fetch/push `origin` URLs and the authenticated provider CLI selected from that origin: GitHub CLI (`gh`) for GitHub or GitHub Enterprise, or Azure CLI (`az`) with its Azure DevOps extension for Azure DevOps Services. See [integration-mode.md](references/integration-mode.md) for clone formats and publication safeguards.
 
 ControlRoom expects a Git repository with a configured base branch. The branch may be unborn: `$control-room init` works before the repository has its first commit.
 
@@ -73,12 +77,15 @@ Discuss each change in its own Local task. Change requests and concrete implemen
 
 Send `Enqueue` to authorize the task to start when eligible. Use `Run now` when the shared checkout is idle, or explicitly request `Run isolated now` for a dedicated repository-local worktree. Queue order and dependencies are separate: moving a task does not change its prerequisites.
 
-Implementation remains uncommitted through review. `Approve` integrates the current assigned workspace and finishes the task. `Approve and pause` integrates a checkpoint and releases the workspace; `Resume` returns that same task to planning. A paused prerequisite remains unsatisfied until it reaches `DONE`. Direct approval is final authorization, including recovery from a turn interrupted before recording review. Independent review is left to the user's own request and adds no approval gate.
+Implementation remains uncommitted through review. `Approve` captures the current project mode: merge mode integrates locally; PR mode commits, pushes its worker and creates a PR without a second confirmation. A published task remains 🔵 `PR_OPEN`, releases shared execution and keeps dependent tasks waiting. Settlement checks remote completion and safely synchronizes the base before `DONE`. `Approve and pause` targets `PAUSED` after that mode's integration; `Resume` returns that same task to planning. Direct approval is final authorization, including recovery from an interrupted turn. Independent review is left to the user's own request and adds no approval gate.
 
 ## Commands
 
 | Command | Result |
 | --- | --- |
+| `PR mode` | Select worker commit, push and PR publication for future approvals in this project. |
+| `merge mode` | Select the existing local integration flow for future approvals. |
+| `current mode` | Read the selected integration mode and separate autopilot setting. |
 | `autopilot` or `autopilot on` | Enable automatic approval and continuation for explicitly started or queued work in this project. |
 | `autopilot off` | Return to manual approval while preserving running work. |
 | `autopilot status` | Show current mode and a snapshot of project progress. |
@@ -112,7 +119,7 @@ English commands are canonical; equivalent natural-language requests are accepte
 
 Use `autopilot` (or `autopilot on`) in any chat associated with an initialized project to enable automatic approval and continuation. Use `autopilot off` to return to manual approval, and `autopilot status` for a read-only progress snapshot. Commands also work in excluded tasks and side chats without registering them; a chat without an identifiable project must name the project first.
 
-The setting persists for that project, including tasks enqueued later, until disabled. Planning tasks still need an explicit start or enqueue. Workers complete relevant verification and review before automatic approval, local integration, and the normal handoff to the next eligible task. Failed checks, unresolved decisions, user attention, and recovery needs stop automatic completion. Existing reviews need actual successful verification evidence.
+The setting persists for that project, including tasks enqueued later, until disabled. Planning tasks still need an explicit start or enqueue. Workers complete relevant verification and review before automatic approval, delivery through the selected merge or PR mode, and the normal handoff to the next eligible task. Failed checks, unresolved decisions, user attention, and recovery needs stop automatic completion. Existing reviews need actual successful verification evidence.
 
 Off preserves running work and returns unleased automatic approvals to review. An integration already started may finish or recover. This is a return to manual approval, not a pause of the queue: later manual approval still starts eligible queued work. No background service or changes to Codex tool permissions are required.
 
@@ -151,9 +158,9 @@ Doctor explains runtime capabilities, SQLite integrity, routing and ignore rules
 
 ## Git behavior and local state
 
-Normal workers share one checkout and run serially. An explicit isolated worker uses `.control-room/worktrees/<T_ID>` on `control-room/<T_ID>`. Approval either completes unchanged work without a commit, commits dirty changes, or accepts existing worker commits. It advances the base directly when possible and otherwise creates a linear integration commit from the combined tree. Isolated integration can advance the base while a different shared worker remains dirty.
+Normal workers share one checkout and run serially. An explicit isolated worker uses `.control-room/worktrees/<T_ID>` on `control-room/<T_ID>`. Approval either completes unchanged work without a commit, commits dirty changes, or accepts existing worker commits. Merge mode advances the base directly when possible and otherwise creates a linear integration commit from the combined tree. PR mode publishes the worker and waits for remote merge. Both local integration and verified PR synchronization can advance the base while a different shared worker remains dirty.
 
-Review does not freeze content; approval includes the assigned workspace at settlement time. ControlRoom never pushes, opens a pull request, rebases or force-updates history. Successful integration releases the worker workspace. Cancellation preserves uncommitted work and task-local commits; integration conflicts preserve the workspace and block the task for rework.
+Review does not freeze content; approval includes the assigned workspace at settlement time and captures the selected integration mode. PR-mode approval authorizes worker push and PR creation; ControlRoom never pushes the base, remotely merges PRs, rebases or force-updates history. Successful integration releases the worker workspace. Cancellation preserves uncommitted work and task-local commits; integration conflicts preserve the workspace and block the task for rework. See [integration-mode.md](references/integration-mode.md) for publication and remote synchronization.
 
 State lives in `<project-root>/.control-room/state.sqlite`, beside the `worktrees/` directory and covered by the `.control-room/` ignore rule. Existing state under `${CODEX_HOME:-~/.codex}/control-room/projects/<project-hash>/state.sqlite` remains readable and moves automatically on the first mutating command. The transfer preserves project identity and history, checkpoints WAL, removes the original database after durable publication, and resumes interrupted transfers. Busy databases and conflicting copies are preserved for retry or recovery. An explicit `--state-root` retains its existing `<path>/<project-hash>/state.sqlite` layout. It contains compact task metadata, events, decisions, approval anchors, activation briefs and delivery receipts. Secrets, raw diffs, transcripts and independent-review reports do not belong in the database. The path-derived project identity is local to that canonical checkout.
 

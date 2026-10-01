@@ -19,7 +19,7 @@ node <skill-dir>/scripts/control-room.ts autopilot \
 
 Apply returned title updates. A repeated key returns current mode without replaying the old change. A fresh on command renews authorization; pending approvals under the older authorization must be reassessed. On/off only changes authorization: it never starts planning work, interrupts a worker, or commits by itself.
 
-- **On:** The user's command authorizes automatic approval, local integration and continuation for this project's already-started and explicitly queued tasks, including tasks enqueued later until off. It also authorizes the requesting agent to finish already-reviewed work under the procedure below. Inspect the ordered queue, complete eligible reviewed work, then settle and deliver the next activation normally. Each worker reads fresh mode at review completion, so a running worker does not need an extra wake-up message.
+- **On:** The user's command authorizes automatic approval, delivery through the selected integration mode and continuation for this project's already-started and explicitly queued tasks, including tasks enqueued later until off. Merge mode integrates locally; explicitly selected PR mode authorizes worker push and PR creation and waits in 🔵 `PR_OPEN` for remote integration. It also authorizes the requesting agent to finish already-reviewed work under the procedure below. Inspect the ordered queue, complete eligible reviewed work, then settle and deliver the next activation normally. Each worker reads fresh mode at review completion, so a running worker does not need an extra wake-up message.
 - **Off:** Return to manual approval immediately. Unleased automatic approvals return to `REVIEW`; pending automatic events become invalid. Running work continues, and an integration already holding its lease may finish or recover. Apply title updates and report the mode; do not run settlement merely to disable autopilot. Existing explicit enqueue authorization remains valid, so later manual approval still advances the queue.
 - **Status:** Read `queue`; display mode and progress without settlement, title changes, registration, or messages to other tasks.
 
@@ -43,11 +43,11 @@ node <skill-dir>/scripts/control-room.ts request-autopilot-approve \
 node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 ```
 
-The engine derives the user request from the on command, rechecks authorization and review during processing, and rechecks authorization before acquiring the commit lease. Approval always targets `DONE`. It records verification evidence and automatic provenance in the event. Manual `Approve` and `Approve and pause` retain their existing behavior.
+The engine derives the user request from the on command, rechecks authorization and review during processing, and rechecks authorization before acquiring the commit lease. Approval always targets `DONE` and captures the current `integrationMode` at submission. In PR mode it first enters `PR_OPEN` and reaches `DONE` only after remote merge and base synchronization. It records verification evidence and automatic provenance in the event. Follow [integration-mode.md](integration-mode.md) to attach returned PRs. Manual `Approve` and `Approve and pause` use the same mode snapshot.
 
 If off, renewal, rework, or a new blocker races with completion, preserve the work and read fresh status. Do not substitute a manual approval or invent another user message. A new automatic request requires the current authorization and review. Stable retry keys never replay a revoked approval.
 
-Apply all returned titles and follow the existing claim/send/confirm activation protocol. Autopilot does not change sandbox/tool permissions, authorize push or publication, create independent reviews, retry uncertain messages, or keep a daemon running. Worker completion and settlement drive the sequence.
+Apply all returned titles and follow the existing claim/send/confirm activation protocol. Automatic approval permits worker push and PR creation only in explicitly selected PR mode. Autopilot never changes sandbox/tool permissions, pushes a base branch, merges a remote PR, creates independent reviews, retries uncertain messages, or keeps a daemon running. Worker completion and settlement drive the sequence.
 
 ## Show progress in Control Room
 

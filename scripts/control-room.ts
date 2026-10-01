@@ -6,6 +6,7 @@ interface IParsedArguments {
 }
 
 const USER_COMMANDS = [
+    "PR mode | merge mode | current mode",
     "autopilot | autopilot on | autopilot off | autopilot status",
     "$control-room init",
     "$control-room join",
@@ -109,6 +110,8 @@ User commands:
 ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 
 Commands:
+  mode --project-root ROOT --mode (merge|pr|status) [--event-key KEY --user-request-id ID --thread-id ID] [--state-root PATH]
+  sync-prs --project-root ROOT [--task T0001] [--state-root PATH]
   autopilot --project-root ROOT --mode (on|off) --event-key KEY --user-request-id ID --thread-id ID [--state-root PATH]
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   install-routing --project-root ROOT [--state-root PATH]
@@ -159,6 +162,23 @@ function executeCommand(parsed: IParsedArguments): unknown {
         return null;
     }
     const core: import("./control-room-core.ts").IControlRoomApi = require("./control-room-core.ts");
+    if (parsed.command === "mode") {
+        validateOptions(values, ["project-root", "mode", "event-key", "user-request-id", "thread-id", "state-root"]);
+        const mode = requireOption(values, "mode");
+        if (mode === "status") {
+            const status = core.getStatus(buildOptions(values));
+            return { initialized: status.initialized, reason: status.reason, projectRoot: status.projectRoot, integrationMode: status.integrationMode, autopilot: status.autopilot };
+        }
+        if (mode !== "merge" && mode !== "pr") {
+            throw new Error("--mode must be merge, pr or status.");
+        }
+        return core.setIntegrationMode(buildOptions(values), mode, requireOption(values, "event-key"), requireOption(values, "user-request-id"), requireOption(values, "thread-id"));
+    }
+    if (parsed.command === "sync-prs") {
+        validateOptions(values, ["project-root", "task", "state-root"]);
+        const { syncPullRequests }: import("./control-room-pr.ts").IPullRequestApi = require("./control-room-pr.ts");
+        return syncPullRequests(buildOptions(values), values.task);
+    }
     if (parsed.command === "autopilot") {
         validateOptions(values, ["project-root", "mode", "event-key", "user-request-id", "thread-id", "state-root"]);
         const mode = requireOption(values, "mode");

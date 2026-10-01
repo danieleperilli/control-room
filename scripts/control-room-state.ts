@@ -111,7 +111,9 @@ function titleForTask(task: ITaskRow): string {
         return task.semantic_name;
     }
     let prefix = "";
-    if ((task.pending_handoff_task_ids && task.pending_handoff_task_ids !== "[]") || (task.awaiting_user && task.state === "RUNNING")) {
+    if (task.state === "PR_OPEN") {
+        prefix = "🔵 ";
+    } else if ((task.pending_handoff_task_ids && task.pending_handoff_task_ids !== "[]") || (task.awaiting_user && task.state === "RUNNING")) {
         prefix = "🟡 ";
     } else if (task.state === "PLANNING") {
         prefix = "⚪️ ";
@@ -165,6 +167,8 @@ function serializeTask(task: ITaskRow): ISerializedTask {
         worktreePath: task.worktree_path,
         approvedCommit: task.approved_commit,
         approvalTarget: task.approval_target,
+        integrationMode: task.integration_mode,
+        pullRequestUrl: task.pr_url,
         committedCommit: task.integrated_commit
     };
 }

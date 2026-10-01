@@ -18,7 +18,7 @@ If process creation or completion is uncertain, inspect the existing command ses
 
 ## Approval commit and recovery
 
-The Git mode is `local-approval-commit`:
+Merge-mode approval uses `local-approval-commit`. PR-mode approvals use the same persistent lease and commit anchors, then publish the worker without local integration; read [integration-mode.md](integration-mode.md) for publication recovery and remote synchronization. The following integration steps describe merge mode:
 
 1. Require a processed direct-user approval event.
 2. Resolve the task's assigned workspace. If it is clean and has no task-local commit, persist the cleanup intent and acquire the approval lease before releasing its workspace, then move the task to its persisted `DONE` or `PAUSED` target, compact the queue, and release the shared branch or clean isolated worktree without creating a commit.
@@ -29,7 +29,7 @@ The Git mode is `local-approval-commit`:
 7. After successful integration, move the task to its persisted target. `PAUSED` retains the `⏸️` identity but owns no workspace and does not satisfy dependencies; `resume` returns it to `PLANNING` for a new execution and approval cycle. After successful isolated integration, remove its worktree and branch. If tree integration conflicts, clear the lease, preserve both, and move the task to `BLOCKED` with `blocked_from_state = RUNNING`; resume and rework it before a new review and approval.
 8. For an unborn base, only shared execution can create the root commit, establish the base branch, and delete the worker branch. Isolated execution requires an existing base commit.
 
-The approved commit contains the assigned workspace state present when settlement runs. ControlRoom does not freeze review contents or reject outside commits. It never rebases, resets, force-updates, pushes, or opens a pull request. It creates a linked worktree only for explicit isolated execution below `.control-room/worktrees/`.
+The approved commit contains the assigned workspace state present when settlement runs. ControlRoom does not freeze review contents or reject outside commits. Only a PR-mode approval permits worker push and PR creation. It never rebases, resets, force-updates, pushes a base branch or merges a remote PR. It creates a linked worktree only for explicit isolated execution below `.control-room/worktrees/`.
 
 Cancellation cleanup runs after the cancellation event transaction. It removes an isolated worktree and branch only when the workspace is clean and the branch still equals its activation base; uncommitted changes or task-local commits preserve both. If cleanup completed before a process interruption, the next settlement reconciles the stored paths idempotently.
 

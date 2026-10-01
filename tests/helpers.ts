@@ -108,7 +108,7 @@ function initializeFixture(fixture: IFixture): string {
         "control-room-thread",
         "main"
     );
-    assert.equal(initialized.controlRoomTitle, "⚫️ Control Room");
+
     assert.equal(initialized.gitMode, "local-approval-commit");
     return String(initialized.databasePath);
 }

@@ -19,7 +19,7 @@ node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 
 For `Approve and pause`, replace only `request-approve` with `request-approve-and-pause`. Use the same required arguments; successful settlement targets `PAUSED`, releases the workspace and leaves dependents unsatisfied.
 
-After settlement, inspect its actual completion or blocker, apply every returned `titleUpdates` entry and handle any pending activation through [execution.md](execution.md). Report completion only when the returned result confirms it. For a permission timeout or uncertain execution, follow [Permission waits and timeouts](recovery.md#permission-waits-and-timeouts).
+After settlement, inspect its actual completion or blocker, apply every returned `titleUpdates` entry and handle any pending activation through [execution.md](execution.md). Report completion only when the returned result confirms it. If approval captures `integrationMode: pr`, follow [integration-mode.md](integration-mode.md) for PR publication and attachment; report 🔵 `PR_OPEN` until confirmed remote merge and local synchronization. For a permission timeout or uncertain execution, follow [Permission waits and timeouts](recovery.md#permission-waits-and-timeouts).
 
 ### Resolve the approval message ID
 
@@ -61,6 +61,8 @@ Do not call `process`, `activate-next`, or `commit-approved` separately during n
 
 ## Preserve Git behavior
 
+The local integration rules below apply to merge mode. Approval captures the project's current mode at submission; PR mode follows [integration-mode.md](integration-mode.md) instead and preserves the worker until remote integration. Both modes use the existing no-change cleanup path.
+
 - Never create a branch while a task is `PLANNING` or `QUEUED`; activation inside `settle` is the only pre-approval branch operation.
 - In an unborn repository, the first activation may adopt existing uncommitted files without committing them.
 - Never stage or commit during `RUNNING` or `REVIEW`.
@@ -70,5 +72,5 @@ Do not call `process`, `activate-next`, or `commit-approved` separately during n
 - Approval targeting `PAUSED` uses the same Git flow, releases the shared or isolated workspace, preserves the task history and dependencies, and remains unsatisfied for dependency checks until a later approval reaches `DONE`.
 - If isolated integration conflicts, keep the worktree and branch, clear the approval lease, and move the task to `BLOCKED` from `RUNNING`. Resume it, rework against the latest base inside the preserved workspace, then request review and approval again.
 - Canceling an unchanged isolated task removes its worktree and branch. Canceling one with uncommitted changes or task-local commits preserves both and reports their path for manual recovery.
-- Never push, open a pull request, rebase, force-update, or rewrite published history. Create worktrees only for explicit isolated execution and only below the repository-local `.control-room/worktrees/` directory.
+- Only a PR-mode approval authorizes worker push and PR creation. Never push the base, remotely merge a PR, rebase, force-update, or rewrite published history. Create worktrees only for explicit isolated execution and only below the repository-local `.control-room/worktrees/` directory.
 - Do not reject approval because Git history or working-tree content changed outside ControlRoom.

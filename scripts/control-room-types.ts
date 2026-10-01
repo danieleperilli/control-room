@@ -1,4 +1,5 @@
-export type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
+export type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PR_OPEN" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
+export type IntegrationMode = "merge" | "pr";
 export type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "RUN_ISOLATED_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 export type WorkspaceMode = "shared" | "isolated";
 export type ApprovalTarget = "DONE" | "PAUSED";
@@ -28,6 +29,7 @@ export interface IUnavailableState {
 }
 
 export interface IEventPayload {
+    integrationMode?: IntegrationMode;
     autopilotEventKey?: string;
     reviewEventKey?: string;
     verification?: string;
@@ -107,6 +109,7 @@ export interface IProjectRow {
     coordinator_thread_id: string;
     base_branch: string;
     git_mode: string;
+    integration_mode: IntegrationMode;
     next_task_number: number;
     integration_task_id: string | null;
     integration_started_at: string | null;
@@ -140,6 +143,9 @@ export interface ITaskRow {
     approved_commit: string | null;
     approval_event_key: string | null;
     approval_target: ApprovalTarget;
+    integration_mode: IntegrationMode | null;
+    pr_url: string | null;
+    pr_repository: string | null;
     integrated_commit: string | null;
     cleanup_pending: number;
     created_at: string;
@@ -248,6 +254,8 @@ export interface IApprovalResult {
     task: ISerializedTask;
     controlRoomTitle: string;
     gitMode: string;
+    integrationMode?: IntegrationMode;
+    pullRequestUrl?: string;
     approvalTarget?: ApprovalTarget;
     titleUpdates?: ITitleUpdate[];
     integrated?: boolean;
@@ -290,5 +298,7 @@ export interface ISerializedTask {
     worktreePath: string | null;
     approvedCommit: string | null;
     approvalTarget: ApprovalTarget;
+    integrationMode: IntegrationMode | null;
+    pullRequestUrl: string | null;
     committedCommit: string | null;
 }

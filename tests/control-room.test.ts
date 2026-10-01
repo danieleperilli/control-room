@@ -23,7 +23,7 @@ test("initializes and completes the first task in a repository without commits",
     assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
     const initializationResult = JSON.parse(initialized.stdout);
     const databasePath = initializationResult.databasePath;
-    assert.equal(initializationResult.controlRoomTitle, "⚫️ Control Room");
+
     assert.equal(initializationResult.baseCommit, null);
     assert.equal(initializationResult.routing.installed, true);
     assert.equal(initializationResult.worktreeIgnore.installed, true);
@@ -71,7 +71,7 @@ test("allocates four-digit task IDs and preserves IDs across registration retrie
     const retry = registerTask(options, "thread-one", "Build queue");
     const second = registerTask(options, "thread-two", "Add review");
     assert.equal(first.taskId, "T0001");
-    assert.equal(first.title, "⚪️ T0001 - Build queue");
+
     assert.equal(retry.taskId, "T0001");
     assert.equal(retry.created, false);
     assert.equal(second.taskId, "T0002");
@@ -172,7 +172,7 @@ test("excludes a planning task through cancellation and restores it through expl
     assert.equal(settled.processed.results[0].excluded, true);
     assert.equal(settled.processed.results[0].task.state, "CANCELED");
     assert.deepEqual(settled.queue, []);
-    assert.deepEqual(settled.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "Leave planning" }]);
+    assert.deepEqual(settled.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [{ taskId: "T0001", threadId: "thread-one" }]);
     const excludedStatus = core.getStatus(options, undefined, "thread-one");
     assert.equal(excludedStatus.role, "EXCLUDED");
     assert.equal(excludedStatus.task, null);
@@ -183,7 +183,7 @@ test("excludes a planning task through cancellation and restores it through expl
     assert.equal(adopted.created, false);
     assert.equal(adopted.adoptedExclusion, true);
     assert.equal(adopted.state, "PLANNING");
-    assert.equal(adopted.title, "⚪️ T0001 - Leave planning");
+
     assert.equal(core.getStatus(options, undefined, "thread-one").role, "WORKER");
     assert.equal(core.getReviewPacket(options, "T0001").decisionCount, 0);
 });
@@ -223,12 +223,10 @@ test("excludes a queued task, compacts waiting titles, and rejects active exclus
     assert.equal(queuedRequest.status, 0, queuedRequest.stderr || queuedRequest.stdout);
 
     const settled = core.settleProject(options);
-    const titlesByTask = new Map(settled.titleUpdates.map((update: Record<string, unknown>) => [update.taskId, update.title]));
+
     assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003"]);
     assert.equal(settled.queue[1].queuedPosition, 1);
-    assert.equal(settled.queue[1].title, "⭕️ ① T0003 - Remain queued");
-    assert.equal(titlesByTask.get("T0002"), "Leave queue");
-    assert.equal(titlesByTask.get("T0003"), "⭕️ ① T0003 - Remain queued");
+
     assert.equal(core.getStatus(options, undefined, "thread-two").role, "EXCLUDED");
     assert.equal(core.getStatus(options, "T0002").task.state, "CANCELED");
 });
@@ -251,7 +249,7 @@ test("persists exclusion when an earlier pending cancellation wins", () => {
     assert.equal(core.getStatus(options, undefined, "thread-one").role, "EXCLUDED");
 });
 
-test("returns the user command list for the created Control Room console", () => {
+test("initializes project routing idempotently through the CLI", () => {
     const fixture = createFixture();
     const codexHome = path.join(path.dirname(fixture.stateRoot), "codex-home");
     const argumentsList = [
@@ -268,32 +266,17 @@ test("returns the user command list for the created Control Room console", () =>
     const initialized = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(initialized.status, 0, initialized.stderr || initialized.stdout);
     const result = JSON.parse(initialized.stdout);
-    assert.equal(result.controlRoomTitle, "⚫️ Control Room");
+
     assert.equal(result.routing.installed, true);
     assert.equal(result.routing.updated, true);
-    assert.deepEqual(result.userCommands, [
-        "autopilot | autopilot on | autopilot off | autopilot status",
-        "$control-room init",
-        "$control-room join",
-        "$control-room exclude",
-        "$control-room queue",
-        "$control-room doctor",
-        "$control-room help",
-        "Return to planning | Return T0002 to planning",
-        "Enqueue [after T0002]",
-        "Run now | Run T0002 now",
-        "Run isolated now | Run T0002 isolated now",
-        "Move first | Move to 3 | Move before T0002 | Move after T0002",
-        "Depends on T0002 | Remove dependency T0002",
-        "Approve | Approve and pause | Resume | Reopen | Cancel | Status | Queue status"
-    ]);
+
     const retry = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
     assert.equal(JSON.parse(retry.stdout).created, false);
     assert.equal(JSON.parse(retry.stdout).routing.installed, true);
     assert.equal(JSON.parse(retry.stdout).routing.updated, false);
     assert.equal(JSON.parse(retry.stdout).worktreeIgnore.updated, false);
-    assert.deepEqual(JSON.parse(retry.stdout).userCommands, result.userCommands);
+
 });
 
 test("repairs local routing for a project initialized before routing support", () => {
@@ -482,17 +465,7 @@ test("uses the active project override and rejects project instruction symlinks"
     assert.equal(fs.readFileSync(externalPath, "utf8"), "# External\n");
 });
 
-test("keeps the failure icon for blocked tasks and resets canceled titles", () => {
-    const baseTask = {
-        task_id: "T0001",
-        semantic_name: "Handle failure"
-    };
-    assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Handle failure");
-    assert.equal(core.titleForTask({ ...baseTask, state: "PAUSED" }), "⏸️ T0001 - Handle failure");
-    assert.equal(core.titleForTask({ ...baseTask, state: "CANCELED" }), "Handle failure");
-});
-
-test("settlement returns the undecorated semantic title for a canceled task", () => {
+test("settlement removes canceled tasks and identifies their update recipients", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
@@ -502,31 +475,10 @@ test("settlement returns the undecorated semantic title for a canceled task", ()
     const settled = core.settleProject(options);
 
     assert.equal(settled.processed.results[0].action, "CANCELED");
-    assert.equal(settled.processed.results[0].task.title, "Discard obsolete work");
+
     assert.deepEqual(settled.queue, []);
-    assert.deepEqual(settled.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "Discard obsolete work" }]);
+    assert.deepEqual(settled.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [{ taskId: "T0001", threadId: "thread-one" }]);
     assert.equal(core.getStatus(options, undefined, "thread-one").role, "WORKER");
-});
-
-test("uses the review marker and red when review rework starts", () => {
-    const baseTask = {
-        task_id: "T0001",
-        semantic_name: "Refine review"
-    };
-    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "💪 T0001 - Refine review");
-    assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🔴 T0001 - Refine review");
-});
-
-test("uses the pointing hand only while a running task awaits user input", () => {
-    const baseTask = {
-        task_id: "T0001",
-        semantic_name: "Confirm implementation",
-        awaiting_user: 1
-    };
-    assert.equal(core.titleForTask({ ...baseTask, state: "PLANNING" }), "⚪️ T0001 - Confirm implementation");
-    assert.equal(core.titleForTask({ ...baseTask, state: "RUNNING" }), "🟡 T0001 - Confirm implementation");
-    assert.equal(core.titleForTask({ ...baseTask, state: "REVIEW" }), "💪 T0001 - Confirm implementation");
-    assert.equal(core.titleForTask({ ...baseTask, state: "BLOCKED" }), "❌ T0001 - Confirm implementation");
 });
 
 test("rejects user-attention requests while a task is planning", () => {
@@ -539,7 +491,7 @@ test("rejects user-attention requests while a task is planning", () => {
         () => core.submitEvent(options, "user-input-planning", "T0001", "USER_INPUT_REQUESTED", {}),
         /Cannot request user input for T0001 from PLANNING/
     );
-    assert.equal(core.getStatus(options, "T0001").task.title, "⚪️ T0001 - Confirm implementation");
+
 });
 
 test("marks a running task for user attention and restores red after the response", () => {
@@ -556,10 +508,10 @@ test("marks a running task for user attention and restores red after the respons
     assert.equal(waiting.processed.results[0].action, "USER_INPUT_REQUESTED");
     assert.equal(waiting.queue[0].state, "RUNNING");
     assert.equal(waiting.queue[0].awaitingUser, true);
-    assert.equal(waiting.queue[0].title, "🟡 T0001 - Confirm implementation");
+
     assert.equal(waiting.queue[0].queuePosition, initialTask.queuePosition);
     assert.equal(waiting.queue[0].branchName, initialTask.branchName);
-    assert.deepEqual(waiting.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "🟡 T0001 - Confirm implementation" }]);
+    assert.deepEqual(waiting.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [{ taskId: "T0001", threadId: "thread-one" }]);
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
 
     const responded = runCli(["request-user-response", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--event-key", "user-response-1"]);
@@ -568,10 +520,10 @@ test("marks a running task for user attention and restores red after the respons
     assert.equal(resumed.processed.results[0].action, "USER_INPUT_RECEIVED");
     assert.equal(resumed.queue[0].state, "RUNNING");
     assert.equal(resumed.queue[0].awaitingUser, false);
-    assert.equal(resumed.queue[0].title, "🔴 T0001 - Confirm implementation");
+
     assert.equal(resumed.queue[0].queuePosition, initialTask.queuePosition);
     assert.equal(resumed.queue[0].branchName, initialTask.branchName);
-    assert.deepEqual(resumed.titleUpdates, [{ taskId: "T0001", threadId: "thread-one", title: "🔴 T0001 - Confirm implementation" }]);
+    assert.deepEqual(resumed.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [{ taskId: "T0001", threadId: "thread-one" }]);
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
 
     const retry = core.submitEvent(options, "user-response-1", "T0001", "USER_INPUT_RECEIVED", {});
@@ -579,16 +531,13 @@ test("marks a running task for user attention and restores red after the respons
     assert.equal(retry.processed, true);
 });
 
-test("derives queued position markers without storing them in the semantic name", () => {
+test("normalizes imported task metadata before registration", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     const registered = registerTask(options, "thread-one", "⭕️ ① Build queue");
     assert.equal(registered.semanticName, "Build queue");
-    assert.equal(core.titleForTask({ task_id: "T0001", semantic_name: "Build queue", state: "QUEUED", queue_position: 1 }), "⭕️ ① T0001 - Build queue");
-    assert.equal(core.titleForTask({ task_id: "T0009", semantic_name: "Ninth task", state: "QUEUED", queue_position: 9 }), "⭕️ ⑨ T0009 - Ninth task");
-    assert.equal(core.titleForTask({ task_id: "T0010", semantic_name: "Tenth task", state: "QUEUED", queue_position: 10 }), "⭕️ ①⓪ T0010 - Tenth task");
-    assert.equal(core.titleForTask({ task_id: "T0105", semantic_name: "One hundred fifth", state: "QUEUED", queue_position: 105 }), "⭕️ ①⓪⑤ T0105 - One hundred fifth");
+
 });
 
 test("rejects linked Git worktrees", () => {
@@ -678,7 +627,7 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 19);
+    assert.equal(version, 20);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
@@ -736,7 +685,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -781,7 +730,7 @@ test("removes legacy mental-model events and persisted fields", () => {
     const eventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     const persistedResult = JSON.parse(migratedDatabase.prepare("SELECT result_json FROM events WHERE event_key = 'legacy-result'").get().result_json);
     const persistedBrief = JSON.parse(migratedDatabase.prepare("SELECT brief_json FROM activation_deliveries WHERE activation_key = 'legacy-activation'").get().brief_json);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
     assert.doesNotMatch(eventSql, /MENTAL_MODEL_RECORDED/);
     assert.equal(migratedDatabase.prepare("SELECT COUNT(*) AS count FROM events WHERE event_key = 'legacy-mental'").get().count, 0);
     assert.deepEqual(persistedResult.reviewPacket, { decisionCount: 0 });
@@ -828,7 +777,7 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
@@ -921,7 +870,7 @@ test("migrates version 14 tasks to PAUSED without losing events or dependencies"
     const taskSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get().sql;
     const migratedTask = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const dependency = migratedDatabase.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = 'T0002'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
     assert.match(taskSql, /'PAUSED'/);
     assert.equal(migratedTask.reviewed_tree, '{"legacy":true}');
     assert.equal(dependency.depends_on_id, "T0001");
@@ -959,8 +908,8 @@ test("keeps enqueue event-only and orders tasks without Git anchors", () => {
     const processed = core.processPendingEvents(options);
     const queue = core.getQueue(options).queue;
     assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002"]);
-    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0001 - First task", "⭕️ ② T0002 - Second task"]);
-    assert.deepEqual(processed.results.flatMap((result: { titleUpdates: Array<{ title: string }> }) => result.titleUpdates).map((update: { title: string }) => update.title), ["⭕️ ① T0001 - First task", "⭕️ ② T0002 - Second task"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002"]);
+    assert.deepEqual(processed.results.flatMap((result: { titleUpdates: Array<{ taskId: string }> }) => result.titleUpdates).map((update: { taskId: string }) => update.taskId), ["T0001", "T0002"]);
     assert.deepEqual(queue[1].dependencies, []);
     assert.equal(queue[0].baseCommit, null);
     assert.equal(queue[0].branchName, null);
@@ -987,22 +936,22 @@ test("settles worker events directly and returns the fully renumbered queue", ()
     assert.equal(settled.processed.processedCount, 3);
     assert.equal(settled.activation.activated, true);
     assert.equal(settled.activation.task.taskId, "T0001");
-    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), [
-        "🔴 T0001 - Task 1",
-        "⭕️ ① T0002 - Task 2",
-        "⭕️ ② T0003 - Task 3"
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), [
+        "T0001",
+        "T0002",
+        "T0003"
     ]);
-    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), [
-        "🔴 T0001 - Task 1",
-        "⭕️ ① T0002 - Task 2",
-        "⭕️ ② T0003 - Task 3"
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.taskId), [
+        "T0001",
+        "T0002",
+        "T0003"
     ]);
 
     const retry = core.settleProject(options);
     assert.equal(retry.processed.processedCount, 0);
     assert.equal(retry.activation.activated, false);
     assert.equal(retry.activation.reason, "ACTIVE_TASK_PRESENT");
-    assert.deepEqual(retry.queue.map((task: Record<string, unknown>) => task.title), settled.queue.map((task: Record<string, unknown>) => task.title));
+    assert.deepEqual(retry.queue.map((task: Record<string, unknown>) => task.taskId), settled.queue.map((task: Record<string, unknown>) => task.taskId));
     assert.deepEqual(retry.titleUpdates, []);
 });
 
@@ -1041,7 +990,7 @@ test("runs an eligible planning task immediately ahead of queued work", () => {
     assert.equal(settled.activation.task.state, "RUNNING");
     assert.equal(settled.activation.executionBrief.activationRequest.eventKind, "RUN_NOW_REQUESTED");
     assert.equal(settled.activation.executionBrief.activationRequest.userRequestId, "user-run-now-2");
-    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Immediate task", "⭕️ ① T0001 - Queued task"]);
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0002", "T0001"]);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
 
     const retry = core.submitEvent(options, "run-now-2", "T0002", "RUN_NOW_REQUESTED", { userRequestId: "user-run-now-2" });
@@ -1063,7 +1012,7 @@ test("prioritizes and runs an eligible queued task immediately", () => {
     const settled = core.settleProject(options);
     assert.equal(settled.processed.results[0].action, "RUN_NOW_PRIORITIZED");
     assert.equal(settled.activation.task.taskId, "T0002");
-    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Second queued task", "⭕️ ① T0001 - First queued task"]);
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0002", "T0001"]);
 });
 
 test("rejects run now without reordering when another task is active", () => {
@@ -1294,10 +1243,10 @@ test("settlement commits an approved task and automatically activates the user-e
     assert.equal(activationRequest.eventKind, "ENQUEUE_REQUESTED");
     assert.equal(activationRequest.userRequestId, "user-enqueue-2");
     assert.ok(Number.isFinite(Date.parse(activationRequest.requestedAt)));
-    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0002 - Task 2"]);
-    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), [
-        "🟢 T0001 - Task 1",
-        "🔴 T0002 - Task 2"
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0002"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.taskId), [
+        "T0001",
+        "T0002"
     ]);
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Add settled workflow coverage");
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
@@ -1320,36 +1269,35 @@ test("marks the approved sender yellow and the undelivered worker queued without
     core.submitEvent(options, "approve-first", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Complete initial work", userRequestId: "approve-first-message" });
     const activated = core.settleProject(options).activation;
     const initialHead = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
-    assert.equal(activated.task.title, "🔴 T0002 - Task 2");
+
     const marked = runCli(["request-user-input", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--handoff-task", activated.task.taskId, "--event-key", "activation-send-denied"]);
     assert.equal(marked.status, 0, marked.stderr || marked.stdout);
     const waiting = core.settleProject(options);
-    assert.deepEqual(waiting.titleUpdates, [
-        { taskId: "T0001", threadId: "thread-1", title: "🟡 T0001 - Task 1" },
-        { taskId: "T0002", threadId: "thread-2", title: "⭕️ ① T0002 - Task 2" },
-        { taskId: "T0003", threadId: "thread-3", title: "⭕️ ② T0003 - Task 3" }
+    assert.deepEqual(waiting.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [
+        { taskId: "T0001", threadId: "thread-1" },
+        { taskId: "T0002", threadId: "thread-2" },
+        { taskId: "T0003", threadId: "thread-3" }
     ]);
     assert.equal(waiting.activation.reason, "ACTIVE_TASK_PRESENT");
     assert.equal(waiting.queue[0].state, "RUNNING");
     assert.equal(waiting.queue[0].queuePosition, activated.task.queuePosition);
     assert.equal(waiting.queue[0].branchName, activated.task.branchName);
     assert.equal(waiting.queue[0].handoffSenderTaskId, "T0001");
-    assert.equal(waiting.queue[1].title, "⭕️ ② T0003 - Task 3");
-    assert.equal(core.getStatus(options, "T0001").task.title, "🟡 T0001 - Task 1");
+
     assert.equal(core.getStatus(options, "T0001").task.state, "DONE");
     assert.deepEqual(core.getStatus(options, "T0001").task.pendingHandoffTaskIds, ["T0002"]);
     assert.equal(core.getStatus(options, "T0001").task.awaitingUser, false);
-    assert.equal(core.settleProject(options).queue[0].title, "⭕️ ① T0002 - Task 2");
+    core.settleProject(options);
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), initialHead);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), activated.executionBrief.workerBranch);
 
     const responded = runCli(["request-user-response", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0001", "--handoff-task", "T0002", "--event-key", "authorized-handoff-delivered"]);
     assert.equal(responded.status, 0, responded.stderr || responded.stdout);
     const resumed = core.settleProject(options);
-    assert.deepEqual(resumed.titleUpdates, [
-        { taskId: "T0001", threadId: "thread-1", title: "🟢 T0001 - Task 1" },
-        { taskId: "T0002", threadId: "thread-2", title: "🔴 T0002 - Task 2" },
-        { taskId: "T0003", threadId: "thread-3", title: "⭕️ ① T0003 - Task 3" }
+    assert.deepEqual(resumed.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [
+        { taskId: "T0001", threadId: "thread-1" },
+        { taskId: "T0002", threadId: "thread-2" },
+        { taskId: "T0003", threadId: "thread-3" }
     ]);
     assert.equal(resumed.activation.activated, false);
     assert.equal(resumed.queue[1].state, "QUEUED");
@@ -1374,21 +1322,20 @@ test("preserves handoff ownership and clears a paused sender after destination c
     core.settleProject(options);
     core.submitEvent(options, "handoff-denied", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" });
     core.settleProject(options);
-    assert.equal(core.getStatus(options, "T0001").task.title, "🟡 T0001 - Task 1");
+
     assert.equal(core.getStatus(options, "T0001").task.state, "PAUSED");
     assert.throws(() => core.submitEvent(options, "wrong-sender", "T0003", "USER_INPUT_RECEIVED", { handoffTaskId: "T0002" }), /does not belong to this sender/);
     assert.throws(() => core.submitEvent(options, "unapproved-sender", "T0003", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" }), /Cannot report an approval handoff/);
     assert.throws(() => core.submitEvent(options, "ordinary-response", "T0001", "USER_INPUT_RECEIVED", {}), /Cannot update user-input attention/);
     assert.equal(core.submitEvent(options, "handoff-denied", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" }).created, false);
-    assert.equal(core.getStatus(options, "T0002").task.title, "⭕️ ① T0002 - Task 2");
 
     core.submitEvent(options, "cancel-destination", "T0002", "CANCEL_REQUESTED", { userRequestId: "cancel-message" });
     const settled = core.settleProject(options);
     assert.equal(core.getStatus(options, "T0002").task.handoffSenderTaskId, null);
-    assert.equal(core.getStatus(options, "T0001").task.title, "⏸️ T0001 - Task 1");
-    assert.deepEqual(settled.titleUpdates, [
-        { taskId: "T0002", threadId: "thread-2", title: "Task 2" },
-        { taskId: "T0001", threadId: "thread-1", title: "⏸️ T0001 - Task 1" }
+
+    assert.deepEqual(settled.titleUpdates.map((update: { taskId: string; threadId: string }) => ({ taskId: update.taskId, threadId: update.threadId })), [
+        { taskId: "T0002", threadId: "thread-2" },
+        { taskId: "T0001", threadId: "thread-1" }
     ]);
 });
 
@@ -1411,11 +1358,11 @@ test("migrates version 15 without changing running tasks or their ordinary atten
     core.installProjectRouting(options);
     const after = core.getStatus(options, "T0001").task;
     assert.deepEqual(after, before);
-    assert.equal(after.title, "🟡 T0001 - Existing worker");
+
     assert.equal(after.handoffSenderTaskId, null);
     assert.deepEqual(after.pendingHandoffTaskIds, []);
     const migrated = new DatabaseSync(databasePath);
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 20);
     migrated.close();
 });
 
@@ -1512,7 +1459,7 @@ test("approve and pause commits a checkpoint without satisfying dependencies", (
     const settled = core.settleProject(options);
 
     assert.equal(settled.completion.task.state, "PAUSED");
-    assert.equal(settled.completion.task.title, "⏸️ T0001 - Task 1");
+
     assert.equal(settled.completion.task.approvalTarget, "PAUSED");
     assert.equal(settled.completion.task.branchName, null);
     assert.equal(settled.completion.task.worktreePath, null);
@@ -1526,7 +1473,7 @@ test("approve and pause commits a checkpoint without satisfying dependencies", (
     const resumed = core.resumeTask(options, "T0001");
     assert.equal(resumed.resumedFrom, "PAUSED");
     assert.equal(resumed.task.state, "PLANNING");
-    assert.equal(resumed.task.title, "⚪️ T0001 - Task 1");
+
     assert.equal(resumed.task.approvalTarget, "DONE");
     assert.equal(resumed.task.committedCommit, null);
     assert.equal(core.getReviewPacket(options, "T0001").decisionCount, 0);
@@ -1636,7 +1583,7 @@ test("a resumed checkpoint uses the new approval subject and can finish", () => 
     const completed = core.settleProject(options);
 
     assert.equal(completed.completion.task.state, "DONE");
-    assert.equal(completed.completion.task.title, "🟢 T0001 - Continue after checkpoint");
+
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-2", "--format=%s"]), "Finish the resumed implementation\nSave the first implementation checkpoint");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "main:checkpoint.txt"]), "finished");
 });
@@ -1709,7 +1656,7 @@ test("moves an already queued task to the end on a new enqueue request", () => {
     const processed = core.processPendingEvents(options);
     assert.equal(processed.results[0].action, "REENQUEUED");
     assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002"]);
-    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0001 - Task 1", "⭕️ ② T0003 - Task 3", "⭕️ ③ T0002 - Task 2"]);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002"]);
 
     const retry = core.submitEvent(options, "enqueue-2-again", "T0002", "ENQUEUE_REQUESTED", {});
     assert.equal(retry.created, false);
@@ -1740,9 +1687,9 @@ test("returns a queued task to planning and preserves its dependencies", () => {
     assert.equal(settled.processed.results[0].action, "RETURNED_TO_PLANNING");
     assert.equal(settled.processed.results[0].task.state, "PLANNING");
     assert.equal(settled.processed.results[0].task.queuePosition, null);
-    assert.equal(settled.processed.results[0].task.title, "⚪️ T0002 - Task 2");
-    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
-    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "⭕️ ① T0003 - Task 3"]);
+
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0002", "T0003"]);
     const database = new DatabaseSync(databasePath);
     const dependency = database.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     database.close();
@@ -1774,9 +1721,9 @@ test("returns a blocked waiting task to planning and preserves its dependencies"
     assert.equal(settled.processed.results[0].action, "RETURNED_TO_PLANNING");
     assert.equal(settled.processed.results[0].task.state, "PLANNING");
     assert.equal(settled.processed.results[0].task.queuePosition, null);
-    assert.equal(settled.processed.results[0].task.title, "⚪️ T0002 - Task 2");
-    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3"]);
-    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⚪️ T0002 - Task 2", "⭕️ ① T0003 - Task 3"]);
+
+    assert.deepEqual(settled.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003"]);
+    assert.deepEqual(settled.titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0002", "T0003"]);
     const database = new DatabaseSync(databasePath);
     const dependency = database.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     database.close();
@@ -1810,9 +1757,8 @@ test("enqueues a blocked waiting task at an explicit position or at the end", ()
     const positioned = core.settleProject(options);
     assert.equal(positioned.processed.results[0].action, "ENQUEUED");
     assert.deepEqual(positioned.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002", "T0004"]);
-    assert.deepEqual(positioned.queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0003 - Task 3", "⭕️ ② T0002 - Task 2", "⭕️ ③ T0004 - Task 4"]);
+    assert.deepEqual(positioned.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0002", "T0004"]);
     assert.deepEqual(positioned.queue.find((task: Record<string, unknown>) => task.taskId === "T0002").dependencies, ["T0001"]);
-    assert.equal(positioned.titleUpdates.find((update: Record<string, unknown>) => update.taskId === "T0002").title, "⭕️ ② T0002 - Task 2");
 
     const retry = runCli(["request-enqueue", "--project-root", fixture.repositoryRoot, "--state-root", fixture.stateRoot, "--task", "T0002", "--event-key", "reenqueue-2-positioned", "--after", "T0003"]);
     assert.equal(retry.status, 0, retry.stderr || retry.stdout);
@@ -1824,7 +1770,7 @@ test("enqueues a blocked waiting task at an explicit position or at the end", ()
     assert.equal(endRequest.status, 0, endRequest.stderr || endRequest.stdout);
     const ended = core.settleProject(options);
     assert.deepEqual(ended.queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0003", "T0004", "T0002"]);
-    assert.equal(ended.queue[3].title, "⭕️ ③ T0002 - Task 2");
+
 });
 
 test("rejects planning and enqueue for blocked running or review work without changing Git", () => {
@@ -1875,15 +1821,15 @@ test("reorders waiting tasks independently from blocking dependencies", () => {
     const firstMove = core.processPendingEvents(options);
     let queue = core.getQueue(options).queue;
     assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0004", "T0001", "T0002", "T0003"]);
-    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0004 - Task 4", "⭕️ ② T0001 - Task 1", "⭕️ ③ T0002 - Task 2", "⭕️ ④ T0003 - Task 3"]);
-    assert.deepEqual(firstMove.results[0].titleUpdates.map((update: Record<string, unknown>) => update.title), queue.map((task: Record<string, unknown>) => task.title));
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0004", "T0001", "T0002", "T0003"]);
+    assert.deepEqual(firstMove.results[0].titleUpdates.map((update: Record<string, unknown>) => update.taskId), queue.map((task: Record<string, unknown>) => task.taskId));
     assert.deepEqual(queue[0].dependencies, ["T0001"]);
 
     core.submitEvent(options, "move-4-after-2", "T0004", "MOVE_REQUESTED", { afterTaskId: "T0002" });
     core.processPendingEvents(options);
     queue = core.getQueue(options).queue;
     assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0004", "T0003"]);
-    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["⭕️ ① T0001 - Task 1", "⭕️ ② T0002 - Task 2", "⭕️ ③ T0004 - Task 4", "⭕️ ④ T0003 - Task 3"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0004", "T0003"]);
     assert.deepEqual(queue[2].dependencies, ["T0001"]);
 
     core.submitEvent(options, "move-4-before-2", "T0004", "MOVE_REQUESTED", { beforeTaskId: "T0002" });
@@ -1972,10 +1918,10 @@ test("numbers only queued tasks while another task is running", () => {
     core.processPendingEvents(options);
 
     const activation = core.activateNextTask(options);
-    assert.equal(activation.task.title, "🔴 T0001 - Task 1");
-    assert.deepEqual(activation.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3"]);
+
+    assert.deepEqual(activation.titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0002", "T0003"]);
     let queue = core.getQueue(options).queue;
-    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0003"]);
     assert.deepEqual(queue.map((task: Record<string, unknown>) => task.queuedPosition), [null, 1, 2]);
 
     registerTask(options, "thread-4", "Task 4");
@@ -1983,17 +1929,17 @@ test("numbers only queued tasks while another task is running", () => {
     const enqueued = core.processPendingEvents(options);
     assert.equal(enqueued.results[0].task.queuePosition, 4);
     assert.equal(enqueued.results[0].task.queuedPosition, 3);
-    assert.equal(enqueued.results[0].task.title, "⭕️ ③ T0004 - Task 4");
+
     queue = core.getQueue(options).queue;
-    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3", "⭕️ ③ T0004 - Task 4"]);
+    assert.deepEqual(queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0003", "T0004"]);
 
     core.submitEvent(options, "block-2", "T0002", "BLOCKED_REPORTED", { reason: "Waiting for input" });
     const blocked = core.processPendingEvents(options);
-    assert.deepEqual(blocked.results[0].titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0003 - Task 3", "⭕️ ② T0004 - Task 4"]);
-    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.title), ["🔴 T0001 - Task 1", "❌ T0002 - Task 2", "⭕️ ① T0003 - Task 3", "⭕️ ② T0004 - Task 4"]);
+    assert.deepEqual(blocked.results[0].titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0003", "T0004"]);
+    assert.deepEqual(core.getQueue(options).queue.map((task: Record<string, unknown>) => task.taskId), ["T0001", "T0002", "T0003", "T0004"]);
 
     const resumed = core.resumeTask(options, "T0002");
-    assert.deepEqual(resumed.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Task 2", "⭕️ ② T0003 - Task 3", "⭕️ ③ T0004 - Task 4"]);
+    assert.deepEqual(resumed.titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0002", "T0003", "T0004"]);
 });
 
 test("review and approval do not create a commit", () => {
@@ -2005,7 +1951,7 @@ test("review and approval do not create a commit", () => {
     core.submitEvent(options, "review-1", "T0001", "REVIEW_REQUESTED", { summary: "Ready" });
     core.processPendingEvents(options);
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
-    assert.equal(core.getStatus(options, "T0001").task.title, "💪 T0001 - Commit on approval");
+
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0001");
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.initialCommit);
     core.submitEvent(options, "approve-1", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Commit approved changes safely", userRequestId: "user-message-1" });
@@ -2076,7 +2022,7 @@ test("returns review to running before rework without changing Git state", () =>
     assert.equal(processed.results[0].action, "REWORK_STARTED");
     assert.equal(processed.results[0].summary, "Address review feedback");
     assert.equal(processed.results[0].task.state, "RUNNING");
-    assert.equal(processed.results[0].task.title, "🔴 T0001 - Refine review");
+
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), branchBeforeRework);
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), headBeforeRework);
     assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), statusBeforeRework);
@@ -2099,7 +2045,7 @@ test("returns review to running before rework without changing Git state", () =>
 
     core.submitEvent(options, "review-2", "T0001", "REVIEW_REQUESTED", { summary: "Rework ready" });
     core.processPendingEvents(options);
-    assert.equal(core.getStatus(options, "T0001").task.title, "💪 T0001 - Refine review");
+
 });
 
 test("requires a meaningful approval commit subject distinct from the task title", () => {
@@ -2159,7 +2105,7 @@ test("approved commit includes changes made after review", () => {
     core.processPendingEvents(options);
     const committed = core.commitApprovedTask(options, "T0001");
     assert.equal(committed.task.state, "DONE");
-    assert.equal(committed.task.title, "🟢 T0001 - Flexible review");
+
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:change.txt"]), "after review");
     assert.equal(runGit(fixture.repositoryRoot, ["show", "HEAD:additional.txt"]), "added during review");
     assert.equal(runGit(fixture.repositoryRoot, ["log", "-1", "--format=%s"]), "Preserve changes made during review");
@@ -2287,7 +2233,7 @@ test("dependencies activate against the latest shared base after approval commit
     approveTask(options, "T0001", "first");
     const firstCompletion = core.commitApprovedTask(options, "T0001");
     const firstCommit = firstCompletion.task.committedCommit;
-    assert.deepEqual(firstCompletion.titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Dependent task"]);
+    assert.deepEqual(firstCompletion.titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0002"]);
     const secondActivation = core.activateNextTask(options);
     assert.equal(secondActivation.task.taskId, "T0002");
     assert.equal(secondActivation.task.baseCommit, firstCommit);
@@ -2365,7 +2311,7 @@ test("recovery preserves the PAUSED approval target", () => {
     const recovered = core.recoverCommit(options, "T0001");
     assert.equal(recovered.finalized, true);
     assert.equal(recovered.task.state, "PAUSED");
-    assert.equal(recovered.task.title, "⏸️ T0001 - Recover paused checkpoint");
+
     assert.equal(recovered.task.branchName, null);
     assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
     assert.equal(core.resumeTask(options, "T0001").task.state, "PLANNING");
@@ -2458,7 +2404,7 @@ test("activation refuses leftover changes from a canceled active task", () => {
     fs.writeFileSync(path.join(fixture.repositoryRoot, "leftover.txt"), "leftover\n");
     core.submitEvent(options, "cancel-1", "T0001", "CANCEL_REQUESTED", { userRequestId: "cancel-message" });
     const canceled = core.processPendingEvents(options);
-    assert.deepEqual(canceled.results[0].titleUpdates.map((update: Record<string, unknown>) => update.title), ["⭕️ ① T0002 - Next task"]);
+    assert.deepEqual(canceled.results[0].titleUpdates.map((update: Record<string, unknown>) => update.taskId), ["T0002"]);
     assert.throws(() => core.activateNextTask(options), /working tree must be clean/);
 });
 

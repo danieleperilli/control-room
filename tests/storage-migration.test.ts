@@ -77,7 +77,7 @@ test("schema upgrades follow relocation and preserve existing registration", () 
     runDefault(fixture, ["install-routing"]);
     assert.equal(runDefault(fixture, ["status", "--thread-id", "worker-one"]).role, "WORKER");
     const migrated = new DatabaseSync(fixture.destination);
-    assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 19);
+    assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 20);
     migrated.close();
     assert.equal(fs.existsSync(fixture.source), false);
 });

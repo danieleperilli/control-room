@@ -91,11 +91,11 @@ node <skill-dir>/scripts/control-room.ts request-user-input \
 node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 ```
 
-The sender must be `DONE` or `PAUSED`, and the distinct destination must still be `RUNNING`. Apply every title update: the sender shows `🟡`, the destination shows `⭕️` with its position, and the following queue titles are renumbered. The destination was marked `🔴` before delivery; the handoff marker corrects that presentation without releasing its reserved workspace. Status exposes `pendingHandoffTaskIds` on the sender and `handoffSenderTaskId` on the destination. These are separate from ordinary `awaitingUser`, so a direct message must not clear them automatically.
+The sender must be `DONE`, `PAUSED` or `PR_OPEN`, and the distinct destination must still be `RUNNING`. Apply every title update: a `PR_OPEN` sender retains 🔵; other approved senders show `🟡`. The destination shows `⭕️` with its position and following queue titles are renumbered. The handoff marker preserves its reserved workspace. Status exposes `pendingHandoffTaskIds` on the sender and `handoffSenderTaskId` on the destination. These are separate from ordinary `awaitingUser`, so a direct message must not clear them automatically.
 
 ## Settle and deliver activations
 
-After submitting a state-changing event, run `settle --project-root <canonical-root>` in the same task. Settlement processes pending events, finalizes approvals, activates requested isolated tasks and the next eligible shared task. It does not wake the manual console. Apply all returned `titleUpdates` before the final response; surface rejected events, integration failures or recovery requirements.
+After submitting a state-changing event, run `settle --project-root <canonical-root>` in the same task. Settlement processes pending events, checks open PRs, finalizes approvals through their captured mode, activates requested isolated tasks and the next eligible shared task. It does not wake the manual console. Apply all returned `titleUpdates` before the final response; surface rejected events, PR synchronization warnings, integration failures or recovery requirements. Attach every PR created or recovered in this turn as described in [integration-mode.md](integration-mode.md).
 
 Each activation stores an immutable execution brief in SQLite in the same transaction that sets the task to `RUNNING`. Its `activationKey` identifies that execution cycle. Settlement also returns `pendingActivations` until delivery is confirmed or the execution is superseded. Deduplicate fresh `activation.executionBrief`, `isolatedActivations[].executionBrief` and pending entries by `activationKey`.
 

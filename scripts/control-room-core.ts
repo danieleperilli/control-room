@@ -1,7 +1,7 @@
 const { isolatedWorktreePathForTask }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
 const { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
 const { resolveTaskWorkspace, cleanupCanceledIsolatedTasks, commitApprovedTask, recoverCommit }: import("./control-room-integration.ts").IIntegrationApi = require("./control-room-integration.ts");
-import type { IApprovalResult, IEventPayloadByKind, IActivationRequest, IActivationDelivery, IDeliveryRow, IExecutionBrief, IActivationResult, TaskState, EventKind, DecisionConfidence, DecisionImpact, DecisionInputStatus, IControlRoomOptions, IEventPayload, IDecision, IReviewPacket, IStore, IProjectRow, ITaskRow, ITaskExclusionRow, IEventRow, ITitleUpdate } from "./control-room-types.ts";
+import type { IntegrationMode, IApprovalResult, IEventPayloadByKind, IActivationRequest, IActivationDelivery, IDeliveryRow, IExecutionBrief, IActivationResult, TaskState, EventKind, DecisionConfidence, DecisionImpact, DecisionInputStatus, IControlRoomOptions, IEventPayload, IDecision, IReviewPacket, IStore, IProjectRow, ITaskRow, ITaskExclusionRow, IEventRow, ITitleUpdate } from "./control-room-types.ts";
 const { currentTimestamp, validateThreadId, validateSemanticName, validateTaskId, validateBranchName, workerBranchForTask, validateEventKey, validateCompactText, validateDecisionId, validateDecisionPayload, validateApprovalCommitMessage, validateQueuePosition, validateEventPayload }: import("./control-room-validation.ts").IValidationApi = require("./control-room-validation.ts");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot, runGit, requireGit, requireBranchCheckout, requireBaseCheckout, readWorkingTreeStatus, resolveCurrentHeadIfExists, resolveLocalBranchHeadIfExists }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
@@ -162,6 +162,7 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "- For a registered PLANNING or QUEUED task, route `$control-room exclude` through cancellation and settlement so it leaves the queue and regains its undecorated semantic title.",
         "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
         "- Route a direct `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status` command to the project before worker registration or exclusion handling, including from side chats. Autopilot authorizes automatic completion of explicitly started or queued work until disabled; it does not enqueue planning tasks. Follow the skill's autopilot reference for approval and progress.",
+        "- Route direct `PR mode`, `merge mode`, and `current mode` commands before registration, including from side chats. The mode belongs to this project and is captured by each approval. Follow the skill's integration-mode reference; PR mode approval authorizes worker-branch push and PR creation, never remote merge.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
         "- Treat a direct user `Enqueue` command as advance authorization for that exact registered task to start automatically when it becomes the first dependency-eligible queued worker. After settlement activates it, send one activation brief to its recorded thread without asking for another confirmation merely because a different task's approval freed the queue. This authorization never covers another task, thread, project, or implementation scope.",
         "- Apply every ControlRoom task title update before replying.",
@@ -367,15 +368,18 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
     const store = openStore(options);
     try {
         beginTransaction(store.database);
-        requireProject(store);
+        const project = requireProject(store);
         let task = requireTask(store, validTaskId);
         if (kind === "APPROVAL_REQUESTED" && validPayload.autopilotEventKey) {
             const authorization = store.database.prepare("SELECT user_request_id FROM autopilot_requests WHERE event_key = ? AND enabled = 1").get(validPayload.autopilotEventKey) as { user_request_id: string } | undefined;
             assertCondition(authorization, "Unknown autopilot authorization.");
             validPayload.userRequestId = authorization.user_request_id;
         }
-        const payloadJson = JSON.stringify(validPayload);
         const existingEvent = store.database.prepare("SELECT event_key, task_id, kind, payload_json, processed_at FROM events WHERE event_key = ?").get(validEventKey) as Record<string, unknown> | undefined;
+        if (kind === "APPROVAL_REQUESTED") {
+            validPayload.integrationMode = existingEvent ? (JSON.parse(String(existingEvent.payload_json)) as IEventPayload).integrationMode : project.integration_mode;
+        }
+        const payloadJson = JSON.stringify(validPayload);
         if (existingEvent) {
             assertCondition(existingEvent.task_id === validTaskId && existingEvent.kind === kind && existingEvent.payload_json === payloadJson, "Event key already exists with different content.");
             commitTransaction(store.database);
@@ -425,7 +429,7 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
             requireTask(store, String(validPayload.dependencyTaskId));
         } else if (kind === "USER_INPUT_REQUESTED") {
             if (validPayload.handoffTaskId) {
-                assertCondition(task.state === "DONE" || task.state === "PAUSED", `Cannot report an approval handoff for ${task.task_id} from ${task.state}.`);
+                assertCondition(task.state === "DONE" || task.state === "PAUSED" || task.state === "PR_OPEN", `Cannot report an approval handoff for ${task.task_id} from ${task.state}.`);
                 const destination = requireTask(store, validPayload.handoffTaskId);
                 assertCondition(destination.task_id !== task.task_id && destination.state === "RUNNING", "Handoff destination must be a different RUNNING task.");
                 assertCondition(!destination.handoff_sender_task_id || destination.handoff_sender_task_id === task.task_id, "Handoff destination already belongs to a different sender.");
@@ -450,13 +454,13 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
             if (validPayload.autopilotEventKey) {
                 validateAutopilotApproval(store, task, validPayload);
             }
-            assertCondition(task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
+            assertCondition(task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
         } else if (kind === "CANCEL_REQUESTED") {
             if (validPayload.cancelSource === "exclude") {
                 assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot request exclusion for ${task.task_id} from ${task.state}.`);
             } else {
-                assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "PAUSED", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
+                assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "PR_OPEN", "PAUSED", "BLOCKED", "CANCELED"].includes(task.state), `Cannot request cancellation for ${task.task_id} from ${task.state}.`);
             }
         } else {
             assertCondition(["QUEUED", "RUNNING", "REVIEW", "BLOCKED"].includes(task.state), `Cannot report ${task.task_id} blocked from ${task.state}.`);
@@ -471,6 +475,42 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
             processed: false,
             eventKey: validEventKey
         };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Persist an integration mode for future approvals without changing active work.
+ * @param options Project and optional state-root settings.
+ * @param mode Integration mode explicitly selected by the user.
+ * @param eventKey Stable command retry key.
+ * @param userRequestId Direct user message selecting the mode.
+ * @param threadId Originating chat identifier.
+ */
+function setIntegrationMode(options: IControlRoomOptions, mode: IntegrationMode, eventKey: string, userRequestId: string, threadId: string): Record<string, unknown> {
+    assertCondition(mode === "merge" || mode === "pr", "Integration mode must be merge or pr.");
+    const validEventKey = validateEventKey(eventKey);
+    const validRequestId = validateCompactText(userRequestId, "Direct user request ID", 200, true)!;
+    const validThreadId = validateThreadId(threadId);
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        const project = requireProject(store);
+        const existing = store.database.prepare("SELECT * FROM integration_mode_requests WHERE event_key = ?").get(validEventKey) as { mode: IntegrationMode; user_request_id: string; thread_id: string } | undefined;
+        if (existing) {
+            assertCondition(existing.mode === mode && existing.user_request_id === validRequestId && existing.thread_id === validThreadId, "Integration mode event key already exists with different content.");
+        } else {
+            const timestamp = currentTimestamp();
+            store.database.prepare("INSERT INTO integration_mode_requests (event_key, mode, user_request_id, thread_id, created_at) VALUES (?, ?, ?, ?, ?)").run(validEventKey, mode, validRequestId, validThreadId, timestamp);
+            store.database.prepare("UPDATE projects SET integration_mode = ?, updated_at = ? WHERE project_key = ?").run(mode, timestamp, store.projectKey);
+        }
+        const currentMode = requireProject(store).integration_mode;
+        commitTransaction(store.database);
+        return { changed: !existing, integrationMode: currentMode, controlRoomThreadId: project.coordinator_thread_id };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -909,7 +949,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         assertCondition(destination.task_id !== task.task_id, "Handoff destination must differ from its sender.");
         assertCondition(!destination.handoff_sender_task_id || destination.handoff_sender_task_id === task.task_id, "Handoff destination does not belong to this sender.");
         if (waiting) {
-            assertCondition(task.state === "DONE" || task.state === "PAUSED", `Cannot report an approval handoff for ${task.task_id} from ${task.state}.`);
+            assertCondition(task.state === "DONE" || task.state === "PAUSED" || task.state === "PR_OPEN", `Cannot report an approval handoff for ${task.task_id} from ${task.state}.`);
             assertCondition(destination.state === "RUNNING", "Handoff destination must be RUNNING.");
         }
         store.database.prepare("UPDATE tasks SET handoff_sender_task_id = ?, awaiting_user = CASE WHEN ? THEN 0 ELSE awaiting_user END, updated_at = ? WHERE task_id = ?").run(waiting ? task.task_id : null, Number(waiting), currentTimestamp(), destination.task_id);
@@ -969,7 +1009,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         if (payload.autopilotEventKey) {
             validateAutopilotApproval(store, task, payload);
         }
-        if (task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE") {
+        if (task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE") {
             const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
             return { action: "APPROVAL_ALREADY_RECORDED", task: serializeTask(task), userRequestId: payload.userRequestId, commitMessage, approvalTarget: task.approval_target };
         }
@@ -978,7 +1018,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Approval requires a direct user request ID.");
         const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
         const approvalTarget = payload.approvalTarget || "DONE";
-        store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, approval_event_key = ?, approval_target = ?, updated_at = ? WHERE task_id = ?").run(event.event_key, approvalTarget, currentTimestamp(), task.task_id);
+        store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, approval_event_key = ?, approval_target = ?, integration_mode = ?, updated_at = ? WHERE task_id = ?").run(event.event_key, approvalTarget, payload.integrationMode || "merge", currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
         return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage, approvalTarget, approvalMode: payload.autopilotEventKey ? "autopilot" : "manual" };
     }
@@ -994,7 +1034,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         if (exclusionRequested) {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED", `Cannot exclude ${task.task_id} from ${task.state}.`);
         } else {
-            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "PAUSED", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
+            assertCondition(["PLANNING", "QUEUED", "RUNNING", "REVIEW", "PR_OPEN", "PAUSED", "BLOCKED"].includes(task.state), `Cannot cancel ${task.task_id} from ${task.state}.`);
         }
         const timestamp = currentTimestamp();
         store.database.prepare(`
@@ -1447,7 +1487,7 @@ function resumeTask(options: IControlRoomOptions, taskId: string, reopen = false
                     queue_position = NULL, base_commit = NULL, branch_name = NULL,
                     workspace_mode = 'shared', worktree_path = NULL, reviewed_commit = NULL,
                     approved_commit = NULL, approval_event_key = NULL, approval_target = 'DONE',
-                    integrated_commit = NULL, updated_at = ?
+                    integrated_commit = NULL, integration_mode = NULL, pr_url = NULL, pr_repository = NULL, updated_at = ?
                 WHERE task_id = ?
             `).run(currentTimestamp(), task.task_id);
             const resumedTask = requireTask(store, task.task_id);
@@ -1523,9 +1563,10 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         const autopilot = readAutopilotStatus(store);
         if (taskId) {
             const task = requireTask(store, taskId);
-            const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE";
+            const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE";
             return {
                 projectRoot: store.projectRoot,
+                integrationMode: project.integration_mode,
                 autopilot,
                 controlRoomTitle: titleForControlRoom(),
                 task: serializeTask(task),
@@ -1534,14 +1575,15 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         }
         if (validThreadId) {
             if (validThreadId === project.coordinator_thread_id) {
-                return { projectRoot: store.projectRoot, autopilot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
+                return { projectRoot: store.projectRoot, integrationMode: project.integration_mode, autopilot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
             }
             const task = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.thread_id = ?`).get(validThreadId) as ITaskRow | undefined;
             const exclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
             const isExcluded = Boolean(exclusion && (!task || task.state === "CANCELED"));
-            const includesReviewPacket = task && (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PAUSED" || task.state === "DONE");
+            const includesReviewPacket = task && (task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE");
             return {
                 projectRoot: store.projectRoot,
+                integrationMode: project.integration_mode,
                 autopilot,
                 controlRoomTitle: titleForControlRoom(),
                 controlRoomThreadId: project.coordinator_thread_id,
@@ -1558,6 +1600,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         }
         return {
             projectRoot: store.projectRoot,
+            integrationMode: project.integration_mode,
             autopilot,
             controlRoomTitle: titleForControlRoom(),
             controlRoomThreadId: project.coordinator_thread_id,
@@ -1585,7 +1628,7 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
         const project = requireProject(store);
         const tasks = store.database.prepare(`
             ${TASK_WITH_QUEUED_POSITION_SELECT}
-            WHERE task.state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'BLOCKED')
+            WHERE task.state IN ('QUEUED', 'RUNNING', 'REVIEW', 'APPROVED', 'PR_OPEN', 'BLOCKED')
             ORDER BY task.queue_position IS NULL, task.queue_position, task.task_number
         `).all() as unknown as ITaskRow[];
         const queue: Record<string, unknown>[] = [];
@@ -1595,7 +1638,7 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
         const progress = store.database.prepare("SELECT COUNT(CASE WHEN state = 'DONE' THEN 1 END) AS completed, COUNT(*) AS total FROM tasks WHERE state NOT IN ('PLANNING', 'PAUSED', 'CANCELED')").get() as { completed: number; total: number };
         const completedTasks = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.state = 'DONE' ORDER BY task.updated_at DESC, task.task_number DESC LIMIT 5`).all() as unknown as ITaskRow[];
         const pendingActivations = store.database.prepare("SELECT task_id AS taskId, activation_key AS activationKey, state FROM activation_deliveries WHERE state IN ('PENDING', 'CLAIMED') ORDER BY created_at, task_id").all();
-        return { projectRoot: store.projectRoot, controlRoomTitle: titleForControlRoom(), autopilot: readAutopilotStatus(store), integrationTaskId: project.integration_task_id, pendingActivations, capturedAt: currentTimestamp(), progress: { ...progress }, completedTasks: completedTasks.map((task) => serializeTask(task)), queue };
+        return { projectRoot: store.projectRoot, integrationMode: project.integration_mode, controlRoomTitle: titleForControlRoom(), autopilot: readAutopilotStatus(store), integrationTaskId: project.integration_task_id, pendingActivations, capturedAt: currentTimestamp(), progress: { ...progress }, completedTasks: completedTasks.map((task) => serializeTask(task)), queue };
     } finally {
         store.database.close();
     }
@@ -1698,7 +1741,9 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
             titleUpdates: collectSettlementTitleUpdates(processed, [], null, [])
         };
     }
-    const completions: IApprovalResult[] = [];
+    const { syncPullRequests }: import("./control-room-pr.ts").IPullRequestApi = require("./control-room-pr.ts");
+    const pullRequests = syncPullRequests(options);
+    const completions: IApprovalResult[] = [...pullRequests.tasks];
     while (!status.commitTaskId) {
         const activeQueue = getQueue(options).queue as Record<string, unknown>[];
         const approvedTasks = activeQueue.filter((task) => task.state === "APPROVED");
@@ -1724,6 +1769,8 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
     const reviewPackets = reviewTasks.map((task) => getReviewPacket(options, String(task.taskId)));
     return {
         settled: !status.commitTaskId,
+        integrationMode: queue.integrationMode,
+        pullRequestWarnings: pullRequests.warnings,
         autopilot: queue.autopilot,
         progress: queue.progress,
         controlRoomTitle: titleForControlRoom(),
@@ -1873,6 +1920,7 @@ function doctorProject(options: IControlRoomOptions, taskId?: string): import(".
         store = opened;
         const project = requireProject(store);
         const integrity = store.database.prepare("PRAGMA quick_check").all();
+        checks.push({ code: "INTEGRATION_MODE", level: "ok", message: `Current integration mode: ${project.integration_mode}.` });
         const foreignKeys = store.database.prepare("PRAGMA foreign_key_check").all();
         checks.push({ code: "STATE_INTEGRITY", level: integrity.every((row) => row.quick_check === "ok") && foreignKeys.length === 0 ? "ok" : "error", message: integrity.every((row) => row.quick_check === "ok") && foreignKeys.length === 0 ? "SQLite integrity and foreign keys are valid." : "SQLite integrity or foreign key checks failed; preserve the database before recovery." });
         const baseCommit = resolveLocalBranchHeadIfExists(projectRoot, project.base_branch);
@@ -1898,6 +1946,10 @@ function doctorProject(options: IControlRoomOptions, taskId?: string): import(".
         }
         for (const task of tasks) {
             const unmet = store.database.prepare("SELECT prerequisite.task_id, prerequisite.state FROM dependencies JOIN tasks AS prerequisite ON prerequisite.task_id = dependencies.depends_on_id WHERE dependencies.task_id = ? AND prerequisite.state <> 'DONE'").all(task.task_id) as Array<{ task_id: string; state: TaskState }>;
+            if (task.state === "PR_OPEN") {
+                const metadataValid = Boolean(task.pr_url && task.pr_repository && task.approved_commit && task.branch_name);
+                checks.push({ code: metadataValid ? "PR_OPEN" : "PR_METADATA_MISSING", level: metadataValid ? "warning" : "error", taskId: task.task_id, message: metadataValid ? "Approved task is waiting for remote PR merge and local synchronization." : "PR publication metadata is incomplete; preserve its worker branch.", nextAction: `Run sync-prs --task ${task.task_id}, then settle to activate newly eligible work.` });
+            }
             if (unmet.length > 0) {
                 checks.push({ code: "DEPENDENCIES_PENDING", level: "warning", taskId: task.task_id, message: unmet.map((dependency) => `${dependency.task_id}: ${dependency.state}`).join(", "), nextAction: "Complete the prerequisites, or explicitly remove an obsolete dependency." });
             }
@@ -1959,6 +2011,7 @@ const api = {
     resumeTask,
     settleProject,
     setAutopilot,
+    setIntegrationMode,
     submitEvent,
     titleForControlRoom,
     titleForTask

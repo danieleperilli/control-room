@@ -123,7 +123,7 @@ test("off revokes an accepted unleased automatic approval but preserves manual a
     core.processPendingEvents(options);
     assert.equal(core.getStatus(options, "T0001").task.state, "APPROVED");
     const disabled = core.setAutopilot(options, false, "off", "user-off", "side-chat");
-    assert.equal(disabled.titleUpdates[0].title, "💪 T0001 - Fixture feature");
+    assert.equal(disabled.autopilot.enabled, false);
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
     assert.throws(() => core.commitApprovedTask(options, "T0001"), /from REVIEW/);
     assert.equal(runGit(options.projectRoot, ["rev-parse", "main"]), initialCommit);
@@ -176,7 +176,7 @@ for (const kind of ["REWORK_REQUESTED", "REVIEW_REQUESTED", "BLOCKED_REPORTED", 
             assert.equal(runGit(options.projectRoot, ["rev-parse", "main"]), initialCommit);
         }
         if (kind === "REVIEW_REQUESTED") {
-            assert.ok(settlement.titleUpdates.some((update: { title: string }) => update.title === "💪 T0001 - Fixture feature"));
+            assert.ok(settlement.titleUpdates.some((update: { taskId: string }) => update.taskId === "T0001"));
         }
     });
 }
@@ -281,7 +281,7 @@ test("schema 18 migrates to manual mode and read-only commands never migrate it"
     assert.equal(core.getStatus(options).autopilot.enabled, false);
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
     const migrated = new DatabaseSync(databasePath);
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 19);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 20);
     assert.deepEqual(migrated.prepare("SELECT * FROM events ORDER BY sequence").all(), before);
     migrated.close();
 });

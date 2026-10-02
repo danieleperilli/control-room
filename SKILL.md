@@ -1,6 +1,6 @@
 ---
 name: control-room
-description: Coordinate Codex project tasks with a deterministic queue, optional autopilot, isolated execution, review and approval through local merge or repository PRs on GitHub and Azure DevOps. Use for PR mode, merge mode, current mode and autopilot commands in any project chat; $control-room init, join, exclude, queue, help or doctor; project turns after initialization; and lifecycle commands such as Enqueue, Run now, Approve, Resume or Cancel. Keep read-only requests, excluded tasks, subagents and side chats outside automatic registration.
+description: Coordinate Codex project tasks with a deterministic queue, optional autopilot, isolated execution, review and approval through branch commits, local merge or repository PRs on GitHub and Azure DevOps. Use for PR mode, merge mode, commit mode, current mode and autopilot commands in any project chat; $control-room init, join, exclude, queue, help or doctor; project turns after initialization; and lifecycle commands such as Enqueue, Run now, Approve, Resume or Cancel. Keep read-only requests, excluded tasks, subagents and side chats outside automatic registration.
 ---
 
 # ControlRoom
@@ -15,7 +15,7 @@ Preserve the complete user message. Never consume the substantive request while 
 - `$control-room queue`: run `queue --project-root <canonical-root>`.
 - `$control-room doctor`: run `doctor --project-root <canonical-root> [--task <T_ID>]`. Explain the reported blockers and next actions; do not repair state, send messages, register tasks or update titles.
 - A direct `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status` (also with `$control-room`): read [autopilot.md](references/autopilot.md) before ordinary role routing. The command applies to the selected project from any user chat, including an excluded task or side chat, without registering the caller. Discussion or quoted commands do not change the mode.
-- A direct `PR mode`, `merge mode`, or `current mode` (also with `$control-room`): read [integration-mode.md](references/integration-mode.md) before ordinary role routing. The persistent setting applies only to the selected initialized project, from any user chat without registering the caller. Discussion or quoted commands do not change it.
+- A direct `PR mode`, `merge mode`, `commit mode`, or `current mode` (also with `$control-room`): read [integration-mode.md](references/integration-mode.md) before ordinary role routing. The persistent setting applies only to the selected initialized project, from any user chat without registering the caller. Discussion or quoted commands do not change it.
 - For initialization, explicit join/exclusion, or explicit side-chat creation of a top-level task, read [registration.md](references/registration.md).
 - Subagents and side chats never receive a `T_ID` or mutate queue state on their own behalf. A side chat creates a separate top-level **Local** task only when the user explicitly asks, preserving the delegated request while removing the task-creation wrapper.
 
@@ -36,12 +36,12 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 ## Preserve the execution boundaries
 
 - Planning, queued and paused workers do not modify project files. Start only through a direct `Enqueue`, `Run now` or `Run isolated now`, followed by settlement. A direct enqueue authorizes later activation of that exact task and one handoff to its recorded thread within the same implementation scope.
-- Normal execution is serial in the shared checkout. Concurrent isolated execution requires an explicit request for each task and uses `.control-room/worktrees/<T_ID>`; every file operation uses the returned `workspacePath`.
+- Normal execution is serial in the shared checkout. Commit mode uses this checkout and retains its branch between tasks; isolated execution requires merge or PR mode. Concurrent isolated execution requires an explicit request for each task and uses `.control-room/worktrees/<T_ID>`; every file operation uses the returned `workspacePath`.
 - An activated worker may modify project files immediately inside its assigned workspace. Read [review.md](references/review.md) before recording material decisions, requesting review or processing approval.
 - Keep changes uncommitted during implementation and review. New implementation feedback in `REVIEW` first records rework. A direct `Approve` or `Approve and pause` is final authorization from `RUNNING` or `REVIEW`; do not ask for another confirmation.
 - After recording review, read current project status. If autopilot is enabled, follow [autopilot.md](references/autopilot.md) to complete verified work and deliver the next activation in the same turn. Use the stored explicit authorization; never fabricate a new direct approval or treat cached mode as current.
-- Approval captures the current project integration mode. Merge mode retains local integration; PR mode authorizes committing the worker, pushing only its branch and opening one repository PR through the provider selected from `origin`. Follow [integration-mode.md](references/integration-mode.md) for supported providers, publication, attachment, remote completion and recovery. A later mode change never changes an existing approval or PR.
-- Dependencies require `DONE`. PR approval enters 🔵 `PR_OPEN`, releases shared execution and preserves its branch and isolated worktree until confirmed remote merge and base synchronization. An approved checkpoint targets `PAUSED` after integration and remains unsatisfied; `Resume` returns that identity to planning.
+- Approval captures the current project integration mode. Commit mode commits on the current shared branch without integration, creating `control-room/codex` when on `main`. Merge mode retains local integration; PR mode authorizes committing the worker, pushing only its branch and opening one repository PR through the provider selected from `origin`. Follow [integration-mode.md](references/integration-mode.md) for supported providers, publication, attachment, remote completion and recovery. A later mode change never changes an existing approval or PR.
+- Dependencies require `DONE`. PR approval enters 🔵 `PR_OPEN`, returns the shared checkout to the base and holds all queued activation while preserving its branch and isolated worktree until confirmed remote merge and base synchronization. An approved checkpoint targets `PAUSED` after delivery through its captured mode and remains unsatisfied; `Resume` returns that identity to planning.
 - An explicit `Reopen` returns a completed task to planning with the same identity and history. Follow the reopening procedure in [execution.md](references/execution.md); a request to implement the follow-up also authorizes its immediate `Run now` request.
 - Submit events with stable retry keys and settle in the requesting task. Apply every returned title update before the final response. Routine success is concise; surface actual failures and missing delivery confirmations.
 - Activation and delivery are separate. The CLI persists each brief before returning it. Follow the claim/send/confirm workflow in [execution.md](references/execution.md); a `RUNNING` state alone does not prove delivery. An uncertain claim must not be resent automatically.
@@ -55,7 +55,7 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 | [execution.md](references/execution.md) | Queue commands, activation delivery, rework, task titles or user-attention markers |
 | [review.md](references/review.md) | Decisions, review or approval |
 | [autopilot.md](references/autopilot.md) | Project-wide automatic approval, on/off commands or progress display |
-| [integration-mode.md](references/integration-mode.md) | PR/merge mode commands, PR approval, attachment, remote synchronization or publication recovery |
+| [integration-mode.md](references/integration-mode.md) | PR/merge/commit mode commands, PR approval, attachment, remote synchronization or publication recovery |
 | [recovery.md](references/recovery.md) | An interrupted approval/cleanup, uncertain delivery or diagnostic failure needs recovery |
 | [protocol.md](references/protocol.md) | Exact event semantics, storage or an unfamiliar lower-level CLI operation |
 

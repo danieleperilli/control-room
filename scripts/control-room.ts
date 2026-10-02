@@ -6,7 +6,7 @@ interface IParsedArguments {
 }
 
 const USER_COMMANDS = [
-    "PR mode | merge mode | current mode",
+    "PR mode | merge mode | commit mode | current mode",
     "autopilot | autopilot on | autopilot off | autopilot status",
     "$control-room init",
     "$control-room join",
@@ -110,7 +110,7 @@ User commands:
 ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 
 Commands:
-  mode --project-root ROOT --mode (merge|pr|status) [--event-key KEY --user-request-id ID --thread-id ID] [--state-root PATH]
+  mode --project-root ROOT --mode (merge|pr|commit|status) [--event-key KEY --user-request-id ID --thread-id ID] [--state-root PATH]
   sync-prs --project-root ROOT [--task T0001] [--state-root PATH]
   autopilot --project-root ROOT --mode (on|off) --event-key KEY --user-request-id ID --thread-id ID [--state-root PATH]
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
@@ -169,8 +169,8 @@ function executeCommand(parsed: IParsedArguments): unknown {
             const status = core.getStatus(buildOptions(values));
             return { initialized: status.initialized, reason: status.reason, projectRoot: status.projectRoot, integrationMode: status.integrationMode, autopilot: status.autopilot };
         }
-        if (mode !== "merge" && mode !== "pr") {
-            throw new Error("--mode must be merge, pr or status.");
+        if (mode !== "merge" && mode !== "pr" && mode !== "commit") {
+            throw new Error("--mode must be merge, pr, commit or status.");
         }
         return core.setIntegrationMode(buildOptions(values), mode, requireOption(values, "event-key"), requireOption(values, "user-request-id"), requireOption(values, "thread-id"));
     }

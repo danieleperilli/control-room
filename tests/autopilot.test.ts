@@ -281,7 +281,7 @@ test("schema 18 migrates to manual mode and read-only commands never migrate it"
     assert.equal(core.getStatus(options).autopilot.enabled, false);
     assert.equal(core.getStatus(options, "T0001").task.state, "REVIEW");
     const migrated = new DatabaseSync(databasePath);
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 21);
     assert.deepEqual(migrated.prepare("SELECT * FROM events ORDER BY sequence").all(), before);
     migrated.close();
 });

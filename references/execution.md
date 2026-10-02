@@ -5,10 +5,10 @@
 - Keep `⚫️ Control Room` fixed as a manual console. It receives no routine messages and does not run in the background.
 - Let any worker or the manual console submit a valid event, then invoke the deterministic `settle` command in that same turn.
 - Treat the ControlRoom engine as the only queue and state writer. A task triggers the engine but does not edit SQLite directly.
-- Keep `PLANNING`, `QUEUED`, and `PAUSED` read-only on the configured base branch.
+- Keep `PLANNING`, `QUEUED`, and `PAUSED` read-only. Commit-mode completion retains its checkout; do not switch it to the base merely because a task pauses or returns to planning.
 - Allow only a `RUNNING` or `REVIEW` task to modify files, and only inside the `workspacePath` returned by its activation brief.
 - Keep normal tasks exclusive in the shared checkout. Allow additional tasks to run concurrently only after the user explicitly requests isolated execution for each one.
-- Create a worker branch only when settlement activates a task. Normal activation switches the shared checkout; isolated activation creates `<project-root>/.control-room/worktrees/<T_ID>` on the same `control-room/<T_ID>` branch without touching the shared checkout.
+- Create a worker branch only when settlement activates a task. Merge/PR shared activation creates `control-room/<T_ID>` from the configured base; isolated activation creates `<project-root>/.control-room/worktrees/<T_ID>` on that task branch without touching the shared checkout. Commit activation keeps the current non-main branch or creates `control-room/codex` from `main`.
 - Record macro implementation decisions append-only while the task is in `PLANNING`, `QUEUED`, or `RUNNING`.
 - Scope all state to the canonical local repository root.
 
@@ -26,6 +26,7 @@ Use every returned title exactly:
 - `RUNNING`: `🔴 T0001 - Semantic name`
 - `REVIEW`: `💪 T0001 - Semantic name`
 - `APPROVED`: `🟢 T0001 - Semantic name`
+- `PR_OPEN`: `🔵 T0001 - Semantic name`
 - `PAUSED`: `⏸️ T0001 - Semantic name`
 - `DONE`: `🟢 T0001 - Semantic name`
 - `BLOCKED`: `❌ T0001 - Semantic name`
@@ -37,6 +38,8 @@ After every settlement, apply every returned `titleUpdates` entry with the Codex
 
 When controlling Chrome for a worker, name the browser session or tab group `🤖 <T_ID>`, such as `🤖 T0001`.
 
+In commit mode, shared activation keeps the current non-main branch or creates `control-room/codex` from `main`. Approval retains this branch and checkout. Any `PR_OPEN` task holds subsequent shared and isolated activation until verified merge and base synchronization. See [integration-mode.md](integration-mode.md).
+
 ## Handle natural commands
 
 Use English as the canonical command language and recognize equivalent intent in other languages:
@@ -44,8 +47,8 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Return to planning`: submit `PLANNING_REQUESTED`. Accept a `QUEUED` task or a `BLOCKED` task whose recorded prior state is `QUEUED`; settlement removes its queue position, preserves dependencies, and returns the `⚪️` title.
 - `Enqueue`: submit `ENQUEUE_REQUESTED`. The direct user command is advance authorization for that exact registered task to start automatically when it later becomes the first dependency-eligible queued worker, including one activation brief to its recorded thread. Do not ask for another confirmation merely because approval of a different task frees the queue. This deferred authorization never covers another task, thread, project, or implementation scope. A new request for an already queued task moves it to the end. A `BLOCKED` task whose recorded prior state is `QUEUED` also returns to the end of the queue with its dependencies unchanged.
 - `Enqueue after T0005`: submit the same event with `--after T0005`; this changes placement only and also accepts a safely blocked waiting task.
-- `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no shared task is `RUNNING`, `REVIEW`, or `APPROVED` and every dependency is `DONE`; otherwise reject without changing its state or queue position. Explicit isolated workers do not occupy the shared checkout.
-- `Run isolated now`: submit `RUN_ISOLATED_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent already-isolated `RUNNING` no-op. Require every dependency to be `DONE` and an existing first commit on the configured base branch. Settlement creates `<project-root>/.control-room/worktrees/<T_ID>` and activates the task there immediately even while shared or other isolated tasks are active. Never infer this mode from component paths and never fall back to the shared checkout if worktree creation fails.
+- `Run now`: submit `RUN_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent `RUNNING` no-op. Settlement prioritizes and activates the task only when no shared task is `RUNNING`, `REVIEW`, or `APPROVED`, no task is `PR_OPEN`, and every dependency is `DONE`. An open PR keeps the prioritized task queued until synchronization completes; active shared work or unmet dependencies reject the request without changing state or queue position. Explicit isolated workers do not occupy the shared checkout.
+- `Run isolated now`: submit `RUN_ISOLATED_NOW_REQUESTED`. Accept only `PLANNING`, `QUEUED`, or the idempotent already-isolated `RUNNING` no-op. Require merge or PR mode, every dependency to be `DONE`, and an existing first commit on the configured base branch. Settlement creates `<project-root>/.control-room/worktrees/<T_ID>` immediately even while shared or other isolated tasks are active, except while a PR is awaiting merge and synchronization. Never infer isolation from component paths and never fall back to the shared checkout if worktree creation fails.
 - `Move first`, `Move to 3`, `Move before T0005`, or `Move after T0005`: submit `MOVE_REQUESTED` with the matching destination.
 - `Depends on T0005`: submit `DEPENDENCY_ADD_REQUESTED`.
 - `Remove dependency T0005`: submit `DEPENDENCY_REMOVE_REQUESTED`.
@@ -58,12 +61,13 @@ Use English as the canonical command language and recognize equivalent intent in
 - `Status`: read the current task snapshot.
 - `Queue status` or `$control-room queue`: read the project queue.
 - `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status`: follow [autopilot.md](autopilot.md) from any project chat before worker role handling. Mode changes do not register the caller; status is read-only.
+- `PR mode`, `merge mode`, `commit mode`, or `current mode`: follow [integration-mode.md](integration-mode.md) before role handling, without registering the caller.
 - `$control-room doctor`: diagnose state and blockers without registration, repairs or settlement.
 - `$control-room help`: show commands without changing state.
 
 From a worker, return-to-planning, resume, run-now, run-isolated-now, move, and dependency commands target that task. From the manual console, require an explicit target such as `Return T0003 to planning`, `Resume T0003`, `Run T0003 now`, `Run T0003 isolated now`, `Move T0003 before T0005`, or `Make T0003 depend on T0005`. Moving never changes dependencies, and dependency changes never alter queue order.
 
-Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `REVIEW` as its prior state. Those tasks may own a worker branch and uncommitted changes, so use the lower-level `resume` operation to restore the recorded state instead of demoting them into a read-only state. A `PAUSED` task has already integrated its approved checkpoint and uses that same operation to return safely to `PLANNING`.
+Reject `Return to planning` and `Enqueue` when `BLOCKED` records `RUNNING` or `REVIEW` as its prior state. Those tasks may own a worker branch and uncommitted changes, so use the lower-level `resume` operation to restore the recorded state instead of demoting them into a read-only state. A `PAUSED` task has already saved its approved checkpoint through the selected integration mode and uses that same operation to return safely to `PLANNING`.
 
 Generate one caller-stable event key for each user request and reuse it only for retries of that same request. A later direct command gets a new key.
 

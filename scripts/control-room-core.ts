@@ -162,7 +162,7 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "- For a registered PLANNING or QUEUED task, route `$control-room exclude` through cancellation and settlement so it leaves the queue and regains its undecorated semantic title.",
         "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
         "- Route a direct `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status` command to the project before worker registration or exclusion handling, including from side chats. Autopilot authorizes automatic completion of explicitly started or queued work until disabled; it does not enqueue planning tasks. Follow the skill's autopilot reference for approval and progress.",
-        "- Route direct `PR mode`, `merge mode`, and `current mode` commands before registration, including from side chats. The mode belongs to this project and is captured by each approval. Follow the skill's integration-mode reference; PR mode approval authorizes worker-branch push and PR creation, never remote merge.",
+        "- Route direct `PR mode`, `merge mode`, `commit mode`, and `current mode` commands before registration, including from side chats. The mode belongs to this project and is captured by each approval. Follow the skill's integration-mode reference; PR mode approval authorizes worker-branch push and PR creation, never remote merge.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
         "- Treat a direct user `Enqueue` command as advance authorization for that exact registered task to start automatically when it becomes the first dependency-eligible queued worker. After settlement activates it, send one activation brief to its recorded thread without asking for another confirmation merely because a different task's approval freed the queue. This authorization never covers another task, thread, project, or implementation scope.",
         "- Apply every ControlRoom task title update before replying.",
@@ -492,7 +492,7 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
  * @param threadId Originating chat identifier.
  */
 function setIntegrationMode(options: IControlRoomOptions, mode: IntegrationMode, eventKey: string, userRequestId: string, threadId: string): Record<string, unknown> {
-    assertCondition(mode === "merge" || mode === "pr", "Integration mode must be merge or pr.");
+    assertCondition(mode === "merge" || mode === "pr" || mode === "commit", "Integration mode must be merge, pr or commit.");
     const validEventKey = validateEventKey(eventKey);
     const validRequestId = validateCompactText(userRequestId, "Direct user request ID", 200, true)!;
     const validThreadId = validateThreadId(threadId);
@@ -1240,6 +1240,12 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): IAc
         }
         assertCondition(task.state === "QUEUED", `Cannot activate ${task.task_id} isolated from ${task.state}.`);
         assertCondition(task.workspace_mode === "isolated", `${task.task_id} was not requested for isolated execution.`);
+        assertCondition(project.integration_mode !== "commit", "Commit mode uses the current shared checkout; select merge or PR mode for isolated execution.");
+        const pendingPr = store.database.prepare("SELECT task_id FROM tasks WHERE state = 'PR_OPEN' ORDER BY task_number LIMIT 1").get() as { task_id: string } | undefined;
+        if (pendingPr) {
+            commitTransaction(store.database);
+            return { activated: false, reason: "PR_MERGE_PENDING", taskId: pendingPr.task_id, controlRoomTitle: titleForControlRoom() };
+        }
         assertCondition(dependenciesAreDone(store, task.task_id), `Cannot activate ${task.task_id} until all dependencies are DONE.`);
         const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
         assertCondition(baseCommit, `Cannot run ${task.task_id} isolated before ${project.base_branch} has its first commit.`);
@@ -1262,7 +1268,7 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): IAc
             UPDATE tasks
             SET state = 'RUNNING', awaiting_user = 0, base_commit = ?, branch_name = ?,
                 workspace_mode = 'isolated', worktree_path = ?, reviewed_commit = NULL,
-                approved_commit = NULL, updated_at = ?
+                approved_commit = NULL, branch_owned = 1, updated_at = ?
             WHERE task_id = ?
         `).run(baseCommit, workerBranch, worktreePath, currentTimestamp(), task.task_id);
         const runningTask = requireTask(store, task.task_id);
@@ -1327,6 +1333,11 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
             commitTransaction(store.database);
             return { activated: false, controlRoomTitle: titleForControlRoom(), reason: "AUTOPILOT_WAITING", taskId: autopilotBlocker };
         }
+        const pendingPr = store.database.prepare("SELECT task_id FROM tasks WHERE state = 'PR_OPEN' ORDER BY task_number LIMIT 1").get() as { task_id: string } | undefined;
+        if (pendingPr) {
+            commitTransaction(store.database);
+            return { activated: false, controlRoomTitle: titleForControlRoom(), reason: "PR_MERGE_PENDING", taskId: pendingPr.task_id };
+        }
         const exclusiveTask = store.database.prepare("SELECT task_id, state FROM tasks WHERE workspace_mode = 'shared' AND state IN ('RUNNING', 'REVIEW', 'APPROVED') LIMIT 1").get() as { task_id: string; state: TaskState } | undefined;
         if (exclusiveTask) {
             const controlRoomTitle = titleForControlRoom();
@@ -1347,11 +1358,39 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
             return { activated: false, controlRoomTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
         }
         const reviewPacket = readReviewPacketFromStore(store, selectedTask.task_id);
-        const workerBranch = workerBranchForTask(selectedTask.task_id);
-        const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
+        let workerBranch = workerBranchForTask(selectedTask.task_id);
+        let currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve current branch");
         const baseCommit = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
         let currentBaseCommit: string | null;
-        if (!baseCommit) {
+        if (project.integration_mode !== "commit" && baseCommit && currentBranch !== project.base_branch && currentBranch !== workerBranch) {
+            const completedCommitTask = store.database.prepare("SELECT task_id FROM tasks WHERE state IN ('DONE', 'PAUSED', 'CANCELED') AND (branch_owned = 0 OR integration_mode = 'commit') AND (branch_name = ? OR (branch_name IS NULL AND COALESCE(integrated_commit, base_commit) = ?)) LIMIT 1").get(currentBranch, resolveCurrentHeadIfExists(store.projectRoot));
+            if (completedCommitTask) {
+                assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Preserve changes on the commit-mode branch before switching execution modes.");
+                requireGit(store.projectRoot, ["checkout", project.base_branch], "Return to base for task-branch execution");
+                currentBranch = project.base_branch;
+            }
+        }
+        if (project.integration_mode === "commit") {
+            assertCondition(currentBranch, "Commit mode requires a current branch; detached HEAD cannot be adopted.");
+            const previousActivation = store.database.prepare("SELECT task_id FROM tasks WHERE branch_name IS NOT NULL LIMIT 1").get();
+            if (previousActivation) {
+                assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "The shared Local working tree must be clean before activating another task.");
+            }
+            workerBranch = currentBranch;
+            if (currentBranch === "main") {
+                workerBranch = "control-room/codex";
+                const existingCommitBranch = resolveLocalBranchHeadIfExists(store.projectRoot, workerBranch);
+                if (existingCommitBranch) {
+                    assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Switching to the existing control-room/codex branch requires a clean checkout.");
+                    requireGit(store.projectRoot, ["checkout", workerBranch], "Continue commit-mode branch");
+                } else if (resolveCurrentHeadIfExists(store.projectRoot)) {
+                    requireGit(store.projectRoot, ["checkout", "-b", workerBranch], "Create commit-mode branch control-room/codex");
+                } else {
+                    requireGit(store.projectRoot, ["symbolic-ref", "HEAD", `refs/heads/${workerBranch}`], "Create unborn commit-mode branch control-room/codex");
+                }
+            }
+            currentBaseCommit = resolveCurrentHeadIfExists(store.projectRoot);
+        } else if (!baseCommit) {
             assertCondition(resolveCurrentHeadIfExists(store.projectRoot) === null, `Base branch ${project.base_branch} has no commits, but ${currentBranch || "the current branch"} has a commit.`);
             const previousTask = store.database.prepare(`
                 SELECT task_id FROM tasks
@@ -1395,9 +1434,9 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
             UPDATE tasks
             SET state = 'RUNNING', awaiting_user = 0, base_commit = ?, branch_name = ?,
                 workspace_mode = 'shared', worktree_path = NULL, reviewed_commit = NULL,
-                approved_commit = NULL, updated_at = ?
+                approved_commit = NULL, branch_owned = ?, updated_at = ?
             WHERE task_id = ?
-        `).run(currentBaseCommit, workerBranch, currentTimestamp(), selectedTask.task_id);
+        `).run(currentBaseCommit, workerBranch, Number(project.integration_mode !== "commit"), currentTimestamp(), selectedTask.task_id);
         const runningTask = requireTask(store, selectedTask.task_id);
         const activationRequest = readActivationRequest(store, selectedTask.task_id);
         const titleUpdates = readQueuedTitleUpdates(store, selectedTask.queue_position || 1);
@@ -1454,6 +1493,7 @@ function resumeTask(options: IControlRoomOptions, taskId: string, reopen = false
         if (reopen) assertCondition(task.state === "DONE", `Cannot reopen ${task.task_id} from ${task.state}.`);
         if (task.state === "PAUSED" || reopen) {
             assertCondition(!project.integration_task_id, "Approval integration must finish before resuming or reopening work.");
+            if (task.workspace_mode === "shared" && (!task.branch_owned || task.integration_mode === "commit")) task.branch_name = null;
             if (reopen && task.workspace_mode === "shared" && task.branch_name && !task.worktree_path) {
                 const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
                 assertCondition(!workerHead || workerHead === task.base_commit, "Completed worker branch changed; preserve its work.");
@@ -1475,9 +1515,11 @@ function resumeTask(options: IControlRoomOptions, taskId: string, reopen = false
                 assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Cannot defer a changed shared checkout.");
                 const branch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read pending activation branch");
                 const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, destination.branch_name);
-                assertCondition((branch === destination.branch_name || branch === project.base_branch) && (!workerHead || workerHead === destination.base_commit) && resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch) === destination.base_commit, "Pending activation or base branch changed; preserve its workspace.");
-                if (branch !== project.base_branch) requireGit(store.projectRoot, destination.base_commit ? ["checkout", project.base_branch] : ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], "Return undelivered activation to base");
-                if (workerHead) requireGit(store.projectRoot, ["branch", "-d", destination.branch_name], "Remove unchanged undelivered branch");
+                assertCondition((branch === destination.branch_name || branch === project.base_branch) && (!workerHead || workerHead === destination.base_commit) && (!destination.branch_owned || resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch) === destination.base_commit), "Pending activation or base branch changed; preserve its workspace.");
+                if (destination.branch_owned) {
+                    if (branch !== project.base_branch) requireGit(store.projectRoot, destination.base_commit ? ["checkout", project.base_branch] : ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], "Return undelivered activation to base");
+                    if (workerHead) requireGit(store.projectRoot, ["branch", "-d", destination.branch_name], "Remove unchanged undelivered branch");
+                }
                 store.database.prepare("UPDATE activation_deliveries SET state = 'CANCELED', updated_at = ? WHERE task_id = ? AND state = 'PENDING'").run(currentTimestamp(), destination.task_id);
                 store.database.prepare("UPDATE tasks SET state = 'QUEUED', base_commit = NULL, branch_name = NULL, handoff_sender_task_id = NULL, awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), destination.task_id);
             }
@@ -1941,7 +1983,7 @@ function doctorProject(options: IControlRoomOptions, taskId?: string): import(".
             checks.push({ code: "MULTIPLE_SHARED_WORKERS", level: "error", message: "More than one task owns the shared checkout.", nextAction: "Inspect task state and workspace ownership before continuing." });
         }
         const currentBranch = requireGit(projectRoot, ["branch", "--show-current"], "Inspect shared checkout");
-        if (shared.length === 0 && currentBranch !== project.base_branch) {
+        if (shared.length === 0 && currentBranch !== project.base_branch && !(project.integration_mode === "commit" && currentBranch && currentBranch !== "main")) {
             checks.push({ code: "SHARED_CHECKOUT_UNASSIGNED", level: "warning", message: `The shared checkout is on ${currentBranch || "detached HEAD"} without an active shared owner.`, nextAction: "Inspect pending activation or cancellation state and preserve local work before restoring the base checkout." });
         }
         for (const task of tasks) {

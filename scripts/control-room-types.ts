@@ -1,5 +1,5 @@
 export type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PR_OPEN" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
-export type IntegrationMode = "merge" | "pr";
+export type IntegrationMode = "merge" | "pr" | "commit";
 export type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "RUN_ISOLATED_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 export type WorkspaceMode = "shared" | "isolated";
 export type ApprovalTarget = "DONE" | "PAUSED";
@@ -137,6 +137,7 @@ export interface ITaskRow {
     queued_display_position?: number | null;
     base_commit: string | null;
     branch_name: string | null;
+    branch_owned: number;
     workspace_mode: WorkspaceMode;
     worktree_path: string | null;
     reviewed_commit: string | null;

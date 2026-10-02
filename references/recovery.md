@@ -18,7 +18,7 @@ If process creation or completion is uncertain, inspect the existing command ses
 
 ## Approval commit and recovery
 
-Merge-mode approval uses `local-approval-commit`. PR-mode approvals use the same persistent lease and commit anchors, then publish the worker without local integration; read [integration-mode.md](integration-mode.md) for publication recovery and remote synchronization. The following integration steps describe merge mode:
+Commit-mode approval uses the existing lease and commit anchors, then completes on the recorded shared branch without integration or branch cleanup. Its recovery must not enter merge-mode paths. Merge-mode approval uses `local-approval-commit`. PR-mode approvals use the same persistent lease and commit anchors, then publish the worker without local integration; read [integration-mode.md](integration-mode.md) for publication recovery and remote synchronization. The following integration steps describe merge mode:
 
 1. Require a processed direct-user approval event.
 2. Resolve the task's assigned workspace. If it is clean and has no task-local commit, persist the cleanup intent and acquire the approval lease before releasing its workspace, then move the task to its persisted `DONE` or `PAUSED` target, compact the queue, and release the shared branch or clean isolated worktree without creating a commit.

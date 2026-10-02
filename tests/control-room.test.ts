@@ -627,7 +627,7 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 20);
+    assert.equal(version, 21);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
@@ -685,7 +685,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -730,7 +730,7 @@ test("removes legacy mental-model events and persisted fields", () => {
     const eventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     const persistedResult = JSON.parse(migratedDatabase.prepare("SELECT result_json FROM events WHERE event_key = 'legacy-result'").get().result_json);
     const persistedBrief = JSON.parse(migratedDatabase.prepare("SELECT brief_json FROM activation_deliveries WHERE activation_key = 'legacy-activation'").get().brief_json);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
     assert.doesNotMatch(eventSql, /MENTAL_MODEL_RECORDED/);
     assert.equal(migratedDatabase.prepare("SELECT COUNT(*) AS count FROM events WHERE event_key = 'legacy-mental'").get().count, 0);
     assert.deepEqual(persistedResult.reviewPacket, { decisionCount: 0 });
@@ -777,7 +777,7 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
@@ -870,7 +870,7 @@ test("migrates version 14 tasks to PAUSED without losing events or dependencies"
     const taskSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get().sql;
     const migratedTask = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const dependency = migratedDatabase.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = 'T0002'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
     assert.match(taskSql, /'PAUSED'/);
     assert.equal(migratedTask.reviewed_tree, '{"legacy":true}');
     assert.equal(dependency.depends_on_id, "T0001");
@@ -1362,7 +1362,7 @@ test("migrates version 15 without changing running tasks or their ordinary atten
     assert.equal(after.handoffSenderTaskId, null);
     assert.deepEqual(after.pendingHandoffTaskIds, []);
     const migrated = new DatabaseSync(databasePath);
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 20);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 21);
     migrated.close();
 });
 

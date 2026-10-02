@@ -19,7 +19,7 @@ node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 
 For `Approve and pause`, replace only `request-approve` with `request-approve-and-pause`. Use the same required arguments; successful settlement targets `PAUSED`, releases the workspace and leaves dependents unsatisfied.
 
-After settlement, inspect its actual completion or blocker, apply every returned `titleUpdates` entry and handle any pending activation through [execution.md](execution.md). Report completion only when the returned result confirms it. If approval captures `integrationMode: pr`, follow [integration-mode.md](integration-mode.md) for PR publication and attachment; report 🔵 `PR_OPEN` until confirmed remote merge and local synchronization. For a permission timeout or uncertain execution, follow [Permission waits and timeouts](recovery.md#permission-waits-and-timeouts).
+After settlement, inspect its actual completion or blocker, apply every returned `titleUpdates` entry and handle any pending activation through [execution.md](execution.md). Report completion only when the returned result confirms it. For `integrationMode: commit`, report the local commit or no-change completion and retain the branch and checkout. If approval captures `integrationMode: pr`, follow [integration-mode.md](integration-mode.md) for PR publication and attachment; report 🔵 `PR_OPEN` until confirmed remote merge and local synchronization. For a permission timeout or uncertain execution, follow [Permission waits and timeouts](recovery.md#permission-waits-and-timeouts).
 
 ### Resolve the approval message ID
 
@@ -61,14 +61,14 @@ Do not call `process`, `activate-next`, or `commit-approved` separately during n
 
 ## Preserve Git behavior
 
-The local integration rules below apply to merge mode. Approval captures the project's current mode at submission; PR mode follows [integration-mode.md](integration-mode.md) instead and preserves the worker until remote integration. Both modes use the existing no-change cleanup path.
+The local integration rules below apply to merge mode. Approval captures the project's current mode at submission; PR and commit modes follow [integration-mode.md](integration-mode.md). PR mode preserves its worker until remote integration; commit mode preserves the shared branch and checkout at every approval target, including no-change completion.
 
 - Never create a branch while a task is `PLANNING` or `QUEUED`; activation inside `settle` is the only pre-approval branch operation.
 - In an unborn repository, the first activation may adopt existing uncommitted files without committing them.
 - Never stage or commit during `RUNNING` or `REVIEW`.
 - Approval with a clean working tree and no task-local worker commits creates no commit and moves the task directly to its requested target, `DONE` or `PAUSED`. If the shared checkout is still on that unchanged worker branch, restore the base branch and release the worker branch before activating the next task, including in an unborn repository.
 - Approval with uncommitted changes on the base branch commits there without a merge.
-- Approval with uncommitted changes on a worker branch commits there and integrates the result linearly into the latest base branch. A clean worker branch with existing task-local commits integrates its current `HEAD` without creating a replacement commit. Successful integration removes its worker branch, plus its worktree when isolated.
+- Approval with uncommitted changes on a worker branch commits there and integrates the result linearly into the latest base branch. A clean worker branch with existing task-local commits integrates its current `HEAD` without creating a replacement commit. Successful integration removes its task-owned worker branch, plus its worktree when isolated. A branch adopted during commit-mode activation is retained even if approval selects merge mode.
 - Approval targeting `PAUSED` uses the same Git flow, releases the shared or isolated workspace, preserves the task history and dependencies, and remains unsatisfied for dependency checks until a later approval reaches `DONE`.
 - If isolated integration conflicts, keep the worktree and branch, clear the approval lease, and move the task to `BLOCKED` from `RUNNING`. Resume it, rework against the latest base inside the preserved workspace, then request review and approval again.
 - Canceling an unchanged isolated task removes its worktree and branch. Canceling one with uncommitted changes or task-local commits preserves both and reports their path for manual recovery.

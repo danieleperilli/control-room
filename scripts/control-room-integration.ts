@@ -109,8 +109,8 @@ function releaseSharedWorkerBranch(store: IStore, project: IProjectRow, task: IT
         assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, `Cannot release dirty worker branch ${task.branch_name} for ${task.task_id}.`);
         requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
     }
-    requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete released worker branch ${task.branch_name}`);
-    return true;
+    if (task.branch_owned) requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete released worker branch ${task.branch_name}`);
+    return Boolean(task.branch_owned);
 }
 
 /**
@@ -325,6 +325,9 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
         const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Resolve current branch");
         const commitsOnBase = currentBranch === project.base_branch;
         assertCondition(commitsOnBase || currentBranch === task.branch_name, `Cannot commit ${task.task_id} from unrelated branch ${currentBranch || "detached HEAD"}.`);
+        if (task.integration_mode === "commit") {
+            assertCondition(task.workspace_mode === "shared" && currentBranch === task.branch_name && currentBranch !== "main", "Commit mode requires the recorded shared branch and never commits on main.");
+        }
         const workerBranchHasCommits = currentBranch === task.branch_name && currentHead !== task.base_commit;
         if (workingTreeStatus.length === 0 && !task.approved_commit && !workerBranchHasCommits) {
             const timestamp = currentTimestamp();
@@ -363,6 +366,9 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
         if (task.integration_mode === "pr") {
             return publishApprovedPullRequest(store, requireTask(store, task.task_id), commitMessage);
         }
+        if (task.integration_mode === "commit") {
+            return { ...finalizeApprovedCommit(store, task.task_id, committedCommit, false, false), integrationMode: "commit" };
+        }
         if (commitsOnBase) {
             const branchDeleted = task.approval_target === "PAUSED" ? releaseSharedWorkerBranch(store, project, task) : false;
             return finalizeApprovedCommit(store, task.task_id, committedCommit, false, branchDeleted);
@@ -374,8 +380,8 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
             createInitialBaseBranch(store.projectRoot, project.base_branch, committedCommit);
             requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out initial base branch ${project.base_branch}`);
             assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === committedCommit, `${project.base_branch} did not reach initial approved commit ${committedCommit}.`);
-            requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, committedCommit], `Delete worker branch ${task.branch_name}`);
-            return finalizeApprovedCommit(store, task.task_id, committedCommit, true, true);
+            if (task.branch_owned) requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, committedCommit], `Delete worker branch ${task.branch_name}`);
+            return finalizeApprovedCommit(store, task.task_id, committedCommit, true, Boolean(task.branch_owned));
         }
         const integration = buildLinearIntegrationCommit(store.projectRoot, currentBaseCommit, committedCommit, commitMessage);
         if (!integration.integrated) {
@@ -390,9 +396,9 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
             removeIsolatedWorkspace(store, task, committedCommit);
         } else {
             requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out base branch ${project.base_branch}`);
-            requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, committedCommit], `Delete worker branch ${task.branch_name}`);
+            if (task.branch_owned) requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, committedCommit], `Delete worker branch ${task.branch_name}`);
         }
-        return finalizeApprovedCommit(store, task.task_id, integratedCommit, true, true);
+        return finalizeApprovedCommit(store, task.task_id, integratedCommit, true, Boolean(task.branch_owned));
     } catch (error) {
         rollbackTransaction(store.database);
         const message = error instanceof Error ? error.message : String(error);
@@ -415,7 +421,12 @@ function finalizeUnchangedApproval(store: IStore, taskId: string): IApprovalResu
     const task = requireTask(store, taskId);
     assertCondition(task.state === "APPROVED" && task.cleanup_pending === 1 && project.integration_task_id === task.task_id, `${task.task_id} has no pending approved cleanup.`);
     let releaseWorkspace = task.workspace_mode === "isolated" || task.approval_target === "PAUSED";
-    if (task.workspace_mode === "isolated") {
+    if (task.integration_mode === "commit") {
+        assertCondition(task.workspace_mode === "shared" && task.branch_name && task.branch_name !== "main", "Commit-mode cleanup requires the recorded shared branch.");
+        assertCondition(requireGit(store.projectRoot, ["branch", "--show-current"], "Resolve commit-mode checkout") === task.branch_name && resolveCurrentHeadIfExists(store.projectRoot) === task.reviewed_commit && readWorkingTreeStatus(store.projectRoot).length === 0, "Commit-mode checkout changed before finalization; preserve its work.");
+        // A paused task releases its metadata while the shared checkout remains intact.
+        releaseWorkspace = task.approval_target === "PAUSED";
+    } else if (task.workspace_mode === "isolated") {
         assertCondition(task.branch_name && task.worktree_path && task.reviewed_commit === task.base_commit && task.base_commit, `${task.task_id} has invalid cleanup anchors.`);
         const expectedPath = isolatedWorktreePathForTask(store.projectRoot, task.task_id);
         assertCondition(task.worktree_path === expectedPath && !pathIsSymbolicLink(expectedPath), `${task.task_id} has an unsafe cleanup path.`);
@@ -497,24 +508,30 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
         }
         const hasRecoverableAnchor = Boolean(task.base_commit && task.reviewed_commit) || task.base_commit === null;
         assertCondition(task.state === "APPROVED" && hasRecoverableAnchor, `${task.task_id} does not have a recoverable approval.`);
-        if (task.integration_mode === "pr") {
-            assertCondition(task.branch_name, "PR recovery requires the recorded worker branch.");
-            const workerHead = resolveLocalBranchHead(store.projectRoot, task.branch_name);
+        if (task.integration_mode === "pr" || task.integration_mode === "commit") {
+            assertCondition(task.branch_name, "Approval recovery requires the recorded worker branch.");
+            const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
             const subject = readApprovalCommitMessage(store, task);
-            const approvedCommit = task.approved_commit || (commitMatchesApproval(store.projectRoot, workerHead, task.reviewed_commit, subject) ? workerHead : null);
+            const approvedCommit = task.approved_commit || (workerHead && commitMatchesApproval(store.projectRoot, workerHead, task.reviewed_commit, subject) ? workerHead : null);
             if (!approvedCommit) {
-                assertCondition(workerHead === task.reviewed_commit, "PR recovery found unexpected worker history; preserve its changes.");
+                assertCondition(workerHead === task.reviewed_commit, "Approval recovery found unexpected worker history; preserve its changes.");
                 beginTransaction(store.database);
                 const result = resetUncommittedApproval(store, task);
                 commitTransaction(store.database);
                 return result;
             }
-            assertCondition(workerHead === approvedCommit, "PR worker moved after approval; preserve it before recovery.");
+            assertCondition(workerHead === approvedCommit, "Worker moved after approval; preserve it before recovery.");
             const workspace = resolveTaskWorkspace(store, task);
-            assertCondition(readWorkingTreeStatus(workspace).length === 0, "PR workspace changed after approval; preserve it before recovery.");
+            assertCondition(readWorkingTreeStatus(workspace).length === 0, "Workspace changed after approval; preserve it before recovery.");
+            if (task.integration_mode === "commit") {
+                assertCondition(task.workspace_mode === "shared" && task.branch_name !== "main" && requireGit(workspace, ["branch", "--show-current"], "Resolve commit recovery checkout") === task.branch_name, "Commit recovery requires its recorded shared branch.");
+            }
             beginTransaction(store.database);
             store.database.prepare("UPDATE tasks SET approved_commit = ?, updated_at = ? WHERE task_id = ?").run(approvedCommit, currentTimestamp(), task.task_id);
             commitTransaction(store.database);
+            if (task.integration_mode === "commit") {
+                return { ...finalizeApprovedCommit(store, task.task_id, approvedCommit, false, false), integrationMode: "commit", recovered: true, finalized: true };
+            }
             return { ...publishApprovedPullRequest(store, requireTask(store, task.task_id), subject), recovered: true, finalized: true };
         }
         const recordedBase = resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch);
@@ -534,11 +551,11 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
                         requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore integrated base ${project.base_branch}`);
                     }
                 }
-                if (workerCommit) {
+                if (workerCommit && task.branch_owned) {
                     requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, workerCommit], `Delete integrated worker branch ${task.branch_name}`);
                 }
             }
-            return { ...finalizeApprovedCommit(store, task.task_id, task.integrated_commit, true, true), recovered: true, finalized: true };
+            return { ...finalizeApprovedCommit(store, task.task_id, task.integrated_commit, true, Boolean(task.branch_owned)), recovered: true, finalized: true };
         }
         if (task.workspace_mode === "isolated") {
             assertCondition(task.branch_name && task.worktree_path, `${task.task_id} has no recoverable isolated workspace.`);
@@ -604,8 +621,8 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
             createInitialBaseBranch(store.projectRoot, project.base_branch, approvedCommit);
             requireGit(store.projectRoot, ["checkout", project.base_branch], `Check out initial base branch ${project.base_branch}`);
             assertCondition(requireBaseCheckout(store.projectRoot, project.base_branch) === approvedCommit, `${project.base_branch} did not reach recovered initial commit ${approvedCommit}.`);
-            requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete recovered worker branch ${task.branch_name}`);
-            const result = finalizeApprovedCommit(store, task.task_id, approvedCommit, true, true);
+            if (task.branch_owned) requireGit(store.projectRoot, ["branch", "--delete", task.branch_name], `Delete recovered worker branch ${task.branch_name}`);
+            const result = finalizeApprovedCommit(store, task.task_id, approvedCommit, true, Boolean(task.branch_owned));
             return { ...result, recovered: true, finalized: true };
         }
         assertCondition(currentBranch === project.base_branch || currentBranch === task.branch_name, `Recovery found unexpected branch ${currentBranch || "detached HEAD"}.`);
@@ -619,8 +636,8 @@ function recoverCommit(options: IControlRoomOptions, taskId: string): IRecoveryR
         commitTransaction(store.database);
         advanceBaseBranch(store, project, currentBaseCommit, integratedCommit);
         requireGit(store.projectRoot, ["checkout", project.base_branch], `Restore base branch ${project.base_branch}`);
-        requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, approvedCommit], `Delete recovered worker branch ${task.branch_name}`);
-        const result = finalizeApprovedCommit(store, task.task_id, integratedCommit, true, true);
+        if (task.branch_owned) requireGit(store.projectRoot, ["update-ref", "-d", `refs/heads/${task.branch_name}`, approvedCommit], `Delete recovered worker branch ${task.branch_name}`);
+        const result = finalizeApprovedCommit(store, task.task_id, integratedCommit, true, Boolean(task.branch_owned));
         return { ...result, recovered: true, finalized: true };
     } catch (error) {
         rollbackTransaction(store.database);

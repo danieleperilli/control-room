@@ -382,7 +382,7 @@ function syncPullRequests(options: IControlRoomOptions, taskId?: string): { task
                 if (task.workspace_mode === "isolated" && task.worktree_path && fs.existsSync(task.worktree_path)) {
                     resolveTaskWorkspace(store, task);
                     removeIsolatedWorkspace(store, task, task.approved_commit);
-                } else if (workerHead) {
+                } else if (workerHead && task.branch_owned) {
                     const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read checkout before PR cleanup");
                     if (currentBranch === task.branch_name) {
                         assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Published worker checkout changed; preserve it before cleanup.");
@@ -395,7 +395,7 @@ function syncPullRequests(options: IControlRoomOptions, taskId?: string): { task
                 const completedTask = requireTask(store, task.task_id);
                 commitTransaction(store.database);
                 titleUpdates.push({ taskId: task.task_id, threadId: task.thread_id, title: serializeTask(completedTask).title });
-                results.push({ committed: true, merged: true, branchDeleted: true, integrationMode: "pr", pullRequestUrl: pr.url, approvalTarget: task.approval_target, controlRoomTitle: titleForControlRoom(), gitMode: "pull-request", task: serializeTask(completedTask) });
+                results.push({ committed: true, merged: true, branchDeleted: Boolean(task.branch_owned), integrationMode: "pr", pullRequestUrl: pr.url, approvalTarget: task.approval_target, controlRoomTitle: titleForControlRoom(), gitMode: "pull-request", task: serializeTask(completedTask) });
             } catch (error) {
                 rollbackTransaction(store.database);
                 const reason = error instanceof Error ? error.message : "Pull request synchronization failed.";

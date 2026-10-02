@@ -6,7 +6,7 @@ const path: typeof import("node:path") = require("node:path");
 const { DatabaseSync }: typeof import("node:sqlite") = require("node:sqlite");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const CURRENT_SCHEMA_VERSION = 20;
+const CURRENT_SCHEMA_VERSION = 21;
 
 /**
  * Create a secure directory if needed and restrict its mode.
@@ -309,6 +309,9 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
             database.exec("UPDATE tasks SET integration_mode = 'merge' WHERE approval_event_key IS NOT NULL");
             database.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT; ALTER TABLE tasks ADD COLUMN pr_repository TEXT");
         }
+        if (!databaseHasColumn(database, "tasks", "branch_owned")) {
+            database.exec("ALTER TABLE tasks ADD COLUMN branch_owned INTEGER NOT NULL DEFAULT 1 CHECK (branch_owned IN (0, 1))");
+        }
         database.exec(`
             CREATE TABLE IF NOT EXISTS activation_deliveries (
                 activation_key TEXT PRIMARY KEY,
@@ -352,8 +355,16 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
                 thread_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};
         `);
+        for (const tableName of ["projects", "tasks", "integration_mode_requests"]) {
+            const schema = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName) as { sql: string };
+            if (!schema.sql.includes("'commit'")) {
+                const expandedSchema = schema.sql.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:"[a-z_]+"|[a-z_]+)/u, `CREATE TABLE ${tableName}_commit_mode`).replace(/IN \('merge', 'pr'\)/gu, "IN ('merge', 'pr', 'commit')");
+                database.exec(expandedSchema);
+                database.exec(`INSERT INTO ${tableName}_commit_mode SELECT * FROM ${tableName}; DROP TABLE ${tableName}; ALTER TABLE ${tableName}_commit_mode RENAME TO ${tableName}`);
+            }
+        }
+        database.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position); PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         assertCondition(database.prepare("PRAGMA foreign_key_check").all().length === 0, "Schema migration would leave invalid foreign keys.");
         commitTransaction(database);
     } catch (error) {

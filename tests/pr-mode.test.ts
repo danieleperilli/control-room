@@ -221,7 +221,7 @@ test("approval snapshots PR mode before settlement and never integrates its work
     assert.equal(core.getStatus(fixture.options).integrationMode, "merge");
 });
 
-test("open PRs release independent execution and keep prerequisites unsatisfied until remote merge", () => {
+test("open PRs hold all queued tasks until remote merge and base synchronization", () => {
     const fixture = createPrFixture();
     approveChangedTask(fixture);
     helpers.registerTask(fixture.options as import("./helpers.ts").IOptions, "dependent", "Dependent behavior");
@@ -230,18 +230,21 @@ test("open PRs release independent execution and keep prerequisites unsatisfied 
     core.submitEvent(fixture.options, "enqueue-dependent", "T0002", "ENQUEUE_REQUESTED", {});
     core.submitEvent(fixture.options, "enqueue-independent", "T0003", "ENQUEUE_REQUESTED", {});
     const opened = core.settleProject(fixture.options) as any;
-    assert.equal(opened.activation.task.taskId, "T0003");
+    assert.equal(opened.activation.activated, false);
+    assert.equal(opened.activation.reason, "PR_MERGE_PENDING");
+    assert.equal(core.activateNextTask(fixture.options).reason, "PR_MERGE_PENDING");
     assert.equal(core.getStatus(fixture.options, "T0002").task && (core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
-    fs.writeFileSync(path.join(fixture.repositoryRoot, "independent.txt"), "uncommitted independent work\n");
-    const currentHead = helpers.runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+    assert.equal((core.getStatus(fixture.options, "T0003").task as any).state, "QUEUED");
     const merged = mergeRemotePr(fixture);
     const synchronized = syncPullRequests(fixture.options);
     assert.equal(synchronized.warnings.length, 0);
     assert.equal(synchronized.tasks[0].task.state, "DONE");
     assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "main"]), merged);
-    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), currentHead);
-    assert.equal(fs.readFileSync(path.join(fixture.repositoryRoot, "independent.txt"), "utf8"), "uncommitted independent work\n");
+    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), merged);
     assert.equal(helpers.runGit(fixture.repositoryRoot, ["branch", "--list", "control-room/T0001"]), "");
+    const next = core.settleProject(fixture.options) as any;
+    assert.equal(next.activation.task.taskId, "T0002");
+    assert.equal(next.activation.task.baseCommit, merged);
 });
 
 test("merged PR synchronization activates a waiting dependent and supports squash history", () => {
@@ -259,6 +262,40 @@ test("merged PR synchronization activates a waiting dependent and supports squas
 });
 
 for (const provider of ["github", "azure-devops"] as const) {
+    test(`${provider} PR gates explicit isolated activation until synchronization succeeds`, () => {
+        const fixture = createPrFixture(provider);
+        approveChangedTask(fixture);
+        core.settleProject(fixture.options);
+        helpers.registerTask(fixture.options as import("./helpers.ts").IOptions, "isolated", "Next isolated behavior");
+        core.submitEvent(fixture.options, "run-next-isolated", "T0002", "RUN_ISOLATED_NOW_REQUESTED", { userRequestId: "run-isolated-message" });
+        const waiting = core.settleProject(fixture.options) as any;
+        assert.equal(waiting.isolatedActivations[0].reason, "PR_MERGE_PENDING");
+        assert.equal(fs.existsSync(path.join(fixture.repositoryRoot, ".control-room", "worktrees", "T0002")), false);
+        const merged = mergeRemotePr(fixture);
+        const released = core.settleProject(fixture.options) as any;
+        assert.equal(released.isolatedActivations[0].task.baseCommit, merged);
+        assert.equal(helpers.runGit(released.isolatedActivations[0].task.worktreePath, ["rev-parse", "HEAD"]), merged);
+    });
+}
+
+test("PR approval after commit-mode activation preserves the adopted branch after merge", () => {
+    const fixture = createPrFixture();
+    core.setIntegrationMode(fixture.options, "commit", "commit-mode", "commit-mode-message", "side-chat");
+    helpers.activateTask(fixture.options as import("./helpers.ts").IOptions, "worker", "Adopted behavior", "enqueue");
+    fs.writeFileSync(path.join(fixture.repositoryRoot, "feature.txt"), "adopted behavior\n");
+    core.setIntegrationMode(fixture.options, "pr", "pr-mode", "pr-mode-message", "side-chat");
+    helpers.approveTask(fixture.options as import("./helpers.ts").IOptions, "T0001", "approve", "Publish adopted behavior");
+    core.settleProject(fixture.options);
+    const approved = fixture.prs[0].headRefOid;
+    assert.equal(fixture.prs[0].headRefName, "control-room/codex");
+    mergeRemotePr(fixture);
+    const synced = syncPullRequests(fixture.options);
+    assert.equal(synced.tasks[0].task.state, "DONE");
+    assert.equal(synced.tasks[0].branchDeleted, false);
+    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "control-room/codex"]), approved);
+});
+
+for (const provider of ["github", "azure-devops"] as const) {
     for (const failure of ["failCreateReceipt", "failPushReceipt", "failCommitReceipt", "failCheckoutReceipt"] as const) {
         test(`${provider} recovery preserves approval after ${failure} without duplicate commits or PRs`, () => {
             const fixture = createPrFixture(provider);
@@ -273,6 +310,11 @@ for (const provider of ["github", "azure-devops"] as const) {
             assert.equal(fixture.prs.length, 1);
             assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "main"]), fixture.initialCommit);
             assert.equal(core.getStatus(fixture.options).commitTaskId, null);
+            helpers.registerTask(fixture.options as import("./helpers.ts").IOptions, "next-worker", "Next behavior");
+            core.submitEvent(fixture.options, "enqueue-next", "T0002", "ENQUEUE_REQUESTED", {});
+            const held = core.settleProject(fixture.options) as any;
+            assert.equal(held.activation.reason, "PR_MERGE_PENDING");
+            assert.equal((core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
         });
     }
 
@@ -319,6 +361,11 @@ for (const provider of ["github", "azure-devops"] as const) {
             assert.equal((core.getStatus(fixture.options, "T0001").task as any).state, "PR_OPEN");
             assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "control-room/T0001"]), worker);
             assert.equal(core.getStatus(fixture.options).commitTaskId, null);
+            helpers.registerTask(fixture.options as import("./helpers.ts").IOptions, "next-worker", "Next behavior");
+            core.submitEvent(fixture.options, "enqueue-next", "T0002", "ENQUEUE_REQUESTED", {});
+            const held = core.settleProject(fixture.options) as any;
+            assert.equal(held.activation.reason, "PR_MERGE_PENDING");
+            assert.equal((core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
         });
     }
 }
@@ -471,18 +518,19 @@ test("Azure DevOps publication pins repository, branches and approved commit and
     core.submitEvent(fixture.options, "depend", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
     core.submitEvent(fixture.options, "enqueue-dependent", "T0002", "ENQUEUE_REQUESTED", {});
     core.submitEvent(fixture.options, "enqueue-independent", "T0003", "ENQUEUE_REQUESTED", {});
-    assert.equal((core.settleProject(fixture.options) as any).activation.task.taskId, "T0003");
-    const currentHead = helpers.runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
-    fs.writeFileSync(path.join(fixture.repositoryRoot, "independent.txt"), "uncommitted independent work\n");
+    assert.equal((core.settleProject(fixture.options) as any).activation.reason, "PR_MERGE_PENDING");
+    assert.equal((core.getStatus(fixture.options, "T0003").task as any).state, "QUEUED");
     const merged = mergeRemotePr(fixture);
     const synchronized = syncPullRequests(fixture.options);
     assert.equal(synchronized.warnings.length, 0);
     assert.equal(synchronized.tasks[0].task.state, "DONE");
     assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "main"]), merged);
-    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), currentHead);
-    assert.equal(fs.readFileSync(path.join(fixture.repositoryRoot, "independent.txt"), "utf8"), "uncommitted independent work\n");
+    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), merged);
     assert.equal(helpers.runGit(fixture.repositoryRoot, ["branch", "--list", "control-room/T0001"]), "");
     assert.equal((core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
+    const next = core.settleProject(fixture.options) as any;
+    assert.equal(next.activation.task.taskId, "T0002");
+    assert.equal(next.activation.task.baseCommit, merged);
 });
 
 test("Azure DevOps clone formats identify the same repository for fetch and push", () => {

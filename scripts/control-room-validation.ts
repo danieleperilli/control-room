@@ -191,7 +191,11 @@ function validateQueuePosition(position: number | undefined): number {
  */
 function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPayload {
     if (kind === "PLANNING_REQUESTED") {
-        return {};
+        if (payload.stoppedActivationKey === undefined && payload.userRequestId === undefined) { return {}; }
+        return {
+            stoppedActivationKey: validateCompactText(payload.stoppedActivationKey, "Stopped activation key", 200, true),
+            userRequestId: validateCompactText(payload.userRequestId, "Direct stop request ID", 200, true)
+        };
     }
     if (kind === "USER_INPUT_REQUESTED" || kind === "USER_INPUT_RECEIVED") {
         return { handoffTaskId: payload.handoffTaskId !== undefined ? validateTaskId(payload.handoffTaskId) : undefined };
@@ -232,18 +236,18 @@ function validateEventPayload(kind: EventKind, payload: IEventPayload): IEventPa
     if (kind === "APPROVAL_REQUESTED") {
         const approvalTarget = payload.approvalTarget || "DONE";
         assertCondition(approvalTarget === "DONE" || approvalTarget === "PAUSED", "Approval target must be DONE or PAUSED.");
-        if (payload.autopilotEventKey !== undefined) {
-            assertCondition(approvalTarget === "DONE", "Autopilot can only approve completed work.");
-            assertCondition(payload.userRequestId === undefined, "Autopilot approval derives its user request from the recorded authorization.");
+        if (payload.orchestrationEventKey !== undefined) {
+            assertCondition(approvalTarget === "DONE", "Auto-next can only approve completed work.");
+            assertCondition(payload.userRequestId === undefined, "Auto-next approval derives its user request from the recorded authorization.");
             return {
                 approvalTarget,
                 commitMessage: validateCommitMessage(payload.commitMessage),
-                autopilotEventKey: validateEventKey(payload.autopilotEventKey),
+                orchestrationEventKey: validateEventKey(payload.orchestrationEventKey),
                 reviewEventKey: validateEventKey(payload.reviewEventKey || ""),
                 verification: validateCompactText(payload.verification, "Successful verification summary", 2000, true)
             };
         }
-        assertCondition(payload.reviewEventKey === undefined && payload.verification === undefined, "Autopilot evidence requires an autopilot authorization key.");
+        assertCondition(payload.reviewEventKey === undefined && payload.verification === undefined, "Auto-next evidence requires an orchestration authorization key.");
         return {
             approvalTarget,
             commitMessage: validateCommitMessage(payload.commitMessage),

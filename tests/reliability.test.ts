@@ -34,7 +34,10 @@ test("status, queue and doctor leave absent state absent", () => {
     const options = { projectRoot: fixture.repositoryRoot, stateRoot: fixture.stateRoot };
     assert.equal(core.getStatus(options).reason, "NOT_INITIALIZED");
     assert.equal(core.getQueue(options).reason, "NOT_INITIALIZED");
-    assert.ok(core.doctorProject(options).checks.some((check) => check.code === "NOT_INITIALIZED"));
+    const report = core.doctorProject(options);
+    assert.ok(report.checks.some((check) => check.code === "NOT_INITIALIZED"));
+    assert.equal(report.integrationMode, undefined);
+    assert.equal(report.orchestration, undefined);
     assert.equal(fs.existsSync(options.stateRoot), false);
     assert.equal(helpers.runGit(options.projectRoot, ["status", "--porcelain"]), "");
 });
@@ -48,7 +51,10 @@ test("reads report migration without rewriting an existing database", () => {
     const mode = fs.statSync(databasePath).mode;
     assert.equal(core.getStatus(options).reason, "MIGRATION_REQUIRED");
     assert.equal(core.getQueue(options).reason, "MIGRATION_REQUIRED");
-    assert.ok(core.doctorProject(options).checks.some((check) => check.code === "MIGRATION_REQUIRED"));
+    const report = core.doctorProject(options);
+    assert.ok(report.checks.some((check) => check.code === "MIGRATION_REQUIRED"));
+    assert.equal(report.integrationMode, undefined);
+    assert.equal(report.orchestration, undefined);
     assert.deepEqual(fs.readFileSync(databasePath), original);
     assert.equal(fs.statSync(databasePath).mode, mode);
     core.installProjectRouting(options);
@@ -186,6 +192,34 @@ test("canceling a task prevents delivery of its old activation", () => {
     assert.equal(core.claimActivation(options, activation.executionBrief.activationKey).reason, "CANCELED");
 });
 
+/** Verify project settings reflect current persisted selections without changing state. */
+test("doctor reports current integration and orchestration modes with and without a task filter", () => {
+    const { options, databasePath } = readyFixture();
+    helpers.registerTask(options, "planner", "Planned work");
+    const defaults = core.doctorProject(options);
+    assert.equal(defaults.integrationMode, "merge");
+    assert.equal(defaults.orchestration?.mode, "approve-next");
+    for (const [integrationMode, orchestrationMode] of [["merge", "approve-next"], ["pr", "auto-next"], ["commit", "manual-next"]] as const) {
+        core.setIntegrationMode(options, integrationMode, `integration-${integrationMode}`, `user-${integrationMode}`, "settings-chat");
+        core.setOrchestration(options, orchestrationMode, `orchestration-${orchestrationMode}`, `user-${orchestrationMode}`, "settings-chat");
+        const before = fs.readFileSync(databasePath);
+        const expected = core.getStatus(options);
+        const report = core.doctorProject(options);
+        assert.equal(report.integrationMode, integrationMode);
+        assert.equal(report.orchestration?.mode, orchestrationMode);
+        assert.deepEqual(report.orchestration, expected.orchestration);
+        assert.ok(report.checks.some((check) => check.code === "INTEGRATION_MODE" && check.level === "ok"));
+        assert.ok(report.checks.some((check) => check.code === "ORCHESTRATION_MODE" && check.level === "ok"));
+        const cli = helpers.runCli(["doctor", "--project-root", options.projectRoot, "--state-root", options.stateRoot!, "--task", "T0001"]);
+        assert.equal(cli.status, 0, cli.stderr);
+        const filtered = JSON.parse(cli.stdout) as import("../scripts/control-room-types.ts").IDoctorResult;
+        assert.equal(filtered.integrationMode, integrationMode);
+        assert.deepEqual(filtered.orchestration, report.orchestration);
+        assert.deepEqual(fs.readFileSync(databasePath), before);
+        assert.deepEqual(core.getStatus(options), expected);
+    }
+});
+
 test("doctor explains queue blockers and uncertain delivery without changing state", () => {
     const { options, databasePath } = readyFixture();
     const activation = helpers.activateTask(options, "worker", "Active task", "start");
@@ -219,7 +253,10 @@ test("doctor reports a missing worktree and an unsafe instruction file", () => {
     const agents = path.join(options.projectRoot, "AGENTS.md");
     fs.renameSync(agents, `${agents}.original`);
     fs.symlinkSync(`${agents}.original`, agents);
-    assert.ok(core.doctorProject(options).checks.some((check) => check.code === "DIAGNOSTIC_FAILED" && check.message.includes("symbolic link")));
+    const report = core.doctorProject(options);
+    assert.ok(report.checks.some((check) => check.code === "DIAGNOSTIC_FAILED" && check.message.includes("symbolic link")));
+    assert.equal(report.integrationMode, "merge");
+    assert.equal(report.orchestration?.mode, "approve-next");
 });
 
 test("all local documentation links resolve after progressive disclosure", () => {
@@ -262,3 +299,77 @@ test("doctor identifies the checkout left by a canceled shared task", () => {
     assert.ok(core.doctorProject(options).checks.some((check) => check.code === "SHARED_CHECKOUT_UNASSIGNED"));
     assert.equal(fs.readFileSync(path.join(options.projectRoot, "preserved.txt"), "utf8"), "preserve\n");
 });
+
+
+test("explicit rejection is bound to one claim and cannot authorize replay or confirmation", () => {
+    const { options, databasePath } = readyFixture();
+    const activation = helpers.activateTask(options, "worker", "Rejected delivery", "start");
+    const key = activation.executionBrief!.activationKey;
+    const claim = core.claimActivation(options, key);
+    assert.ok(claim.claimToken);
+    assert.throws(() => core.rejectActivation(options, key, "stale-token", "tool-rejection"));
+    assert.throws(() => core.rejectActivation(options, key, claim.claimToken!, " "));
+    const args = ["reject-activation", "--project-root", options.projectRoot, "--state-root", options.stateRoot!, "--activation-key", key, "--claim-token", claim.claimToken, "--receipt", "tool-rejection"];
+    const rejected = helpers.runCli(args);
+    assert.equal(rejected.status, 0, rejected.stderr);
+    assert.deepEqual(JSON.parse(rejected.stdout), { rejected: true });
+    assert.equal(core.rejectActivation(options, key, claim.claimToken, "tool-rejection").alreadyRejected, true);
+    assert.throws(() => core.rejectActivation(options, key, claim.claimToken!, "different-rejection"));
+    assert.throws(() => core.confirmActivation(options, key, claim.claimToken!, "fake-success"));
+    assert.equal(core.claimActivation(options, key).reason, "DELIVERY_REJECTED");
+    const pending = core.getPendingActivations(options)[0];
+    assert.equal(pending.rejectionReceipt, "tool-rejection");
+    assert.equal(pending.priorDeliveryUncertain, false);
+    const before = fs.readFileSync(databasePath);
+    assert.ok(core.doctorProject(options).checks.some((check) => check.code === "DELIVERY_REJECTED"));
+    assert.deepEqual(fs.readFileSync(databasePath), before);
+    const retry = core.claimActivation(options, key, "new-direct-user-request");
+    assert.ok(retry.claimToken);
+    assert.equal(core.getPendingActivations(options)[0].rejectionReceipt, null);
+    assert.equal(core.getPendingActivations(options)[0].priorDeliveryUncertain, false);
+    assert.throws(() => core.rejectActivation(options, key, claim.claimToken!, "late-rejection"));
+    assert.equal(core.claimActivation(options, key, "new-direct-user-request").claimed, false);
+    assert.equal(core.confirmActivation(options, key, retry.claimToken, "actual-success").confirmed, true);
+    assert.throws(() => core.rejectActivation(options, key, retry.claimToken!, "contradictory-rejection"));
+});
+
+test("a rejected retry preserves earlier delivery uncertainty", () => {
+    const { options } = readyFixture();
+    const activation = helpers.activateTask(options, "worker", "Uncertain delivery", "start");
+    const key = activation.executionBrief!.activationKey;
+    core.claimActivation(options, key);
+    const retry = core.claimActivation(options, key, "explicit-retry");
+    core.rejectActivation(options, key, retry.claimToken!, "retry-rejected");
+    assert.equal(core.getPendingActivations(options)[0].priorDeliveryUncertain, true);
+    assert.equal(core.claimActivation(options, key).reason, "DELIVERY_UNCONFIRMED");
+    assert.ok(core.doctorProject(options).checks.some((check) => check.code === "DELIVERY_UNCONFIRMED"));
+    const next = core.claimActivation(options, key, "another-explicit-retry");
+    core.rejectActivation(options, key, next.claimToken!, "next-retry-rejected");
+    assert.equal(core.getPendingActivations(options)[0].priorDeliveryUncertain, true);
+    core.submitEvent(options, "cancel", "T0001", "CANCEL_REQUESTED", { userRequestId: "cancel-request" });
+    core.processPendingEvents(options);
+    assert.equal(core.rejectActivation(options, key, next.claimToken!, "next-retry-rejected").reason, "ACTIVATION_SUPERSEDED");
+});
+
+for (const retried of [false, true]) {
+    test(`schema 21 upgrade preserves a ${retried ? "retried" : "first"} claim without inventing rejection evidence`, () => {
+        const { options, databasePath } = readyFixture();
+        const activation = helpers.activateTask(options, "worker", "Legacy delivery", "start");
+        const key = activation.executionBrief!.activationKey;
+        const first = core.claimActivation(options, key);
+        const claim = retried ? core.claimActivation(options, key, "legacy-retry") : first;
+        const database = new DatabaseSync(databasePath);
+        database.exec("ALTER TABLE activation_deliveries DROP COLUMN rejection_receipt; ALTER TABLE activation_deliveries DROP COLUMN prior_delivery_uncertain; PRAGMA user_version = 21");
+        database.close();
+        const before = fs.readFileSync(databasePath);
+        assert.equal(core.getStatus(options).reason, "MIGRATION_REQUIRED");
+        assert.deepEqual(fs.readFileSync(databasePath), before);
+        core.installProjectRouting(options);
+        const pending = core.getPendingActivations(options)[0];
+        assert.equal(pending.activationKey, key);
+        assert.equal(pending.claimToken, claim.claimToken);
+        assert.equal(pending.rejectionReceipt, null);
+        assert.equal(pending.priorDeliveryUncertain, retried);
+        assert.equal(core.claimActivation(options, key).reason, "DELIVERY_UNCONFIRMED");
+    });
+}

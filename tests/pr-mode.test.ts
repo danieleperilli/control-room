@@ -247,6 +247,28 @@ test("open PRs hold all queued tasks until remote merge and base synchronization
     assert.equal(next.activation.task.baseCommit, merged);
 });
 
+/** Verify remote completion obeys the current manual progression setting. */
+test("manual-next synchronizes a merged PR and waits for Run before activating its successor", () => {
+    const fixture = createPrFixture();
+    approveChangedTask(fixture);
+    helpers.registerTask(fixture.options as import("./helpers.ts").IOptions, "dependent", "Dependent behavior");
+    core.submitEvent(fixture.options, "depend", "T0002", "DEPENDENCY_ADD_REQUESTED", { dependencyTaskId: "T0001" });
+    core.submitEvent(fixture.options, "enqueue-dependent", "T0002", "ENQUEUE_REQUESTED", {});
+    core.settleProject(fixture.options);
+    core.setOrchestration(fixture.options, "manual-next", "manual", "user-manual", "other-chat");
+    const merged = mergeRemotePr(fixture);
+    const synchronized = core.settleProject(fixture.options) as any;
+    assert.equal(synchronized.completions[0].task.state, "DONE");
+    assert.equal(synchronized.activation.activated, false);
+    assert.equal(synchronized.activation.reason, "MANUAL_RUN_REQUIRED");
+    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "main"]), merged);
+    assert.equal((core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
+    core.submitEvent(fixture.options, "run-dependent", "T0002", "RUN_NOW_REQUESTED", { userRequestId: "direct-run" });
+    const started = core.settleProject(fixture.options) as any;
+    assert.equal(started.activation.task.taskId, "T0002");
+    assert.equal(started.activation.task.baseCommit, merged);
+});
+
 test("merged PR synchronization activates a waiting dependent and supports squash history", () => {
     const fixture = createPrFixture();
     approveChangedTask(fixture);
@@ -388,14 +410,14 @@ test("isolated PR worktrees remain until merge and approve-and-pause preserves i
     assert.equal(core.resumeTask(fixture.options, "T0001").resumed, true);
 });
 
-test("autopilot approval uses PR mode without merging or publishing to the base branch", () => {
+test("orchestration approval uses PR mode without merging or publishing to the base branch", () => {
     const fixture = createPrFixture();
     helpers.activateTask(fixture.options as import("./helpers.ts").IOptions, "worker", "Automatic behavior", "enqueue");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "feature.txt"), "automatic changes\n");
     core.submitEvent(fixture.options, "review", "T0001", "REVIEW_REQUESTED", { summary: "Behavior verified" });
     core.processPendingEvents(fixture.options);
-    core.setAutopilot(fixture.options, true, "auto-on", "auto-message", "auto-chat");
-    core.submitEvent(fixture.options, "automatic-approval", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Add automatic fixture behavior", autopilotEventKey: "auto-on", reviewEventKey: "review", verification: "Fixture behavior checks passed" });
+    core.setOrchestration(fixture.options, "auto-next", "auto-on", "auto-message", "auto-chat");
+    core.submitEvent(fixture.options, "automatic-approval", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Add automatic fixture behavior", orchestrationEventKey: "auto-on", reviewEventKey: "review", verification: "Fixture behavior checks passed" });
     const result = core.settleProject(fixture.options) as any;
     assert.equal(result.completion.task.state, "PR_OPEN");
     assert.equal(fixture.prs.length, 1);

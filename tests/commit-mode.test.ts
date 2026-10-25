@@ -140,14 +140,14 @@ test("an approved commit-mode snapshot survives a later mode selection", () => {
     assert.equal(core.getStatus(fixture.options).integrationMode, "pr");
 });
 
-test("autopilot approval follows commit mode and retains the shared branch", () => {
+test("orchestration approval follows commit mode and retains the shared branch", () => {
     const fixture = createCommitFixture();
     helpers.activateTask(fixture.options, "worker", "Automatic behavior", "enqueue");
     fs.writeFileSync(path.join(fixture.repositoryRoot, "automatic.txt"), "automatic behavior\n");
     core.submitEvent(fixture.options, "review", "T0001", "REVIEW_REQUESTED", { summary: "Fixture behavior verified" });
     core.processPendingEvents(fixture.options);
-    core.setAutopilot(fixture.options, true, "auto-on", "auto-message", "side-chat");
-    core.submitEvent(fixture.options, "approve", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Save automatic behavior", autopilotEventKey: "auto-on", reviewEventKey: "review", verification: "Fixture behavior checks passed" });
+    core.setOrchestration(fixture.options, "auto-next", "auto-on", "auto-message", "side-chat");
+    core.submitEvent(fixture.options, "approve", "T0001", "APPROVAL_REQUESTED", { commitMessage: "Save automatic behavior", orchestrationEventKey: "auto-on", reviewEventKey: "review", verification: "Fixture behavior checks passed" });
     const completed = core.settleProject(fixture.options) as any;
     assert.equal(completed.completion.task.state, "DONE");
     assert.equal(completed.completion.merged, false);
@@ -155,22 +155,29 @@ test("autopilot approval follows commit mode and retains the shared branch", () 
     assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "main"]), fixture.initialCommit);
 });
 
-test("reopening a commit-mode sender defers its undelivered successor without deleting the shared branch", () => {
-    const fixture = createCommitFixture();
-    helpers.activateTask(fixture.options, "first", "First behavior", "enqueue-first");
-    fs.writeFileSync(path.join(fixture.repositoryRoot, "first.txt"), "first behavior\n");
-    helpers.registerTask(fixture.options, "second", "Second behavior");
-    core.submitEvent(fixture.options, "enqueue-second", "T0002", "ENQUEUE_REQUESTED", {});
-    helpers.approveTask(fixture.options, "T0001", "first", "Save first behavior");
-    const completed = core.settleProject(fixture.options) as any;
-    core.submitEvent(fixture.options, "handoff-wait", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" });
-    core.processPendingEvents(fixture.options);
-    const reopened = core.resumeTask(fixture.options, "T0001", true);
-    assert.deepEqual(reopened.deferredTaskIds, ["T0002"]);
-    assert.equal((core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
-    assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "control-room/codex"]), completed.completion.task.approvedCommit);
-    assert.equal(helpers.runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/codex");
-});
+for (const delivery of ["pending", "rejected"]) {
+    test(`reopening a commit-mode sender preserves the shared branch after ${delivery} delivery`, () => {
+        const fixture = createCommitFixture();
+        helpers.activateTask(fixture.options, "first", "First behavior", "enqueue-first");
+        fs.writeFileSync(path.join(fixture.repositoryRoot, "first.txt"), "first behavior\n");
+        helpers.registerTask(fixture.options, "second", "Second behavior");
+        core.submitEvent(fixture.options, "enqueue-second", "T0002", "ENQUEUE_REQUESTED", {});
+        helpers.approveTask(fixture.options, "T0001", "first", "Save first behavior");
+        const completed = core.settleProject(fixture.options) as any;
+        core.submitEvent(fixture.options, "handoff-wait", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" });
+        core.processPendingEvents(fixture.options);
+        if (delivery === "rejected") {
+            const key = completed.activation.executionBrief.activationKey;
+            const claim = core.claimActivation(fixture.options, key);
+            core.rejectActivation(fixture.options, key, claim.claimToken!, "explicit-tool-rejection");
+        }
+        const reopened = core.resumeTask(fixture.options, "T0001", true);
+        assert.deepEqual(reopened.deferredTaskIds, ["T0002"]);
+        assert.equal((core.getStatus(fixture.options, "T0002").task as any).state, "QUEUED");
+        assert.equal(helpers.runGit(fixture.repositoryRoot, ["rev-parse", "control-room/codex"]), completed.completion.task.approvedCommit);
+        assert.equal(helpers.runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/codex");
+    });
+}
 
 test("commit mode selection requires user provenance and old retries retain the latest mode", () => {
     const fixture = createCommitFixture();
@@ -273,7 +280,7 @@ test("schema 20 migration retains approvals, dependencies, delivery records, and
     assert.equal(core.getStatus(options).integrationMode, "pr");
     assert.equal((core.getStatus(options, "T0001").task as any).integrationMode, "pr");
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
-    assert.equal(migrated.prepare("PRAGMA user_version").get()!.user_version, 21);
+    assert.equal(migrated.prepare("PRAGMA user_version").get()!.user_version, 23);
     assert.equal(migrated.prepare("SELECT count(*) AS n FROM dependencies").get()!.n, 1);
     assert.equal(migrated.prepare("SELECT count(*) AS n FROM activation_deliveries").get()!.n, 1);
     assert.equal(migrated.prepare("SELECT count(*) AS n FROM integration_mode_requests").get()!.n, 1);

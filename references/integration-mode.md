@@ -19,11 +19,11 @@ For `current mode`, use the read-only command:
 node <skill-dir>/scripts/control-room.ts mode --project-root <root> --mode status
 ```
 
-Report the returned `integrationMode` and, when useful, the separate autopilot setting. Mode selection does not start, approve, commit or publish work. It persists until explicitly changed. Repeating an older command key returns the current selection without restoring its historical value.
+Report the returned `integrationMode` and, when useful, the separate orchestration setting (`auto-next`, `approve-next`, or `manual-next`). Mode selection does not start, approve, commit or publish work. It persists until explicitly changed. Repeating an older command key returns the current selection without restoring its historical value.
 
 ## Approval behavior
 
-The engine captures `integrationMode` when an approval event is submitted. Processing, settlement and recovery retain that snapshot even if the project mode changes meanwhile. Ordinary `Approve`, `Approve and pause`, and authorized autopilot approvals use the same selection; no second commit, push or PR confirmation is needed.
+The engine captures `integrationMode` when an approval event is submitted. Processing, settlement and recovery retain that snapshot even if the project mode changes meanwhile. Ordinary `Approve`, `Approve and pause`, and authorized `auto-next` approvals use the same selection; no second commit, push or PR confirmation is needed.
 
 - `commit`: on shared activation, keep the current branch unless it is `main`. In that case create `control-room/codex`, or check out that existing branch without resetting its commits. Capture its current HEAD as the task baseline. Approval commits only there and reaches `DONE` or `PAUSED` immediately, preserving the branch and checkout. Never merge, push, publish a PR, or create/update main. A clean task with no new commits completes without a commit and retains the checkout. Detached HEAD and isolated activation are rejected before Git changes; use merge or PR mode for isolated work. Never stage or commit during implementation or review.
 - `merge`: preserve the existing local commit, linear base integration, cleanup and `DONE` or `PAUSED` completion. No push or PR is created.
@@ -39,7 +39,7 @@ The provider is derived from the clone URL; there is no provider setting:
 
 Azure DevOps preflight reads the explicitly selected repository to verify authentication and destination before committing. Every PR operation specifies the organization; list/create also specify the project, repository and branches, with local detection disabled. Dynamic extension installation is disabled. Creation leaves auto-complete off and preserves the multiline review description. Provider responses must identify the recorded repository, exact source commit and target branch; forks are rejected. PR IDs are taken only from a validated repository-bound response, and persisted URLs are checked before requesting a PR. CLI diagnostics are sanitized to avoid leaking credentials. Azure DevOps Server and other PR providers are not currently implemented; preserve the task and report an unsupported origin rather than falling back to local merge.
 
-After publication, the task enters `PR_OPEN` with 🔵. Its worker branch and isolated worktree remain; the shared checkout returns to the base. All subsequent shared and isolated activation waits while any task remains `PR_OPEN`, including independent queued tasks and after a mode change. Settlement verifies the remote merge and safely synchronizes the local base before creating the next task branch from that base. It never starts the next task from an open PR branch. Dependencies remain unsatisfied. `Approve and pause` stores a `PAUSED` target that is reached only after the PR merges and the base synchronizes.
+After publication, the task enters `PR_OPEN` with 🔵. Its worker branch and isolated worktree remain; the shared checkout returns to the base. All subsequent shared and isolated activation waits while any task remains `PR_OPEN`, including independent queued tasks and after a mode change. Settlement verifies the remote merge and safely synchronizes the local base before a subsequent task may start from that base. In `manual-next`, the next queued task still requires an explicit `Run`. It never starts the next task from an open PR branch. Dependencies remain unsatisfied. `Approve and pause` stores a `PAUSED` target that is reached only after the PR merges and the base synchronizes.
 
 After successfully creating or recovering a PR in this turn, always call the app's `attach_artifact` tool with its `pullRequestUrl`. Attach every created PR when settlement publishes several tasks. The tool attaches to the calling chat; the task's own status also retains its PR URL. Include the PR link and current state in the completion message and apply all returned title updates and activation deliveries.
 
@@ -63,6 +63,15 @@ Cleanup removes only unchanged task-owned local worker refs and clean isolated w
 Canceling a `PR_OPEN` task cancels local orchestration and preserves its changed branch/worktree and PR metadata. It never closes or deletes the remote PR. Changes to a published PR require a separate explicit implementation request; PR mode itself grants no approval of later remote commits.
 
 ## Branch continuity and recovery
+
+If the user renames the active commit-mode branch, do not recreate or check out its old name to satisfy recorded task metadata. With direct user authorization for the alignment, confirm the existing activation receipt, inspect Git history, and run:
+
+```bash
+node <skill-dir>/scripts/control-room.ts adopt-branch --project-root <root> --task <T_ID> \
+    --branch <current-user-selected-branch> --event-key <stable-key> --user-request-id <actual-message-id>
+```
+
+This command changes only the task's branch registration and appends a decision; it performs no checkout, commit, merge, push or ref deletion. It accepts shared `RUNNING`/`REVIEW` tasks in commit mode with no pending events or approval lease, requires the checked-out non-main branch to contain the baseline and every commit still reachable from the recorded branch, and retains immutable delivered activation briefs. Repeated event keys cannot reapply an old choice. Pending/uncertain deliveries must be resolved first. Preserve dirty files and both refs. If an obsolete branch was recreated and contains a later approved commit, explicit user authorization permits checking out the intended existing branch and fast-forwarding it to that commit before adoption; never reset or discard divergent history.
 
 PR and merge activation keep the per-task branch names `control-room/<T_ID>`; commit mode creates only `control-room/codex` and otherwise keeps an existing non-main branch name. The shared commit branch survives no-change completion, cancellation, checkpoint, resume and reopen. A later commit-mode task starts from its latest approved HEAD. Switching back to merge or PR mode after completion returns a clean checkout to the configured base for new task branches while retaining the commit branch; its unmerged changes are not implicitly included in the base. Git ref-name collisions or a branch held by another worktree are reported without deleting or renaming existing branches.
 

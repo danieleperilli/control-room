@@ -7,7 +7,7 @@ interface IParsedArguments {
 
 const USER_COMMANDS = [
     "PR mode | merge mode | commit mode | current mode",
-    "autopilot | autopilot on | autopilot off | autopilot status",
+    "orchestration auto-next | orchestration approve-next | orchestration manual-next | orchestration status",
     "$control-room init",
     "$control-room join",
     "$control-room exclude",
@@ -16,7 +16,7 @@ const USER_COMMANDS = [
     "$control-room help",
     "Return to planning | Return T0002 to planning",
     "Enqueue [after T0002]",
-    "Run now | Run T0002 now",
+    "Run | Run now | Run T0002 now",
     "Run isolated now | Run T0002 isolated now",
     "Move first | Move to 3 | Move before T0002 | Move after T0002",
     "Depends on T0002 | Remove dependency T0002",
@@ -112,12 +112,12 @@ ${USER_COMMANDS.map((command) => `  ${command}`).join("\n")}
 Commands:
   mode --project-root ROOT --mode (merge|pr|commit|status) [--event-key KEY --user-request-id ID --thread-id ID] [--state-root PATH]
   sync-prs --project-root ROOT [--task T0001] [--state-root PATH]
-  autopilot --project-root ROOT --mode (on|off) --event-key KEY --user-request-id ID --thread-id ID [--state-root PATH]
+  orchestration --project-root ROOT --mode (auto-next|approve-next|manual-next|status) [--event-key KEY --user-request-id ID --thread-id ID] [--state-root PATH]
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   install-routing --project-root ROOT [--state-root PATH]
   exclude --project-root ROOT --thread-id ID --reason TEXT [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--adopt-excluded true] [--state-root PATH]
-  request-planning --project-root ROOT --task T0001 --event-key KEY [--state-root PATH]
+  request-planning --project-root ROOT --task T0001 --event-key KEY [--stopped-activation-key KEY --user-request-id ID] [--state-root PATH]
   request-enqueue --project-root ROOT --task T0001 --event-key KEY [--user-request-id ID] [--after T0002] [--state-root PATH]
   request-run-now --project-root ROOT --task T0001 --event-key KEY [--user-request-id ID] [--state-root PATH]
   request-run-isolated-now --project-root ROOT --task T0001 --event-key KEY [--user-request-id ID] [--state-root PATH]
@@ -131,7 +131,7 @@ Commands:
   request-rework --project-root ROOT --task T0001 --event-key KEY [--summary TEXT] [--state-root PATH]
   request-approve --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
   request-approve-and-pause --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --commit-message SUBJECT [--state-root PATH]
-  request-autopilot-approve --project-root ROOT --task T0001 --event-key KEY --autopilot-event-key KEY --review-event-key KEY --verification TEXT --commit-message SUBJECT [--state-root PATH]
+  request-auto-approve --project-root ROOT --task T0001 --event-key KEY --orchestration-event-key KEY --review-event-key KEY --verification TEXT --commit-message SUBJECT [--state-root PATH]
   request-cancel --project-root ROOT --task T0001 --event-key KEY --user-request-id ID [--state-root PATH]
   request-exclude --project-root ROOT --task T0001 --event-key KEY --user-request-id ID --reason TEXT [--state-root PATH]
   request-block --project-root ROOT --task T0001 --event-key KEY --reason TEXT [--state-root PATH]
@@ -139,11 +139,13 @@ Commands:
   process --project-root ROOT [--state-root PATH]
   activate-next --project-root ROOT [--state-root PATH]
   recover-commit --project-root ROOT --task T0001 [--state-root PATH]
+  adopt-branch --project-root ROOT --task T0001 --branch BRANCH --event-key KEY --user-request-id ID [--state-root PATH]
   resume --project-root ROOT --task T0001 [--state-root PATH]
   reopen --project-root ROOT --task T0001 [--state-root PATH]
   commit-approved --project-root ROOT --task T0001 [--state-root PATH]
   doctor --project-root ROOT [--task T0001] [--state-root PATH]
   claim-activation --project-root ROOT --activation-key KEY [--retry-user-request-id ID] [--state-root PATH]
+  reject-activation --project-root ROOT --activation-key KEY --claim-token TOKEN --receipt ID [--state-root PATH]
   confirm-activation --project-root ROOT --activation-key KEY --claim-token TOKEN --receipt ID [--state-root PATH]
   status --project-root ROOT [--task T0001 | --thread-id ID] [--state-root PATH]
   queue --project-root ROOT [--state-root PATH]
@@ -162,12 +164,16 @@ function executeCommand(parsed: IParsedArguments): unknown {
         return null;
     }
     const core: import("./control-room-core.ts").IControlRoomApi = require("./control-room-core.ts");
+    if (parsed.command === "adopt-branch") {
+        validateOptions(values, ["project-root", "task", "branch", "event-key", "user-request-id", "state-root"]);
+        return core.adoptCurrentBranch(buildOptions(values), requireOption(values, "task"), requireOption(values, "branch"), requireOption(values, "event-key"), requireOption(values, "user-request-id"));
+    }
     if (parsed.command === "mode") {
         validateOptions(values, ["project-root", "mode", "event-key", "user-request-id", "thread-id", "state-root"]);
         const mode = requireOption(values, "mode");
         if (mode === "status") {
             const status = core.getStatus(buildOptions(values));
-            return { initialized: status.initialized, reason: status.reason, projectRoot: status.projectRoot, integrationMode: status.integrationMode, autopilot: status.autopilot };
+            return { initialized: status.initialized, reason: status.reason, projectRoot: status.projectRoot, integrationMode: status.integrationMode, orchestration: status.orchestration };
         }
         if (mode !== "merge" && mode !== "pr" && mode !== "commit") {
             throw new Error("--mode must be merge, pr, commit or status.");
@@ -179,13 +185,17 @@ function executeCommand(parsed: IParsedArguments): unknown {
         const { syncPullRequests }: import("./control-room-pr.ts").IPullRequestApi = require("./control-room-pr.ts");
         return syncPullRequests(buildOptions(values), values.task);
     }
-    if (parsed.command === "autopilot") {
+    if (parsed.command === "orchestration") {
         validateOptions(values, ["project-root", "mode", "event-key", "user-request-id", "thread-id", "state-root"]);
         const mode = requireOption(values, "mode");
-        if (mode !== "on" && mode !== "off") {
-            throw new Error("--mode must be on or off.");
+        if (mode === "status") {
+            const status = core.getStatus(buildOptions(values));
+            return { initialized: status.initialized, reason: status.reason, projectRoot: status.projectRoot, orchestration: status.orchestration };
         }
-        return core.setAutopilot(buildOptions(values), mode === "on", requireOption(values, "event-key"), requireOption(values, "user-request-id"), requireOption(values, "thread-id"));
+        if (mode !== "auto-next" && mode !== "approve-next" && mode !== "manual-next") {
+            throw new Error("--mode must be auto-next, approve-next, manual-next or status.");
+        }
+        return core.setOrchestration(buildOptions(values), mode, requireOption(values, "event-key"), requireOption(values, "user-request-id"), requireOption(values, "thread-id"));
     }
     if (parsed.command === "init") {
         validateOptions(values, ["project-root", "control-room-thread", "base-branch", "state-root"]);
@@ -233,8 +243,8 @@ function executeCommand(parsed: IParsedArguments): unknown {
         return { ...core.installProjectRouting(options), worktreeIgnore: core.installWorktreeIgnore(options) };
     }
     if (parsed.command === "request-planning") {
-        validateOptions(values, ["project-root", "task", "event-key", "state-root"]);
-        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "PLANNING_REQUESTED", {});
+        validateOptions(values, ["project-root", "task", "event-key", "stopped-activation-key", "user-request-id", "state-root"]);
+        return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "PLANNING_REQUESTED", { stoppedActivationKey: values["stopped-activation-key"], userRequestId: values["user-request-id"] });
     }
     if (parsed.command === "request-enqueue") {
         validateOptions(values, ["project-root", "task", "event-key", "user-request-id", "after", "state-root"]);
@@ -317,10 +327,10 @@ function executeCommand(parsed: IParsedArguments): unknown {
             userRequestId: requireOption(values, "user-request-id")
         });
     }
-    if (parsed.command === "request-autopilot-approve") {
-        validateOptions(values, ["project-root", "task", "event-key", "autopilot-event-key", "review-event-key", "verification", "commit-message", "state-root"]);
+    if (parsed.command === "request-auto-approve") {
+        validateOptions(values, ["project-root", "task", "event-key", "orchestration-event-key", "review-event-key", "verification", "commit-message", "state-root"]);
         return core.submitEvent(buildOptions(values), requireOption(values, "event-key"), requireOption(values, "task"), "APPROVAL_REQUESTED", {
-            autopilotEventKey: requireOption(values, "autopilot-event-key"),
+            orchestrationEventKey: requireOption(values, "orchestration-event-key"),
             reviewEventKey: requireOption(values, "review-event-key"),
             verification: requireOption(values, "verification"),
             commitMessage: requireOption(values, "commit-message")
@@ -389,6 +399,10 @@ function executeCommand(parsed: IParsedArguments): unknown {
     if (parsed.command === "claim-activation") {
         validateOptions(values, ["project-root", "activation-key", "retry-user-request-id", "state-root"]);
         return core.claimActivation(buildOptions(values), requireOption(values, "activation-key"), values["retry-user-request-id"]);
+    }
+    if (parsed.command === "reject-activation") {
+        validateOptions(values, ["project-root", "activation-key", "claim-token", "receipt", "state-root"]);
+        return core.rejectActivation(buildOptions(values), requireOption(values, "activation-key"), requireOption(values, "claim-token"), requireOption(values, "receipt"));
     }
     if (parsed.command === "confirm-activation") {
         validateOptions(values, ["project-root", "activation-key", "claim-token", "receipt", "state-root"]);

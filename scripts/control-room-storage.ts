@@ -6,7 +6,7 @@ const path: typeof import("node:path") = require("node:path");
 const { DatabaseSync }: typeof import("node:sqlite") = require("node:sqlite");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const CURRENT_SCHEMA_VERSION = 21;
+const CURRENT_SCHEMA_VERSION = 23;
 
 /**
  * Create a secure directory if needed and restrict its mode.
@@ -328,6 +328,14 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
             CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_position);
             CREATE INDEX IF NOT EXISTS idx_events_pending ON events(processed_at, sequence);
         `);
+        if (!databaseHasColumn(database, "activation_deliveries", "rejection_receipt")) {
+            database.exec("ALTER TABLE activation_deliveries ADD COLUMN rejection_receipt TEXT");
+        }
+        if (!databaseHasColumn(database, "activation_deliveries", "prior_delivery_uncertain")) {
+            database.exec("ALTER TABLE activation_deliveries ADD COLUMN prior_delivery_uncertain INTEGER NOT NULL DEFAULT 0 CHECK (prior_delivery_uncertain IN (0, 1))");
+            // Earlier schemas did not distinguish rejection from an uncertain attempt before retry.
+            database.exec("UPDATE activation_deliveries SET prior_delivery_uncertain = 1 WHERE retry_request_id IS NOT NULL");
+        }
         if (schemaVersion < 18) {
             database.exec(`
                 UPDATE events
@@ -339,10 +347,10 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
             `);
         }
         database.exec(`
-            CREATE TABLE IF NOT EXISTS autopilot_requests (
+            CREATE TABLE IF NOT EXISTS orchestration_requests (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_key TEXT NOT NULL UNIQUE,
-                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                mode TEXT NOT NULL CHECK (mode IN ('auto-next', 'approve-next', 'manual-next')),
                 user_request_id TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -356,6 +364,18 @@ function initializeSchema(database: import("node:sqlite").DatabaseSync): void {
                 created_at TEXT NOT NULL
             );
         `);
+        if (database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'autopilot_requests'").get()) {
+            // Preserve approval property order so retries still match their original serialized payload.
+            database.exec(`
+                INSERT INTO orchestration_requests (sequence, event_key, mode, user_request_id, thread_id, created_at)
+                SELECT sequence, event_key, CASE enabled WHEN 1 THEN 'auto-next' ELSE 'approve-next' END, user_request_id, thread_id, created_at
+                FROM autopilot_requests;
+                DROP TABLE autopilot_requests;
+                UPDATE events
+                SET payload_json = replace(payload_json, '"autopilotEventKey":', '"orchestrationEventKey":')
+                WHERE kind = 'APPROVAL_REQUESTED' AND json_type(payload_json, '$.autopilotEventKey') IS NOT NULL;
+            `);
+        }
         for (const tableName of ["projects", "tasks", "integration_mode_requests"]) {
             const schema = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName) as { sql: string };
             if (!schema.sql.includes("'commit'")) {

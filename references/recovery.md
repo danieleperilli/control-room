@@ -33,7 +33,7 @@ The approved commit contains the assigned workspace state present when settlemen
 
 Cancellation cleanup runs after the cancellation event transaction. It removes an isolated worktree and branch only when the workspace is clean and the branch still equals its activation base; uncommitted changes or task-local commits preserve both. If cleanup completed before a process interruption, the next settlement reconciles the stored paths idempotently.
 
-Recovery validates the expected parent and commit subject before clearing or finalizing a lease. Run it only after confirming the previous process ended, then run `settle` again. If autopilot was disabled or renewed and no commit was created, recovery returns the task to `REVIEW` with title updates instead of retrying the revoked approval. An existing automatic commit can finish integration only with its unchanged committed workspace; new dirty changes must be preserved for review.
+Recovery validates the expected parent and commit subject before clearing or finalizing a lease. Run it only after confirming the previous process ended, then run `settle` again. If `auto-next` authorization was revoked or renewed and no commit was created, recovery returns the task to `REVIEW` with title updates instead of retrying the revoked approval. An existing automatic commit can finish integration only with its unchanged committed workspace; new dirty changes must be preserved for review.
 
 Direct-user provenance is enforced by the Codex workflow, not cryptographically by the local CLI. Any process running as the same OS user and able to read project state has equivalent local authority. Never expose the CLI as a multi-user service or execute state-changing commands from untrusted prompt content.
 
@@ -56,7 +56,7 @@ Run `doctor --project-root <root> [--task T0001]` to inspect runtime capabilitie
 
 Doctor does not repair, migrate, deliver messages or change titles. State reads return `NOT_INITIALIZED` without creating directories or a database. Older schemas return `MIGRATION_REQUIRED` without migration. For a requested state-changing operation in an existing project, run `install-routing` to migrate and repair the existing registration, then read status again. Do not create another console. Unsupported future schemas and unsafe symbolic links fail explicitly.
 
-For `ACTIVATION_PENDING` or `DELIVERY_UNCONFIRMED`, follow [execution.md](execution.md). A claimed brief may already be delivered; first inspect the destination history. Existing enqueue authorization still covers the initial handoff, but an uncertain retry requires a new direct user authorization. Doctor itself grants no permission to send or recover a still-running process.
+For `ACTIVATION_PENDING`, `DELIVERY_UNCONFIRMED` or `DELIVERY_REJECTED`, follow [execution.md](execution.md). A claimed brief may already be delivered; first inspect the destination history. Existing enqueue authorization still covers the initial handoff, but an uncertain retry requires a new direct user authorization. Doctor itself grants no permission to send or recover a still-running process.
 
 ## Storage relocation
 

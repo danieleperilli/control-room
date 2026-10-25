@@ -12,7 +12,7 @@ ControlRoom coordinates multiple top-level Codex tasks inside a Git project. It 
 - Runs tasks serially in the shared checkout by default, with explicit concurrent isolation when requested.
 - Leaves changes uncommitted during implementation and review.
 - Creates a worker branch only when a queued task starts running.
-- Creates a commit after direct user approval or an explicitly enabled project autopilot, and only when uncommitted changes exist.
+- Creates a commit after direct user approval or the project's explicitly selected `auto-next` orchestration, and only when uncommitted changes exist.
 - Supports persistent project `merge mode` (default), `PR mode`, and read-only `current mode` commands from any project chat.
 - Can approve and integrate an intermediate checkpoint into `PAUSED`, then resume the same task later with `⏸️`.
 - Creates isolated worktrees only on demand below the repository-local `.control-room/worktrees/` directory.
@@ -75,7 +75,7 @@ From a top-level task in the repository, select **Local** and send `$control-roo
 
 Discuss each change in its own Local task. Change requests and concrete implementation plans are registered automatically and start in planning; purely read-only questions, reviews and reports stay unregistered. Use `$control-room join` for an existing task that missed automatic registration. The original request is preserved and handled in the same turn.
 
-Send `Enqueue` to authorize the task to start when eligible. Use `Run now` when the shared checkout is idle, or explicitly request `Run isolated now` for a dedicated repository-local worktree. Queue order and dependencies are separate: moving a task does not change its prerequisites.
+Send `Enqueue` to add the task to the queue. In `auto-next` and the default `approve-next`, it starts automatically when eligible. In `manual-next`, it waits for an explicit `Run` (or `Run now`) in that task. Use `Run` when the shared checkout is idle, or explicitly request `Run isolated now` for a dedicated repository-local worktree. Queue order and dependencies are separate: moving a task does not change its prerequisites.
 
 Implementation remains uncommitted through review. `Approve` captures the current project mode: merge mode integrates locally; PR mode commits, pushes its worker and creates a PR without a second confirmation. A published task remains 🔵 `PR_OPEN`, releases shared execution and keeps dependent tasks waiting. Settlement checks remote completion and safely synchronizes the base before `DONE`. `Approve and pause` targets `PAUSED` after that mode's integration; `Resume` returns that same task to planning. Direct approval is final authorization, including recovery from an interrupted turn. Independent review is left to the user's own request and adds no approval gate.
 
@@ -85,10 +85,11 @@ Implementation remains uncommitted through review. `Approve` captures the curren
 | --- | --- |
 | `PR mode` | Select worker commit, push and PR publication for future approvals in this project. |
 | `merge mode` | Select the existing local integration flow for future approvals. |
-| `current mode` | Read the selected integration mode and separate autopilot setting. |
-| `autopilot` or `autopilot on` | Enable automatic approval and continuation for explicitly started or queued work in this project. |
-| `autopilot off` | Return to manual approval while preserving running work. |
-| `autopilot status` | Show current mode and a snapshot of project progress. |
+| `current mode` | Read the selected integration mode and separate orchestration setting. |
+| `orchestration auto-next` | Automatically approve verified work and start the next eligible queued task. |
+| `orchestration approve-next` | Require user approval, then start the next eligible task; this is the default. |
+| `orchestration manual-next` | Require user approval, then leave successors queued until an explicit `Run`. |
+| `orchestration` or `orchestration status` | Show the project setting and a snapshot of progress. |
 | `$control-room init` | Initialize the project and create a separate manual `⚫️ Control Room` console. |
 | `$control-room join` | Explicitly register an existing top-level task when automatic registration did not run. |
 | `$control-room exclude` | Exclude an unregistered task, or cancel and remove a planning/queued task while restoring its semantic title. |
@@ -98,7 +99,7 @@ Implementation remains uncommitted through review. `Approve` captures the curren
 | `Return to planning` | Return a queued or blocked waiting task to planning while preserving its dependencies. |
 | `Enqueue` | Add or update the current task at the end of the queue, including a blocked waiting task. |
 | `Enqueue after T0005` | Add the current task immediately after `T0005`, without creating a dependency, including a blocked waiting task. |
-| `Run now` | Start the current task immediately when the shared checkout is idle and all dependencies are done. |
+| `Run` or `Run now` | Start the current task immediately when the shared checkout is idle and all dependencies are done. |
 | `Run isolated now` | Start the current task immediately in `.control-room/worktrees/<T_ID>` when its dependencies are done. |
 | `Move first` | Move the current queued task to the first waiting position. |
 | `Move to 3` | Move the current queued task to waiting position 3. |
@@ -115,15 +116,17 @@ Implementation remains uncommitted through review. `Approve` captures the curren
 
 English commands are canonical; equivalent natural-language requests are accepted. Use explicit task IDs when issuing project-wide commands from the manual console.
 
-### Autopilot
+### Orchestration
 
-Use `autopilot` (or `autopilot on`) in any chat associated with an initialized project to enable automatic approval and continuation. Use `autopilot off` to return to manual approval, and `autopilot status` for a read-only progress snapshot. Commands also work in excluded tasks and side chats without registering them; a chat without an identifiable project must name the project first.
+Select `orchestration auto-next`, `orchestration approve-next`, or `orchestration manual-next` in any chat associated with an initialized project. The setting persists for that project, including tasks enqueued later. Commands also work in excluded tasks and side chats without registering them. `orchestration status` shows a read-only progress snapshot.
 
-The setting persists for that project, including tasks enqueued later, until disabled. Planning tasks still need an explicit start or enqueue. Workers complete relevant verification and review before automatic approval, delivery through the selected merge or PR mode, and the normal handoff to the next eligible task. Failed checks, unresolved decisions, user attention, and recovery needs stop automatic completion. Existing reviews need actual successful verification evidence.
+`approve-next` is the default: approve the current task and the next eligible queued task starts. `auto-next` also authorizes automatic approval after successful verification and review. Failed checks, unresolved decisions, user attention, and recovery needs stop automatic completion. Planning tasks still need an explicit start or enqueue.
 
-Off preserves running work and returns unleased automatic approvals to review. An integration already started may finish or recover. This is a return to manual approval, not a pause of the queue: later manual approval still starts eligible queued work. No background service or changes to Codex tool permissions are required.
+`manual-next` requires approval of the current task and an explicit `Run` in the next task. Approved work still completes through its selected integration mode; waiting tasks keep their queue positions and dependencies. Enqueueing, approving, or synchronizing a merged PR does not start work authorized only by `Enqueue`. `Run` selects the desired task when the workspace is available and dependencies are done. Explicit isolated execution remains available in merge/PR mode.
 
-Control Room can show enabled/disabled mode, completed/total task counts, active states, dependencies and recent completions from persisted state. This is a snapshot on request; it does not continuously update an earlier chat message.
+Changing the setting preserves running work and revokes unleased automatic approvals. An integration already started may finish or recover. Existing autopilot on/off history migrates to `auto-next`/`approve-next`, retaining authorization references and pending approvals. The former autopilot commands are replaced by orchestration commands.
+
+Control Room can show the selected setting, completed/total task counts, active states, dependencies and recent completions. This is a snapshot on request; it does not continuously update an earlier chat message. See [orchestration.md](references/orchestration.md) for mode selection and automatic approval.
 
 ## Exclusions and task identity
 
@@ -137,7 +140,7 @@ Titles reflect state: `⚪️` planning, `⭕️` queued, `🔴` running, `💪`
 
 Activation reserves a workspace and persists its execution brief in one transaction. A durable delivery record survives an interrupted caller. Concurrent senders compete for one atomic claim, and a successful send is acknowledged with its message or operation reference. A repeated settlement exposes pending deliveries without sending them itself.
 
-A direct enqueue authorizes the initial handoff to that task within the original scope. An unconfirmed claim may already have reached the destination, so the agent verifies task history before proceeding. A new explicit user authorization permits one uncertain retry; it invalidates the previous claim token. Cancellation or another transition out of running invalidates obsolete pending deliveries.
+A direct enqueue authorizes the initial automatic handoff in `auto-next` and `approve-next`; `manual-next` requires an explicit `Run` before activation and handoff. An unconfirmed claim may already have reached the destination, so the agent verifies task history before proceeding. A new explicit user authorization permits one uncertain retry; it invalidates the previous claim token. Cancellation or another transition out of running invalidates obsolete pending deliveries.
 
 Approval and no-change cleanup both acquire a persistent lease before Git side effects. Recovery recognizes an already-integrated base, a deleted worker branch and a removed unchanged worktree. Shared workers can recover linear integration after an isolated task advanced the base. The original `DONE` or `PAUSED` target is preserved. Changed workspaces or unexpectedly moved refs are retained for inspection.
 
@@ -152,7 +155,7 @@ node <skill-dir>/scripts/control-room.ts doctor --project-root <root>
 node <skill-dir>/scripts/control-room.ts doctor --project-root <root> --task T0002
 ```
 
-Doctor explains runtime capabilities, SQLite integrity, routing and ignore rules, missing workspaces, dependencies, shared-checkout ownership, approval leases, unfinished cleanup and pending deliveries. Each check includes a stable code, severity, explanation and a next action when applicable. A healthy report has only `ok` checks; an ordinary waiting dependency can produce a warning without implying corruption. Doctor performs no repairs or deliveries and does not register or rename the caller.
+Doctor reports the current integration mode (`merge`, `pr`, or `commit`) and orchestration mode (`auto-next`, `approve-next`, or `manual-next`), including when filtered to one task. It also explains runtime capabilities, SQLite integrity, routing and ignore rules, missing workspaces, dependencies, shared-checkout ownership, approval leases, unfinished cleanup and pending deliveries. Each check includes a stable code, severity, explanation and a next action when applicable. A healthy report has only `ok` checks; an ordinary waiting dependency can produce a warning without implying corruption. Doctor performs no repairs or deliveries and does not register or rename the caller.
 
 `status`, `queue`, `review-packet` and `doctor` never create or migrate state. Status and queue return `NOT_INITIALIZED` for missing state and `MIGRATION_REQUIRED` for an older database. Before a requested state change, `install-routing` upgrades the existing registration; `$control-room init` handles this without creating another console. Future unsupported schemas fail explicitly.
 

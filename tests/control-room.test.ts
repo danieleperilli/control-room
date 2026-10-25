@@ -333,6 +333,7 @@ test("reports partial initialization when project routing cannot be installed", 
     assert.equal(fs.readFileSync(externalPath, "utf8"), "# External\n");
 });
 
+/** Verify routing installation and repair preserve existing project and global instructions. */
 test("installs ControlRoom routing in project instructions without changing global instructions", () => {
     const fixture = createFixture();
     initializeFixture(fixture);
@@ -351,26 +352,11 @@ test("installs ControlRoom routing in project instructions without changing glob
     assert.equal(result.updated, true);
     assert.equal(result.agentsPath, path.join(fs.realpathSync(fixture.repositoryRoot), "AGENTS.md"));
     assert.equal(agentsContent.startsWith("<!-- control-room:start -->"), true);
-    assert.match(agentsContent, /# Existing instructions/);
-    assert.match(agentsContent, /load and follow `\$control-room` before handling each user message/);
-    assert.match(agentsContent, /invokes or triggers `\$brand-forge`/);
-    assert.match(agentsContent, /exact standalone `\$control-room exclude` directive/);
-    assert.match(agentsContent, /registered PLANNING or QUEUED task/);
-    assert.match(agentsContent, /cancellation and settlement/);
-    assert.match(agentsContent, /only an explicit `\$control-room join` adopts one/);
-    assert.match(agentsContent, /Do not automatically register a purely read-only request/);
-    assert.match(agentsContent, /Treat a direct user `Enqueue` command as advance authorization/);
-    assert.match(agentsContent, /send one activation brief to its recorded thread without asking for another confirmation/);
-    assert.match(agentsContent, /never covers another task, thread, project, or implementation scope/);
-    assert.match(agentsContent, /Apply every ControlRoom task title update before replying/);
-    assert.match(agentsContent, /Never register subagents or side chats as ControlRoom workers/);
-    assert.match(agentsContent, /A side chat may create a new top-level task in this saved project with the Local environment only when the user explicitly requests it/);
-    assert.match(agentsContent, /remove only the task-creation wrapper, preserve the delegated prompt and lifecycle intent/);
-    assert.match(agentsContent, /let the created task register and mutate its own state/);
+    assert.equal(agentsContent.endsWith("# Existing instructions\n\n- Preserve this rule.\n"), true);
     assert.equal(fs.readFileSync(globalAgentsPath, "utf8"), "# Global instructions\n");
     assert.equal(runGit(fixture.repositoryRoot, ["status", "--porcelain"]), "?? .gitignore\n?? AGENTS.md");
 
-    const staleAgentsContent = agentsContent.replace(/^- Treat a direct user `Enqueue` command.*\n/mu, "");
+    const staleAgentsContent = agentsContent.replace(/<!-- control-room:start -->[\s\S]*?<!-- control-room:end -->/u, "<!-- control-room:start -->\n<!-- control-room:end -->");
     fs.writeFileSync(agentsPath, staleAgentsContent);
     const repaired = runCli(argumentsList, { CODEX_HOME: codexHome });
     assert.equal(repaired.status, 0, repaired.stderr || repaired.stdout);
@@ -627,7 +613,7 @@ test("migrates legacy state to approval-only commits", () => {
     const migratedDependency = migratedDatabase.prepare("SELECT dependency_kind FROM dependencies WHERE task_id = 'T0002' AND depends_on_id = 'T0001'").get();
     const migratedEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-enqueue'").get();
     migratedDatabase.close();
-    assert.equal(version, 21);
+    assert.equal(version, 23);
     assert.equal(project.git_mode, "local-approval-commit");
     assert.ok(taskColumns.includes("reviewed_commit"));
     assert.ok(taskColumns.includes("awaiting_user"));
@@ -685,7 +671,7 @@ test("migrates version 6 events without losing pending requests", () => {
     assert.equal(processed.results[0].eventKey, "pending-v6-enqueue");
     assert.equal(processed.results[0].action, "ENQUEUED");
     const migratedDatabase = new DatabaseSync(databasePath);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 23);
     assert.equal(migratedDatabase.prepare("SELECT awaiting_user FROM tasks WHERE task_id = 'T0001'").get().awaiting_user, 0);
     const migratedEventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     assert.match(migratedEventSql, /PLANNING_REQUESTED/);
@@ -730,7 +716,7 @@ test("removes legacy mental-model events and persisted fields", () => {
     const eventSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").get().sql;
     const persistedResult = JSON.parse(migratedDatabase.prepare("SELECT result_json FROM events WHERE event_key = 'legacy-result'").get().result_json);
     const persistedBrief = JSON.parse(migratedDatabase.prepare("SELECT brief_json FROM activation_deliveries WHERE activation_key = 'legacy-activation'").get().brief_json);
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 23);
     assert.doesNotMatch(eventSql, /MENTAL_MODEL_RECORDED/);
     assert.equal(migratedDatabase.prepare("SELECT COUNT(*) AS count FROM events WHERE event_key = 'legacy-mental'").get().count, 0);
     assert.deepEqual(persistedResult.reviewPacket, { decisionCount: 0 });
@@ -777,7 +763,7 @@ test("migrates version 11 state without discarding legacy review data", () => {
     const task = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const legacyEvent = migratedDatabase.prepare("SELECT kind FROM events WHERE event_key = 'legacy-review-audit'").get();
     const exclusionTable = migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_exclusions'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 23);
     assert.equal(task.reviewed_tree, '{"legacy":true}');
     assert.equal(legacyEvent.kind, "REVIEW_AUDIT_RECORDED");
     assert.equal(exclusionTable.name, "task_exclusions");
@@ -870,7 +856,7 @@ test("migrates version 14 tasks to PAUSED without losing events or dependencies"
     const taskSql = migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get().sql;
     const migratedTask = migratedDatabase.prepare("SELECT reviewed_tree FROM tasks WHERE task_id = 'T0001'").get();
     const dependency = migratedDatabase.prepare("SELECT depends_on_id FROM dependencies WHERE task_id = 'T0002'").get();
-    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 21);
+    assert.equal(migratedDatabase.prepare("PRAGMA user_version").get().user_version, 23);
     assert.match(taskSql, /'PAUSED'/);
     assert.equal(migratedTask.reviewed_tree, '{"legacy":true}');
     assert.equal(dependency.depends_on_id, "T0001");
@@ -1362,7 +1348,7 @@ test("migrates version 15 without changing running tasks or their ordinary atten
     assert.equal(after.handoffSenderTaskId, null);
     assert.deepEqual(after.pendingHandoffTaskIds, []);
     const migrated = new DatabaseSync(databasePath);
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 21);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 23);
     migrated.close();
 });
 
@@ -1519,7 +1505,7 @@ test("reopening releases an unchanged worker retained by direct-base approval", 
     assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "main"]), head);
 });
 
-for (const protection of ["clean", "dirty", "committed", "claimed", "delivered"]) {
+for (const protection of ["clean", "dirty", "committed", "claimed", "delivered", "rejected", "rejected-dirty", "rejected-committed", "rejected-base-moved", "rejected-retry", "rejected-reenqueued", "uncertain-retry-rejected"]) {
     test(`reopening handles a ${protection} successor without losing work`, () => {
         const fixture = createFixture();
         initializeFixture(fixture);
@@ -1531,21 +1517,32 @@ for (const protection of ["clean", "dirty", "committed", "claimed", "delivered"]
         const activated = core.settleProject(options).activation;
         core.submitEvent(options, "handoff-blocked", "T0001", "USER_INPUT_REQUESTED", { handoffTaskId: "T0002" });
         core.settleProject(options);
-        if (protection === "dirty" || protection === "committed") fs.writeFileSync(path.join(fixture.repositoryRoot, "successor.txt"), "must survive\n");
-        if (protection === "committed") {
+        if (protection.endsWith("dirty") || protection.endsWith("committed")) fs.writeFileSync(path.join(fixture.repositoryRoot, "successor.txt"), "must survive\n");
+        if (protection.endsWith("committed")) {
             runGit(fixture.repositoryRoot, ["add", "successor.txt"]);
             runGit(fixture.repositoryRoot, ["commit", "-m", "Successor checkpoint"]);
         }
-        if (protection === "claimed" || protection === "delivered") {
-            const claim = core.claimActivation(options, activated.executionBrief.activationKey);
-            if (protection === "delivered") core.confirmActivation(options, activated.executionBrief.activationKey, claim.claimToken, "actual-delivery");
+        if (protection === "claimed" || protection === "delivered" || protection.includes("rejected")) {
+            const key = activated.executionBrief.activationKey;
+            const claim = core.claimActivation(options, key);
+            if (protection === "delivered") core.confirmActivation(options, key, claim.claimToken, "actual-delivery");
+            if (protection.startsWith("rejected")) core.rejectActivation(options, key, claim.claimToken, "explicit-tool-rejection");
+            if (protection.includes("retry")) {
+                const retry = core.claimActivation(options, key, "new-direct-user-request");
+                core.rejectActivation(options, key, retry.claimToken, "explicit-retry-rejection");
+            }
         }
-        if (protection !== "clean") {
+        if (protection === "rejected-base-moved") {
+            runGit(fixture.repositoryRoot, ["checkout", "main"]);
+            runGit(fixture.repositoryRoot, ["commit", "--allow-empty", "-m", "Base moved"]);
+            runGit(fixture.repositoryRoot, ["checkout", "control-room/T0002"]);
+        }
+        if (!["clean", "rejected", "rejected-retry", "rejected-reenqueued"].includes(protection)) {
             assert.throws(() => core.resumeTask(options, "T0001", true), /Cannot defer|changed/);
             assert.equal(core.getStatus(options, "T0001").task.state, "DONE");
             assert.equal(core.getStatus(options, "T0002").task.state, "RUNNING");
             assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "control-room/T0002");
-            if (protection === "dirty" || protection === "committed") assert.equal(fs.readFileSync(path.join(fixture.repositoryRoot, "successor.txt"), "utf8"), "must survive\n");
+            if (protection.endsWith("dirty") || protection.endsWith("committed")) assert.equal(fs.readFileSync(path.join(fixture.repositoryRoot, "successor.txt"), "utf8"), "must survive\n");
             return;
         }
         const reopened = core.resumeTask(options, "T0001", true);
@@ -1556,6 +1553,29 @@ for (const protection of ["clean", "dirty", "committed", "claimed", "delivered"]
         assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "main");
         core.submitEvent(options, "reopened-start", "T0001", "RUN_NOW_REQUESTED", {});
         assert.equal(core.settleProject(options).activation.task.taskId, "T0001");
+        if (protection.startsWith("rejected")) {
+            if (protection === "rejected-reenqueued") {
+                core.submitEvent(options, "new-successor-start", "T0002", "ENQUEUE_REQUESTED", { userRequestId: "new-successor-user-request" });
+                core.processPendingEvents(options);
+            }
+            approveTask(options, "T0001", "follow-up", "Save predecessor follow-up");
+            const next = core.settleProject(options).activation.executionBrief;
+            assert.equal(next.taskId, "T0002");
+            assert.notEqual(next.activationKey, activated.executionBrief.activationKey);
+            if (protection === "rejected-reenqueued") {
+                assert.equal(next.activationRequest.eventKey, "new-successor-start");
+                const claim = core.claimActivation(options, next.activationKey);
+                assert.equal(claim.claimed, true);
+                assert.equal(core.confirmActivation(options, next.activationKey, claim.claimToken, "new-start-delivery").confirmed, true);
+                return;
+            }
+            assert.deepEqual(next.activationRequest, activated.executionBrief.activationRequest);
+            assert.equal(core.claimActivation(options, next.activationKey).reason, "DELIVERY_REJECTED");
+            if (protection === "rejected-retry") assert.equal(core.claimActivation(options, next.activationKey, "new-direct-user-request").claimed, false);
+            const retry = core.claimActivation(options, next.activationKey, "new-successor-authorization");
+            assert.equal(retry.claimed, true);
+            assert.equal(core.confirmActivation(options, next.activationKey, retry.claimToken, "authorized-delivery").confirmed, true);
+        }
     });
 }
 

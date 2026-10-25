@@ -71,13 +71,13 @@ test("read commands preserve legacy state and the first write moves it without r
 test("schema upgrades follow relocation and preserve existing registration", () => {
     const fixture = legacyFixture();
     const database = new DatabaseSync(fixture.source);
-    database.exec("DROP TABLE autopilot_requests; PRAGMA user_version = 18");
+    database.exec("DROP TABLE orchestration_requests; PRAGMA user_version = 18");
     database.close();
     assert.equal(runDefault(fixture, ["status"]).reason, "MIGRATION_REQUIRED");
     runDefault(fixture, ["install-routing"]);
     assert.equal(runDefault(fixture, ["status", "--thread-id", "worker-one"]).role, "WORKER");
     const migrated = new DatabaseSync(fixture.destination);
-    assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 21);
+    assert.equal(migrated.prepare("PRAGMA user_version").get()?.user_version, 23);
     migrated.close();
     assert.equal(fs.existsSync(fixture.source), false);
 });
@@ -156,7 +156,7 @@ test("committed WAL frames left by process termination survive relocation", () =
     assert.equal(fs.existsSync(`${fixture.source}-wal`), false);
 });
 
-test("migration restores a missing ignore rule and preserves an active isolated workspace and autopilot", () => {
+test("migration restores a missing ignore rule and preserves an active isolated workspace and orchestration", () => {
     const fixture = legacyFixture();
     helpers.runGit(fixture.projectRoot, ["add", "-A"]);
     helpers.runGit(fixture.projectRoot, ["commit", "-m", "Install fixture routing"]);
@@ -164,7 +164,7 @@ test("migration restores a missing ignore rule and preserves an active isolated 
     core.processPendingEvents(fixture.options);
     const activation = core.activateIsolatedTask(fixture.options, "T0001");
     assert.ok(activation.executionBrief);
-    core.setAutopilot(fixture.options, true, "mode-on", "enable-autopilot", "worker-one");
+    core.setOrchestration(fixture.options, "auto-next", "mode-on", "enable-orchestration", "worker-one");
     const before = runDefault(fixture, ["status", "--thread-id", "worker-one"]);
     fs.unlinkSync(path.join(fixture.projectRoot, ".gitignore"));
     runDefault(fixture, ["install-routing"]);

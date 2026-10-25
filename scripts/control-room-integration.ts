@@ -7,7 +7,7 @@ const { pathIsSymbolicLink, openStore, beginTransaction, commitTransaction, roll
 const fs: typeof import("node:fs") = require("node:fs");
 const path: typeof import("node:path") = require("node:path");
 
-const { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, titleForControlRoom, serializeTask, compactActiveQueue }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
+const { requireProject, requireTask, readOrchestrationStatus, readAutomaticApprovalBlocker, assertAutomaticReviewCurrent, titleForControlRoom, serializeTask, compactActiveQueue }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
 const GIT_MODE = "local-approval-commit";
 const { validatePullRequestEnvironment, publishApprovedPullRequest }: import("./control-room-pr.ts").IPullRequestApi = require("./control-room-pr.ts");
 
@@ -309,17 +309,17 @@ function commitApprovedTask(options: IControlRoomOptions, taskId: string): IAppr
         assertCondition(!project.integration_task_id, `Commit lease is already held by ${project.integration_task_id}; use recover-commit only after confirming the prior process ended.`);
         const approval = store.database.prepare("SELECT payload_json FROM events WHERE event_key = ?").get(task.approval_event_key) as { payload_json: string } | undefined;
         const approvalPayload = approval ? JSON.parse(approval.payload_json) as IEventPayload : null;
-        if (approvalPayload?.autopilotEventKey && !task.approved_commit) {
-            const autopilot = readAutopilotStatus(store);
-            assertCondition(autopilot.enabled && autopilot.eventKey === approvalPayload.autopilotEventKey, "Autopilot authorization was revoked before integration.");
-            const blocker = readAutopilotBlocker(store);
-            assertCondition(!blocker, `Autopilot is waiting for user attention or recovery on ${blocker}.`);
-            assertAutopilotReviewCurrent(store, task.task_id, approvalPayload.reviewEventKey);
+        if (approvalPayload?.orchestrationEventKey && !task.approved_commit) {
+            const orchestration = readOrchestrationStatus(store);
+            assertCondition(orchestration.mode === "auto-next" && orchestration.eventKey === approvalPayload.orchestrationEventKey, "Auto-next authorization was revoked before integration.");
+            const blocker = readAutomaticApprovalBlocker(store);
+            assertCondition(!blocker, `Auto-next is waiting for user attention or recovery on ${blocker}.`);
+            assertAutomaticReviewCurrent(store, task.task_id, approvalPayload.reviewEventKey);
         }
         const workspacePath = resolveTaskWorkspace(store, task);
         const currentHead = resolveCurrentHeadIfExists(workspacePath);
         const workingTreeStatus = readWorkingTreeStatus(workspacePath);
-        if (approvalPayload?.autopilotEventKey && task.approved_commit) {
+        if (approvalPayload?.orchestrationEventKey && task.approved_commit) {
             assertCondition(workingTreeStatus.length === 0 && currentHead === task.approved_commit, "Automatic approval recovery requires unchanged committed work; preserve new changes for review.");
         }
         const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Resolve current branch");
@@ -473,9 +473,9 @@ function finalizeUnchangedApproval(store: IStore, taskId: string): IApprovalResu
  */
 function resetUncommittedApproval(store: IStore, task: ITaskRow): IRecoveryResult {
     const approval = store.database.prepare("SELECT payload_json FROM events WHERE event_key = ?").get(task.approval_event_key) as { payload_json: string } | undefined;
-    const authorizationKey = approval ? (JSON.parse(approval.payload_json) as IEventPayload).autopilotEventKey : undefined;
-    const autopilot = readAutopilotStatus(store);
-    const revoked = Boolean(authorizationKey && (!autopilot.enabled || autopilot.eventKey !== authorizationKey));
+    const authorizationKey = approval ? (JSON.parse(approval.payload_json) as IEventPayload).orchestrationEventKey : undefined;
+    const orchestration = readOrchestrationStatus(store);
+    const revoked = Boolean(authorizationKey && (orchestration.mode !== "auto-next" || orchestration.eventKey !== authorizationKey));
     store.database.prepare("UPDATE tasks SET state = ?, approval_event_key = ?, reviewed_commit = NULL, approved_commit = NULL, integrated_commit = NULL, updated_at = ? WHERE task_id = ?").run(revoked ? "REVIEW" : "APPROVED", revoked ? null : task.approval_event_key, currentTimestamp(), task.task_id);
     store.database.prepare("UPDATE projects SET integration_task_id = NULL, integration_started_at = NULL, updated_at = ? WHERE project_key = ?").run(currentTimestamp(), store.projectKey);
     const refreshedTask = serializeTask(requireTask(store, task.task_id));

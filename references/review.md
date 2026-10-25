@@ -17,7 +17,7 @@ node <skill-dir>/scripts/control-room.ts request-approve \
 node <skill-dir>/scripts/control-room.ts settle --project-root <canonical-root>
 ```
 
-For `Approve and pause`, replace only `request-approve` with `request-approve-and-pause`. Use the same required arguments; successful settlement targets `PAUSED`, releases the workspace and leaves dependents unsatisfied.
+For `Approve and pause`, replace only `request-approve` with `request-approve-and-pause`. Use the same required arguments; successful settlement targets `PAUSED`, releases the workspace and leaves dependents unsatisfied. Project orchestration controls activation independently: in `manual-next`, waiting tasks stay queued until an explicit `Run`.
 
 After settlement, inspect its actual completion or blocker, apply every returned `titleUpdates` entry and handle any pending activation through [execution.md](execution.md). Report completion only when the returned result confirms it. For `integrationMode: commit`, report the local commit or no-change completion and retain the branch and checkout. If approval captures `integrationMode: pr`, follow [integration-mode.md](integration-mode.md) for PR publication and attachment; report 🔵 `PR_OPEN` until confirmed remote merge and local synchronization. For a permission timeout or uncertain execution, follow [Permission waits and timeouts](recovery.md#permission-waits-and-timeouts).
 
@@ -47,7 +47,7 @@ Do not record routine edits or low-level coding steps. Decision events are appen
 
 ## Present review
 
-Before requesting review, record and process every material decision not yet captured. Submit `REVIEW_REQUESTED` and settle. Read fresh task status: when autopilot is enabled, follow [autopilot.md](autopilot.md#complete-verified-work) to approve verified completed work, integrate it and deliver the next activation in the same turn. Otherwise present a compact summary from the returned `reviewPacket` without requiring the user to inspect code:
+Before requesting review, record and process every material decision not yet captured. Submit `REVIEW_REQUESTED` and settle. Read fresh task status: when `orchestration.mode` is `auto-next`, follow [orchestration.md](orchestration.md#complete-verified-work) to approve verified completed work, integrate it and deliver the next activation in the same turn. Otherwise present a compact summary from the returned `reviewPacket` without requiring the user to inspect code:
 
 1. Summarize the outcome and verification in one short paragraph.
 2. Show unresolved or `low`-confidence current decisions. Collapse all other current decisions to a count and omit superseded decisions unless they affect a remaining risk.

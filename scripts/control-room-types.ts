@@ -1,5 +1,6 @@
 export type TaskState = "PLANNING" | "QUEUED" | "RUNNING" | "REVIEW" | "APPROVED" | "PR_OPEN" | "PAUSED" | "DONE" | "BLOCKED" | "CANCELED";
 export type IntegrationMode = "merge" | "pr" | "commit";
+export type OrchestrationMode = "auto-next" | "approve-next" | "manual-next";
 export type EventKind = "PLANNING_REQUESTED" | "ENQUEUE_REQUESTED" | "RUN_NOW_REQUESTED" | "RUN_ISOLATED_NOW_REQUESTED" | "MOVE_REQUESTED" | "DEPENDENCY_ADD_REQUESTED" | "DEPENDENCY_REMOVE_REQUESTED" | "USER_INPUT_REQUESTED" | "USER_INPUT_RECEIVED" | "DECISION_RECORDED" | "REVIEW_REQUESTED" | "REWORK_REQUESTED" | "APPROVAL_REQUESTED" | "CANCEL_REQUESTED" | "BLOCKED_REPORTED";
 export type WorkspaceMode = "shared" | "isolated";
 export type ApprovalTarget = "DONE" | "PAUSED";
@@ -30,7 +31,7 @@ export interface IUnavailableState {
 
 export interface IEventPayload {
     integrationMode?: IntegrationMode;
-    autopilotEventKey?: string;
+    orchestrationEventKey?: string;
     reviewEventKey?: string;
     verification?: string;
     afterTaskId?: string;
@@ -54,10 +55,11 @@ export interface IEventPayload {
     supersedesDecisionId?: string;
     uncertainty?: string;
     userRequestId?: string;
+    stoppedActivationKey?: string;
 }
 
 export interface IEventPayloadByKind {
-    PLANNING_REQUESTED: Record<string, never>;
+    PLANNING_REQUESTED: Pick<IEventPayload, "userRequestId" | "stoppedActivationKey">;
     ENQUEUE_REQUESTED: Pick<IEventPayload, "afterTaskId" | "userRequestId">;
     RUN_NOW_REQUESTED: Pick<IEventPayload, "userRequestId">;
     RUN_ISOLATED_NOW_REQUESTED: Pick<IEventPayload, "userRequestId">;
@@ -69,7 +71,7 @@ export interface IEventPayloadByKind {
     DECISION_RECORDED: Required<Pick<IEventPayload, "decision" | "rationale" | "confidence" | "impact" | "evidence" | "status">> & Pick<IEventPayload, "alternatives" | "uncertainty" | "supersedesDecisionId">;
     REVIEW_REQUESTED: Pick<IEventPayload, "summary">;
     REWORK_REQUESTED: Pick<IEventPayload, "summary">;
-    APPROVAL_REQUESTED: Required<Pick<IEventPayload, "commitMessage">> & Pick<IEventPayload, "userRequestId" | "approvalTarget" | "autopilotEventKey" | "reviewEventKey" | "verification">;
+    APPROVAL_REQUESTED: Required<Pick<IEventPayload, "commitMessage">> & Pick<IEventPayload, "userRequestId" | "approvalTarget" | "orchestrationEventKey" | "reviewEventKey" | "verification">;
     CANCEL_REQUESTED: Required<Pick<IEventPayload, "userRequestId">> & Pick<IEventPayload, "cancelSource" | "exclusionReason">;
     BLOCKED_REPORTED: Required<Pick<IEventPayload, "reason">>;
 }
@@ -115,8 +117,8 @@ export interface IProjectRow {
     integration_started_at: string | null;
 }
 
-export interface IAutopilotStatus {
-    enabled: boolean;
+export interface IOrchestrationStatus {
+    mode: OrchestrationMode;
     eventKey: string | null;
     userRequestId: string | null;
     threadId: string | null;
@@ -206,6 +208,8 @@ export interface IActivationDelivery {
     activationKey: string;
     state: "PENDING" | "CLAIMED";
     claimToken: string | null;
+    rejectionReceipt: string | null;
+    priorDeliveryUncertain: boolean;
     executionBrief: IExecutionBrief;
 }
 
@@ -217,6 +221,8 @@ export interface IDeliveryRow {
     claim_token: string | null;
     retry_request_id: string | null;
     receipt: string | null;
+    rejection_receipt: string | null;
+    prior_delivery_uncertain: number;
 }
 
 export interface IDoctorCheck {
@@ -231,6 +237,8 @@ export interface IDoctorCheck {
 export interface IDoctorResult {
     healthy: boolean;
     projectRoot: string;
+    integrationMode?: IntegrationMode;
+    orchestration?: IOrchestrationStatus;
     checks: IDoctorCheck[];
 }
 

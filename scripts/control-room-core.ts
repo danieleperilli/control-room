@@ -1,7 +1,7 @@
 const { isolatedWorktreePathForTask }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const { requireProject, requireTask, readAutopilotStatus, readAutopilotBlocker, assertAutopilotReviewCurrent, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
+const { requireProject, requireTask, readOrchestrationStatus, readAutomaticApprovalBlocker, assertAutomaticReviewCurrent, titleForTask, titleForControlRoom, serializeTask, writeQueueOrder, readQueuedTitleUpdates, readTaskDependencies, compactActiveQueue, TASK_WITH_QUEUED_POSITION_SELECT, ACTIVE_STATES }: import("./control-room-state.ts").IStateApi = require("./control-room-state.ts");
 const { resolveTaskWorkspace, cleanupCanceledIsolatedTasks, commitApprovedTask, recoverCommit }: import("./control-room-integration.ts").IIntegrationApi = require("./control-room-integration.ts");
-import type { IntegrationMode, IApprovalResult, IEventPayloadByKind, IActivationRequest, IActivationDelivery, IDeliveryRow, IExecutionBrief, IActivationResult, TaskState, EventKind, DecisionConfidence, DecisionImpact, DecisionInputStatus, IControlRoomOptions, IEventPayload, IDecision, IReviewPacket, IStore, IProjectRow, ITaskRow, ITaskExclusionRow, IEventRow, ITitleUpdate } from "./control-room-types.ts";
+import type { OrchestrationMode, IntegrationMode, IApprovalResult, IEventPayloadByKind, IActivationRequest, IActivationDelivery, IDeliveryRow, IExecutionBrief, IActivationResult, TaskState, EventKind, DecisionConfidence, DecisionImpact, DecisionInputStatus, IControlRoomOptions, IEventPayload, IDecision, IReviewPacket, IStore, IProjectRow, ITaskRow, ITaskExclusionRow, IEventRow, ITitleUpdate } from "./control-room-types.ts";
 const { currentTimestamp, validateThreadId, validateSemanticName, validateTaskId, validateBranchName, workerBranchForTask, validateEventKey, validateCompactText, validateDecisionId, validateDecisionPayload, validateApprovalCommitMessage, validateQueuePosition, validateEventPayload }: import("./control-room-validation.ts").IValidationApi = require("./control-room-validation.ts");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot, runGit, requireGit, requireBranchCheckout, requireBaseCheckout, readWorkingTreeStatus, resolveCurrentHeadIfExists, resolveLocalBranchHeadIfExists }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
@@ -161,10 +161,10 @@ function installProjectRouting(options: IControlRoomOptions): Record<string, unk
         "- Persistently exclude an unregistered task before automatic registration when it invokes or triggers `$brand-forge`, or when its message contains the exact standalone `$control-room exclude` directive.",
         "- For a registered PLANNING or QUEUED task, route `$control-room exclude` through cancellation and settlement so it leaves the queue and regains its undecorated semantic title.",
         "- Keep excluded tasks unregistered on later turns; only an explicit `$control-room join` adopts one.",
-        "- Route a direct `autopilot`, `autopilot on`, `autopilot off`, or `autopilot status` command to the project before worker registration or exclusion handling, including from side chats. Autopilot authorizes automatic completion of explicitly started or queued work until disabled; it does not enqueue planning tasks. Follow the skill's autopilot reference for approval and progress.",
+        "- Route `orchestration auto-next`, `orchestration approve-next`, `orchestration manual-next`, and `orchestration status` before worker registration, including from side chats. Default to approve-next: manual approval then queue continuation. Auto-next also authorizes verified automatic approval; manual-next requires an explicit Run for each queued task. Follow the skill's orchestration reference.",
         "- Route direct `PR mode`, `merge mode`, `commit mode`, and `current mode` commands before registration, including from side chats. The mode belongs to this project and is captured by each approval. Follow the skill's integration-mode reference; PR mode approval authorizes worker-branch push and PR creation, never remote merge.",
         "- Do not automatically register a purely read-only request; register change work and concrete plans intended for later implementation.",
-        "- Treat a direct user `Enqueue` command as advance authorization for that exact registered task to start automatically when it becomes the first dependency-eligible queued worker. After settlement activates it, send one activation brief to its recorded thread without asking for another confirmation merely because a different task's approval freed the queue. This authorization never covers another task, thread, project, or implementation scope.",
+        "- A direct `Enqueue` authorizes automatic activation of that exact task in auto-next and approve-next. In manual-next, keep it queued until an explicit `Run` (alias `Run now`). After authorized activation, deliver one brief to its recorded thread. This never authorizes another task, thread, project, or scope.",
         "- Apply every ControlRoom task title update before replying.",
         "- Never register subagents or side chats as ControlRoom workers, allocate task IDs for them, or let them submit queue or lifecycle mutations on their own behalf.",
         "- A side chat may create a new top-level task in this saved project with the Local environment only when the user explicitly requests it; remove only the task-creation wrapper, preserve the delegated prompt and lifecycle intent, and let the created task register and mutate its own state.",
@@ -370,9 +370,9 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
         beginTransaction(store.database);
         const project = requireProject(store);
         let task = requireTask(store, validTaskId);
-        if (kind === "APPROVAL_REQUESTED" && validPayload.autopilotEventKey) {
-            const authorization = store.database.prepare("SELECT user_request_id FROM autopilot_requests WHERE event_key = ? AND enabled = 1").get(validPayload.autopilotEventKey) as { user_request_id: string } | undefined;
-            assertCondition(authorization, "Unknown autopilot authorization.");
+        if (kind === "APPROVAL_REQUESTED" && validPayload.orchestrationEventKey) {
+            const authorization = store.database.prepare("SELECT user_request_id FROM orchestration_requests WHERE event_key = ? AND mode = 'auto-next'").get(validPayload.orchestrationEventKey) as { user_request_id: string } | undefined;
+            assertCondition(authorization, "Unknown orchestration authorization.");
             validPayload.userRequestId = authorization.user_request_id;
         }
         const existingEvent = store.database.prepare("SELECT event_key, task_id, kind, payload_json, processed_at FROM events WHERE event_key = ?").get(validEventKey) as Record<string, unknown> | undefined;
@@ -389,16 +389,17 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
                 eventKey: validEventKey
             };
         }
-        const replacesAutomaticApproval = ["REWORK_REQUESTED", "REVIEW_REQUESTED", "BLOCKED_REPORTED", "CANCEL_REQUESTED"].includes(kind) || (kind === "APPROVAL_REQUESTED" && !validPayload.autopilotEventKey);
+        const replacesAutomaticApproval = ["REWORK_REQUESTED", "REVIEW_REQUESTED", "BLOCKED_REPORTED", "CANCEL_REQUESTED"].includes(kind) || (kind === "APPROVAL_REQUESTED" && !validPayload.orchestrationEventKey);
         if (task.state === "APPROVED" && replacesAutomaticApproval && requireProject(store).integration_task_id !== task.task_id) {
-            const automatic = store.database.prepare("SELECT 1 FROM events WHERE event_key = ? AND json_extract(payload_json, '$.autopilotEventKey') IS NOT NULL").get(task.approval_event_key);
+            const automatic = store.database.prepare("SELECT 1 FROM events WHERE event_key = ? AND json_extract(payload_json, '$.orchestrationEventKey') IS NOT NULL").get(task.approval_event_key);
             if (automatic) {
                 store.database.prepare("UPDATE tasks SET state = 'REVIEW', approval_event_key = NULL, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), task.task_id);
                 task = requireTask(store, validTaskId);
             }
         }
         if (kind === "PLANNING_REQUESTED") {
-            assertCondition(task.state === "QUEUED" || task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
+            assertCondition(!validPayload.stoppedActivationKey || task.state === "RUNNING", "A stopped activation must still be RUNNING.");
+            assertCondition(task.state === "QUEUED" || task.state === "BLOCKED" || (task.state === "RUNNING" && validPayload.stoppedActivationKey && validPayload.userRequestId), `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
             if (task.state === "BLOCKED") {
                 assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
             }
@@ -447,12 +448,12 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "RUNNING", `Cannot record review context for ${task.task_id} from ${task.state}.`);
         } else if (kind === "REVIEW_REQUESTED") {
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot request review for ${task.task_id} from ${task.state}.`);
-            assertCondition(!task.awaiting_user || !readAutopilotStatus(store).enabled, "Resolve awaited user input before autopilot review.");
+            assertCondition(!task.awaiting_user || readOrchestrationStatus(store).mode !== "auto-next", "Resolve awaited user input before automatic review.");
         } else if (kind === "REWORK_REQUESTED") {
             assertCondition(task.state === "REVIEW", `Cannot request rework for ${task.task_id} from ${task.state}.`);
         } else if (kind === "APPROVAL_REQUESTED") {
-            if (validPayload.autopilotEventKey) {
-                validateAutopilotApproval(store, task, validPayload);
+            if (validPayload.orchestrationEventKey) {
+                validateAutomaticApproval(store, task, validPayload);
             }
             assertCondition(task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE", `Cannot request approval for ${task.task_id} from ${task.state}.`);
             validateApprovalCommitMessage(task, validPayload.commitMessage);
@@ -522,13 +523,13 @@ function setIntegrationMode(options: IControlRoomOptions, mode: IntegrationMode,
 /**
  * Record a project-wide mode change without registering or interrupting the caller.
  * @param options Project and optional state-root settings.
- * @param enabled Whether automatic approval is authorized.
+ * @param mode Project approval and queue progression behavior.
  * @param eventKey Stable retry key for this command.
  * @param userRequestId Actual direct-user message authorizing the mode change.
  * @param threadId Task or side chat containing that user message.
  */
-function setAutopilot(options: IControlRoomOptions, enabled: boolean, eventKey: string, userRequestId: string, threadId: string): Record<string, unknown> {
-    assertCondition(typeof enabled === "boolean", "Autopilot mode must be a boolean.");
+function setOrchestration(options: IControlRoomOptions, mode: OrchestrationMode, eventKey: string, userRequestId: string, threadId: string): Record<string, unknown> {
+    assertCondition(mode === "auto-next" || mode === "approve-next" || mode === "manual-next", "Orchestration mode must be auto-next, approve-next or manual-next.");
     const validEventKey = validateEventKey(eventKey);
     const validRequestId = validateCompactText(userRequestId, "Direct user request ID", 200, true)!;
     const validThreadId = validateThreadId(threadId);
@@ -536,18 +537,18 @@ function setAutopilot(options: IControlRoomOptions, enabled: boolean, eventKey: 
     try {
         beginTransaction(store.database);
         const project = requireProject(store);
-        const existing = store.database.prepare("SELECT * FROM autopilot_requests WHERE event_key = ?").get(validEventKey) as { enabled: number; user_request_id: string; thread_id: string } | undefined;
+        const existing = store.database.prepare("SELECT * FROM orchestration_requests WHERE event_key = ?").get(validEventKey) as { mode: string; user_request_id: string; thread_id: string } | undefined;
         const titleUpdates: ITitleUpdate[] = [];
         if (existing) {
-            assertCondition(Boolean(existing.enabled) === enabled && existing.user_request_id === validRequestId && existing.thread_id === validThreadId, "Autopilot event key already exists with different content.");
+            assertCondition(existing.mode === mode && existing.user_request_id === validRequestId && existing.thread_id === validThreadId, "Orchestration event key already exists with different content.");
         } else {
             const timestamp = currentTimestamp();
-            store.database.prepare("INSERT INTO autopilot_requests (event_key, enabled, user_request_id, thread_id, created_at) VALUES (?, ?, ?, ?, ?)").run(validEventKey, Number(enabled), validRequestId, validThreadId, timestamp);
+            store.database.prepare("INSERT INTO orchestration_requests (event_key, mode, user_request_id, thread_id, created_at) VALUES (?, ?, ?, ?, ?)").run(validEventKey, mode, validRequestId, validThreadId, timestamp);
             // An integration that already holds its lease must finish or recover normally.
             const revoked = store.database.prepare(`
                 SELECT task.task_id FROM tasks AS task JOIN events ON events.event_key = task.approval_event_key
                 WHERE task.state = 'APPROVED' AND task.task_id <> COALESCE(?, '')
-                    AND json_extract(events.payload_json, '$.autopilotEventKey') IS NOT NULL
+                    AND json_extract(events.payload_json, '$.orchestrationEventKey') IS NOT NULL
             `).all(project.integration_task_id) as Array<{ task_id: string }>;
             for (const task of revoked) {
                 store.database.prepare("UPDATE tasks SET state = 'REVIEW', approval_event_key = NULL, approval_target = 'DONE', updated_at = ? WHERE task_id = ?").run(timestamp, task.task_id);
@@ -555,9 +556,9 @@ function setAutopilot(options: IControlRoomOptions, enabled: boolean, eventKey: 
                 titleUpdates.push({ taskId: refreshed.task_id, threadId: refreshed.thread_id, title: titleForTask(refreshed) });
             }
         }
-        const autopilot = readAutopilotStatus(store);
+        const orchestration = readOrchestrationStatus(store);
         commitTransaction(store.database);
-        return { changed: !existing, autopilot, controlRoomThreadId: project.coordinator_thread_id, integrationTaskId: project.integration_task_id, titleUpdates };
+        return { changed: !existing, orchestration, controlRoomThreadId: project.coordinator_thread_id, integrationTaskId: project.integration_task_id, titleUpdates };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -572,14 +573,14 @@ function setAutopilot(options: IControlRoomOptions, enabled: boolean, eventKey: 
  * @param task Task proposed for automatic completion.
  * @param payload Validated automatic approval and verification evidence.
  */
-function validateAutopilotApproval(store: IStore, task: ITaskRow, payload: IEventPayload): void {
-    const autopilot = readAutopilotStatus(store);
-    assertCondition(autopilot.enabled && autopilot.eventKey === payload.autopilotEventKey && autopilot.userRequestId === payload.userRequestId, "Autopilot authorization is disabled or superseded.");
-    assertCondition(task.state === "REVIEW", `Autopilot requires ${task.task_id} to be in REVIEW.`);
+function validateAutomaticApproval(store: IStore, task: ITaskRow, payload: IEventPayload): void {
+    const orchestration = readOrchestrationStatus(store);
+    assertCondition(orchestration.mode === "auto-next" && orchestration.eventKey === payload.orchestrationEventKey && orchestration.userRequestId === payload.userRequestId, "Auto-next authorization is disabled or superseded.");
+    assertCondition(task.state === "REVIEW", `Auto-next requires ${task.task_id} to be in REVIEW.`);
     assertCondition(!requireProject(store).integration_task_id, "Finish the pending integration before automatic approval.");
-    const blocker = readAutopilotBlocker(store);
-    assertCondition(!blocker, `Autopilot is waiting for user attention or recovery on ${blocker}.`);
-    assertAutopilotReviewCurrent(store, task.task_id, payload.reviewEventKey);
+    const blocker = readAutomaticApprovalBlocker(store);
+    assertCondition(!blocker, `Auto-next is waiting for user attention or recovery on ${blocker}.`);
+    assertAutomaticReviewCurrent(store, task.task_id, payload.reviewEventKey);
     const reviewPacket = readReviewPacketFromStore(store, task.task_id);
     assertCondition(!reviewPacket.decisions.some((decision) => decision.status !== "superseded" && (decision.status === "unresolved" || decision.confidence === "low")), "Resolve pending or low-confidence decisions before automatic approval.");
 }
@@ -682,12 +683,28 @@ function assertDependencyIsAcyclic(store: IStore, taskId: string, dependsOnId: s
 /**
  * Return a queued or safely blocked waiting task to planning.
  * @param store Open project store.
- * @param task Current waiting task row.
+ * @param task Current waiting or explicitly stopped task row.
+ * @param payload Direct stop authorization bound to the exact activation, when releasing a worker.
  */
-function applyPlanningEvent(store: IStore, task: ITaskRow): Record<string, unknown> {
-    assertCondition(task.state === "QUEUED" || task.state === "BLOCKED", `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
+function applyPlanningEvent(store: IStore, task: ITaskRow, payload: IEventPayload): Record<string, unknown> {
+    assertCondition(!payload.stoppedActivationKey || task.state === "RUNNING", "A stopped activation must still be RUNNING.");
+    assertCondition(task.state === "QUEUED" || task.state === "BLOCKED" || (task.state === "RUNNING" && payload.stoppedActivationKey && payload.userRequestId), `Cannot return ${task.task_id} to PLANNING from ${task.state}.`);
     if (task.state === "BLOCKED") {
         assertCondition(task.blocked_from_state === "QUEUED", `Cannot return ${task.task_id} to PLANNING after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+    }
+    if (task.state === "RUNNING") {
+        const project = requireProject(store);
+        const delivery = store.database.prepare("SELECT * FROM activation_deliveries WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(task.task_id) as IDeliveryRow | undefined;
+        assertCondition(delivery && delivery.activation_key === payload.stoppedActivationKey && delivery.state === "DELIVERED", "Stop request must match the latest delivered activation.");
+        assertCondition(!project.integration_task_id && !task.approval_event_key && !task.cleanup_pending && !task.handoff_sender_task_id, "Resolve pending approval, recovery or handoff before releasing stopped work.");
+        assertCondition(task.workspace_mode === "shared" && !task.worktree_path && task.branch_owned && task.branch_name && task.base_commit, "Only an unchanged owned shared worker branch can be released.");
+        assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Stopped worker checkout changed; preserve its work.");
+        const branch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read stopped worker checkout");
+        const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
+        assertCondition((branch === task.branch_name || branch === project.base_branch) && (!workerHead || workerHead === task.base_commit) && resolveLocalBranchHeadIfExists(store.projectRoot, project.base_branch) === task.base_commit, "Stopped worker or base changed; preserve its work.");
+        if (branch !== project.base_branch) { requireGit(store.projectRoot, ["checkout", project.base_branch], "Return stopped worker to base"); }
+        if (workerHead) { requireGit(store.projectRoot, ["branch", "-d", task.branch_name], "Release unchanged stopped worker branch"); }
+        store.database.prepare("UPDATE tasks SET base_commit = NULL, branch_name = NULL, reviewed_commit = NULL WHERE task_id = ?").run(task.task_id);
     }
     store.database.prepare(`
         UPDATE tasks
@@ -923,7 +940,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
     const task = requireTask(store, event.task_id);
     const payload = JSON.parse(event.payload_json) as IEventPayload;
     if (event.kind === "PLANNING_REQUESTED") {
-        return applyPlanningEvent(store, task);
+        return applyPlanningEvent(store, task, payload);
     }
     if (event.kind === "ENQUEUE_REQUESTED") {
         return applyEnqueueEvent(store, task, payload);
@@ -983,7 +1000,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return applyDecisionEvent(store, task, payload);
     }
     if (event.kind === "REVIEW_REQUESTED") {
-        assertCondition(!task.awaiting_user || !readAutopilotStatus(store).enabled, "Resolve awaited user input before autopilot review.");
+        assertCondition(!task.awaiting_user || readOrchestrationStatus(store).mode !== "auto-next", "Resolve awaited user input before automatic review.");
         if (task.state === "APPROVED" || task.state === "DONE") {
             return { action: "REVIEW_ALREADY_RECORDED", task: serializeTask(task), summary: payload.summary || null, reviewPacket: readReviewPacketFromStore(store, task.task_id) };
         }
@@ -1006,8 +1023,8 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         return { action: "REWORK_STARTED", task: serializeTask(refreshedTask), summary: payload.summary || null };
     }
     if (event.kind === "APPROVAL_REQUESTED") {
-        if (payload.autopilotEventKey) {
-            validateAutopilotApproval(store, task, payload);
+        if (payload.orchestrationEventKey) {
+            validateAutomaticApproval(store, task, payload);
         }
         if (task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE") {
             const commitMessage = validateApprovalCommitMessage(task, payload.commitMessage);
@@ -1020,7 +1037,7 @@ function applyPendingEvent(store: IStore, event: IEventRow): Record<string, unkn
         const approvalTarget = payload.approvalTarget || "DONE";
         store.database.prepare("UPDATE tasks SET state = 'APPROVED', awaiting_user = 0, approval_event_key = ?, approval_target = ?, integration_mode = ?, updated_at = ? WHERE task_id = ?").run(event.event_key, approvalTarget, payload.integrationMode || "merge", currentTimestamp(), task.task_id);
         const refreshedTask = requireTask(store, task.task_id);
-        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage, approvalTarget, approvalMode: payload.autopilotEventKey ? "autopilot" : "manual" };
+        return { action: "APPROVED", task: serializeTask(refreshedTask), userRequestId: payload.userRequestId, commitMessage, approvalTarget, approvalMode: payload.orchestrationEventKey ? "auto-next" : "manual" };
     }
     if (event.kind === "CANCEL_REQUESTED") {
         assertCondition(payload.userRequestId && payload.userRequestId.trim().length > 0, "Cancellation requires a direct user request ID.");
@@ -1179,6 +1196,19 @@ function readActivationRequest(store: IStore, taskId: string): IActivationReques
 }
 
 /**
+ * Check for an explicit Run request that has not already authorized an activation.
+ * @param store Open project store.
+ * @param taskId Queued task requiring a manual start.
+ */
+function hasUnconsumedRunRequest(store: IStore, taskId: string): boolean {
+    const request = readActivationRequest(store, taskId);
+    if (!request || (request.eventKind !== "RUN_NOW_REQUESTED" && request.eventKind !== "RUN_ISOLATED_NOW_REQUESTED")) {
+        return false;
+    }
+    return !store.database.prepare("SELECT 1 FROM activation_deliveries WHERE task_id = ? AND json_extract(brief_json, '$.activationRequest.eventKey') = ? LIMIT 1").get(taskId, request.eventKey);
+}
+
+/**
  * Validate and create the parent directory used by isolated task worktrees.
  * @param projectRoot Canonical project root.
  * @param worktreePath Deterministic task worktree path.
@@ -1240,6 +1270,10 @@ function activateIsolatedTask(options: IControlRoomOptions, taskId: string): IAc
         }
         assertCondition(task.state === "QUEUED", `Cannot activate ${task.task_id} isolated from ${task.state}.`);
         assertCondition(task.workspace_mode === "isolated", `${task.task_id} was not requested for isolated execution.`);
+        if (readOrchestrationStatus(store).mode === "manual-next" && !hasUnconsumedRunRequest(store, task.task_id)) {
+            commitTransaction(store.database);
+            return { activated: false, reason: "MANUAL_RUN_REQUIRED", taskId: task.task_id, controlRoomTitle: titleForControlRoom() };
+        }
         assertCondition(project.integration_mode !== "commit", "Commit mode uses the current shared checkout; select merge or PR mode for isolated execution.");
         const pendingPr = store.database.prepare("SELECT task_id FROM tasks WHERE state = 'PR_OPEN' ORDER BY task_number LIMIT 1").get() as { task_id: string } | undefined;
         if (pendingPr) {
@@ -1328,10 +1362,10 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
     try {
         beginTransaction(store.database);
         const project = requireProject(store);
-        const autopilotBlocker = readAutopilotStatus(store).enabled ? readAutopilotBlocker(store) : null;
-        if (autopilotBlocker) {
+        const orchestrationBlocker = readOrchestrationStatus(store).mode === "auto-next" ? readAutomaticApprovalBlocker(store) : null;
+        if (orchestrationBlocker) {
             commitTransaction(store.database);
-            return { activated: false, controlRoomTitle: titleForControlRoom(), reason: "AUTOPILOT_WAITING", taskId: autopilotBlocker };
+            return { activated: false, controlRoomTitle: titleForControlRoom(), reason: "AUTO_NEXT_WAITING", taskId: orchestrationBlocker };
         }
         const pendingPr = store.database.prepare("SELECT task_id FROM tasks WHERE state = 'PR_OPEN' ORDER BY task_number LIMIT 1").get() as { task_id: string } | undefined;
         if (pendingPr) {
@@ -1345,9 +1379,10 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
             return { activated: false, controlRoomTitle, reason: "ACTIVE_TASK_PRESENT", taskId: exclusiveTask.task_id, state: exclusiveTask.state };
         }
         const queuedTasks = store.database.prepare("SELECT * FROM tasks WHERE state = 'QUEUED' AND workspace_mode = 'shared' ORDER BY queue_position, task_number").all() as unknown as ITaskRow[];
+        const manualNext = readOrchestrationStatus(store).mode === "manual-next";
         let selectedTask: ITaskRow | undefined;
         for (const queuedTask of queuedTasks) {
-            if (dependenciesAreDone(store, queuedTask.task_id)) {
+            if (dependenciesAreDone(store, queuedTask.task_id) && (!manualNext || hasUnconsumedRunRequest(store, queuedTask.task_id))) {
                 selectedTask = queuedTask;
                 break;
             }
@@ -1355,7 +1390,7 @@ function activateNextTask(options: IControlRoomOptions): IActivationResult {
         if (!selectedTask) {
             const controlRoomTitle = titleForControlRoom();
             commitTransaction(store.database);
-            return { activated: false, controlRoomTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : "DEPENDENCIES_PENDING" };
+            return { activated: false, controlRoomTitle, reason: queuedTasks.length === 0 ? "QUEUE_EMPTY" : manualNext ? "MANUAL_RUN_REQUIRED" : "DEPENDENCIES_PENDING" };
         }
         const reviewPacket = readReviewPacketFromStore(store, selectedTask.task_id);
         let workerBranch = workerBranchForTask(selectedTask.task_id);
@@ -1510,8 +1545,9 @@ function resumeTask(options: IControlRoomOptions, taskId: string, reopen = false
             assertCondition(reopen || deferred.length === 0, "Resolve the pending activation handoff before resuming.");
             assertCondition(deferred.length <= 1, "Resolve multiple pending handoffs before reopening.");
             for (const destination of deferred) {
-                const delivery = store.database.prepare("SELECT state FROM activation_deliveries WHERE task_id = ? AND state IN ('PENDING', 'CLAIMED')").get(destination.task_id) as { state: string } | undefined;
-                assertCondition(destination.state === "RUNNING" && destination.workspace_mode === "shared" && !destination.worktree_path && destination.branch_name && delivery?.state === "PENDING", `Cannot defer ${destination.task_id}: its activation may already have been delivered.`);
+                const delivery = store.database.prepare("SELECT * FROM activation_deliveries WHERE task_id = ? AND state IN ('PENDING', 'CLAIMED')").get(destination.task_id) as IDeliveryRow | undefined;
+                const undelivered = delivery && (delivery.state === "PENDING" || (delivery.rejection_receipt !== null && !delivery.prior_delivery_uncertain));
+                assertCondition(destination.state === "RUNNING" && destination.workspace_mode === "shared" && !destination.worktree_path && destination.branch_name && undelivered, `Cannot defer ${destination.task_id}: its activation may already have been delivered.`);
                 assertCondition(readWorkingTreeStatus(store.projectRoot).length === 0, "Cannot defer a changed shared checkout.");
                 const branch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read pending activation branch");
                 const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, destination.branch_name);
@@ -1520,7 +1556,7 @@ function resumeTask(options: IControlRoomOptions, taskId: string, reopen = false
                     if (branch !== project.base_branch) requireGit(store.projectRoot, destination.base_commit ? ["checkout", project.base_branch] : ["symbolic-ref", "HEAD", `refs/heads/${project.base_branch}`], "Return undelivered activation to base");
                     if (workerHead) requireGit(store.projectRoot, ["branch", "-d", destination.branch_name], "Remove unchanged undelivered branch");
                 }
-                store.database.prepare("UPDATE activation_deliveries SET state = 'CANCELED', updated_at = ? WHERE task_id = ? AND state = 'PENDING'").run(currentTimestamp(), destination.task_id);
+                store.database.prepare("UPDATE activation_deliveries SET state = 'CANCELED', updated_at = ? WHERE activation_key = ?").run(currentTimestamp(), delivery!.activation_key);
                 store.database.prepare("UPDATE tasks SET state = 'QUEUED', base_commit = NULL, branch_name = NULL, handoff_sender_task_id = NULL, awaiting_user = 0, updated_at = ? WHERE task_id = ?").run(currentTimestamp(), destination.task_id);
             }
             store.database.prepare(`
@@ -1602,14 +1638,14 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
     }
     try {
         const project = requireProject(store);
-        const autopilot = readAutopilotStatus(store);
+        const orchestration = readOrchestrationStatus(store);
         if (taskId) {
             const task = requireTask(store, taskId);
             const includesReviewPacket = task.state === "RUNNING" || task.state === "REVIEW" || task.state === "APPROVED" || task.state === "PR_OPEN" || task.state === "PAUSED" || task.state === "DONE";
             return {
                 projectRoot: store.projectRoot,
                 integrationMode: project.integration_mode,
-                autopilot,
+                orchestration,
                 controlRoomTitle: titleForControlRoom(),
                 task: serializeTask(task),
                 ...(includesReviewPacket ? { reviewPacket: readReviewPacketFromStore(store, task.task_id) } : {})
@@ -1617,7 +1653,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         }
         if (validThreadId) {
             if (validThreadId === project.coordinator_thread_id) {
-                return { projectRoot: store.projectRoot, integrationMode: project.integration_mode, autopilot, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
+                return { projectRoot: store.projectRoot, integrationMode: project.integration_mode, orchestration, controlRoomTitle: titleForControlRoom(), controlRoomThreadId: project.coordinator_thread_id, role: "CONTROL_ROOM", task: null };
             }
             const task = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.thread_id = ?`).get(validThreadId) as ITaskRow | undefined;
             const exclusion = store.database.prepare("SELECT * FROM task_exclusions WHERE thread_id = ?").get(validThreadId) as ITaskExclusionRow | undefined;
@@ -1626,7 +1662,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
             return {
                 projectRoot: store.projectRoot,
                 integrationMode: project.integration_mode,
-                autopilot,
+                orchestration,
                 controlRoomTitle: titleForControlRoom(),
                 controlRoomThreadId: project.coordinator_thread_id,
                 role: isExcluded ? "EXCLUDED" : task ? "WORKER" : "UNREGISTERED",
@@ -1643,7 +1679,7 @@ function getStatus(options: IControlRoomOptions, taskId?: string, threadId?: str
         return {
             projectRoot: store.projectRoot,
             integrationMode: project.integration_mode,
-            autopilot,
+            orchestration,
             controlRoomTitle: titleForControlRoom(),
             controlRoomThreadId: project.coordinator_thread_id,
             baseBranch: project.base_branch,
@@ -1680,7 +1716,7 @@ function getQueue(options: IControlRoomOptions): Record<string, unknown> {
         const progress = store.database.prepare("SELECT COUNT(CASE WHEN state = 'DONE' THEN 1 END) AS completed, COUNT(*) AS total FROM tasks WHERE state NOT IN ('PLANNING', 'PAUSED', 'CANCELED')").get() as { completed: number; total: number };
         const completedTasks = store.database.prepare(`${TASK_WITH_QUEUED_POSITION_SELECT} WHERE task.state = 'DONE' ORDER BY task.updated_at DESC, task.task_number DESC LIMIT 5`).all() as unknown as ITaskRow[];
         const pendingActivations = store.database.prepare("SELECT task_id AS taskId, activation_key AS activationKey, state FROM activation_deliveries WHERE state IN ('PENDING', 'CLAIMED') ORDER BY created_at, task_id").all();
-        return { projectRoot: store.projectRoot, integrationMode: project.integration_mode, controlRoomTitle: titleForControlRoom(), autopilot: readAutopilotStatus(store), integrationTaskId: project.integration_task_id, pendingActivations, capturedAt: currentTimestamp(), progress: { ...progress }, completedTasks: completedTasks.map((task) => serializeTask(task)), queue };
+        return { projectRoot: store.projectRoot, integrationMode: project.integration_mode, controlRoomTitle: titleForControlRoom(), orchestration: readOrchestrationStatus(store), integrationTaskId: project.integration_task_id, pendingActivations, capturedAt: currentTimestamp(), progress: { ...progress }, completedTasks: completedTasks.map((task) => serializeTask(task)), queue };
     } finally {
         store.database.close();
     }
@@ -1767,7 +1803,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         const activeQueue = queue.queue as Record<string, unknown>[];
         return {
             settled: false,
-            autopilot: queue.autopilot,
+            orchestration: queue.orchestration,
             progress: queue.progress,
             reason: "COMMIT_RECOVERY_REQUIRED",
             commitTaskId: status.commitTaskId,
@@ -1813,7 +1849,7 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
         settled: !status.commitTaskId,
         integrationMode: queue.integrationMode,
         pullRequestWarnings: pullRequests.warnings,
-        autopilot: queue.autopilot,
+        orchestration: queue.orchestration,
         progress: queue.progress,
         controlRoomTitle: titleForControlRoom(),
         processed,
@@ -1837,7 +1873,10 @@ function settleProject(options: IControlRoomOptions): Record<string, unknown> {
  */
 function persistActivation(store: IStore, brief: IExecutionBrief): void {
     const timestamp = currentTimestamp();
-    store.database.prepare("INSERT INTO activation_deliveries (activation_key, task_id, brief_json, state, created_at, updated_at) VALUES (?, ?, ?, 'PENDING', ?, ?)").run(brief.activationKey, brief.taskId, JSON.stringify(brief), timestamp, timestamp);
+    const previous = store.database.prepare("SELECT * FROM activation_deliveries WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(brief.taskId) as IDeliveryRow | undefined;
+    // Reopening a predecessor does not authorize retrying a rejected successor handoff.
+    const retainRejection = previous?.rejection_receipt && (JSON.parse(previous.brief_json) as IExecutionBrief).activationRequest?.eventKey === brief.activationRequest?.eventKey;
+    store.database.prepare("INSERT INTO activation_deliveries (activation_key, task_id, brief_json, state, claim_token, retry_request_id, rejection_receipt, prior_delivery_uncertain, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(brief.activationKey, brief.taskId, JSON.stringify(brief), retainRejection ? "CLAIMED" : "PENDING", retainRejection ? nodeCrypto.randomUUID() : null, retainRejection ? previous.retry_request_id : null, retainRejection ? previous.rejection_receipt : null, retainRejection ? previous.prior_delivery_uncertain : 0, timestamp, timestamp);
 }
 
 /**
@@ -1851,7 +1890,7 @@ function getPendingActivations(options: IControlRoomOptions): IActivationDeliver
     }
     try {
         const rows = store.database.prepare("SELECT delivery.* FROM activation_deliveries AS delivery JOIN tasks AS task ON task.task_id = delivery.task_id WHERE delivery.state IN ('PENDING', 'CLAIMED') AND task.state = 'RUNNING' ORDER BY delivery.created_at, delivery.activation_key").all() as unknown as IDeliveryRow[];
-        return rows.map((row) => ({ activationKey: row.activation_key, state: row.state as "PENDING" | "CLAIMED", claimToken: row.claim_token, executionBrief: JSON.parse(row.brief_json) as IExecutionBrief }));
+        return rows.map((row) => ({ activationKey: row.activation_key, state: row.state as "PENDING" | "CLAIMED", claimToken: row.claim_token, rejectionReceipt: row.rejection_receipt, priorDeliveryUncertain: Boolean(row.prior_delivery_uncertain), executionBrief: JSON.parse(row.brief_json) as IExecutionBrief }));
     } finally {
         store.database.close();
     }
@@ -1874,7 +1913,7 @@ function claimActivation(options: IControlRoomOptions, activationKey: string, re
         assertCondition(row, `Unknown activation: ${validKey}`);
         if (row.state === "DELIVERED" || row.state === "CANCELED" || (row.state === "CLAIMED" && (!retryRequest || retryRequest === row.retry_request_id))) {
             commitTransaction(store.database);
-            return { claimed: false, reason: row.state === "CLAIMED" ? "DELIVERY_UNCONFIRMED" : row.state };
+            return { claimed: false, reason: row.state === "CLAIMED" ? (row.rejection_receipt && !row.prior_delivery_uncertain ? "DELIVERY_REJECTED" : "DELIVERY_UNCONFIRMED") : row.state };
         }
         const task = requireTask(store, row.task_id);
         assertCondition(task.state === "RUNNING" && task.branch_name, `${task.task_id} no longer owns this activation.`);
@@ -1885,9 +1924,50 @@ function claimActivation(options: IControlRoomOptions, activationKey: string, re
         const currentBranch = requireGit(workspacePath, ["branch", "--show-current"], "Verify activation checkout");
         assertCondition(currentBranch === task.branch_name, `Activation checkout changed for ${task.task_id}.`);
         const claimToken = nodeCrypto.randomUUID();
-        store.database.prepare("UPDATE activation_deliveries SET state = 'CLAIMED', claim_token = ?, retry_request_id = ?, updated_at = ? WHERE activation_key = ?").run(claimToken, retryRequest, currentTimestamp(), validKey);
+        const priorDeliveryUncertain = row.prior_delivery_uncertain || (row.state === "CLAIMED" && row.rejection_receipt === null) ? 1 : 0;
+        store.database.prepare("UPDATE activation_deliveries SET state = 'CLAIMED', claim_token = ?, retry_request_id = ?, rejection_receipt = NULL, prior_delivery_uncertain = ?, updated_at = ? WHERE activation_key = ?").run(claimToken, retryRequest, priorDeliveryUncertain, currentTimestamp(), validKey);
         commitTransaction(store.database);
         return { claimed: true, claimToken, executionBrief: brief };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
+/**
+ * Record an explicit tool rejection without treating it as delivery or retry authorization.
+ * @param options Project and optional state-root settings.
+ * @param activationKey Persisted activation identifier.
+ * @param claimToken Token of the attempt explicitly rejected by the tool.
+ * @param receipt Compact reference to the verified rejection outcome.
+ */
+function rejectActivation(options: IControlRoomOptions, activationKey: string, claimToken: string, receipt: string): { rejected: boolean; alreadyRejected?: boolean; reason?: string } {
+    const validKey = validateEventKey(activationKey);
+    const validToken = validateEventKey(claimToken);
+    const validReceipt = validateCompactText(receipt, "Rejection receipt", 500, true)!;
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        requireProject(store);
+        const row = store.database.prepare("SELECT * FROM activation_deliveries WHERE activation_key = ?").get(validKey) as IDeliveryRow | undefined;
+        assertCondition(row, `Unknown activation: ${validKey}`);
+        assertCondition(row.claim_token === validToken, "Activation claim changed; a stale rejection cannot affect another delivery attempt.");
+        if (row.state === "CANCELED") {
+            commitTransaction(store.database);
+            return { rejected: false, reason: "ACTIVATION_SUPERSEDED" };
+        }
+        assertCondition(row.state === "CLAIMED", "Only an unconfirmed claimed attempt can be rejected.");
+        assertCondition(requireTask(store, row.task_id).state === "RUNNING", "Activation is no longer running.");
+        if (row.rejection_receipt !== null) {
+            assertCondition(row.rejection_receipt === validReceipt, "Activation rejection was already recorded with another receipt.");
+            commitTransaction(store.database);
+            return { rejected: true, alreadyRejected: true };
+        }
+        store.database.prepare("UPDATE activation_deliveries SET rejection_receipt = ?, updated_at = ? WHERE activation_key = ?").run(validReceipt, currentTimestamp(), validKey);
+        commitTransaction(store.database);
+        return { rejected: true };
     } catch (error) {
         rollbackTransaction(store.database);
         throw error;
@@ -1924,6 +2004,7 @@ function confirmActivation(options: IControlRoomOptions, activationKey: string, 
             return { confirmed: true, alreadyConfirmed: true };
         }
         assertCondition(row.state === "CLAIMED", "Activation must be claimed before confirmation.");
+        assertCondition(row.rejection_receipt === null, "This delivery attempt was rejected; a newly authorized claim is required before confirmation.");
         assertCondition(requireTask(store, row.task_id).state === "RUNNING", "Activation is no longer running.");
         store.database.prepare("UPDATE activation_deliveries SET state = 'DELIVERED', receipt = ?, updated_at = ? WHERE activation_key = ?").run(validReceipt, currentTimestamp(), validKey);
         commitTransaction(store.database);
@@ -1943,6 +2024,7 @@ function confirmActivation(options: IControlRoomOptions, activationKey: string, 
  */
 function doctorProject(options: IControlRoomOptions, taskId?: string): import("./control-room-types.ts").IDoctorResult {
     const checks: import("./control-room-types.ts").IDoctorCheck[] = [];
+    const settings: Pick<import("./control-room-types.ts").IDoctorResult, "integrationMode" | "orchestration"> = {};
     let store: IStore | undefined;
     let projectRoot = path.resolve(options.projectRoot);
     try {
@@ -1961,8 +2043,11 @@ function doctorProject(options: IControlRoomOptions, taskId?: string): import(".
         }
         store = opened;
         const project = requireProject(store);
+        settings.integrationMode = project.integration_mode;
+        settings.orchestration = readOrchestrationStatus(store);
         const integrity = store.database.prepare("PRAGMA quick_check").all();
         checks.push({ code: "INTEGRATION_MODE", level: "ok", message: `Current integration mode: ${project.integration_mode}.` });
+        checks.push({ code: "ORCHESTRATION_MODE", level: "ok", message: `Current orchestration mode: ${settings.orchestration.mode}.` });
         const foreignKeys = store.database.prepare("PRAGMA foreign_key_check").all();
         checks.push({ code: "STATE_INTEGRITY", level: integrity.every((row) => row.quick_check === "ok") && foreignKeys.length === 0 ? "ok" : "error", message: integrity.every((row) => row.quick_check === "ok") && foreignKeys.length === 0 ? "SQLite integrity and foreign keys are valid." : "SQLite integrity or foreign key checks failed; preserve the database before recovery." });
         const baseCommit = resolveLocalBranchHeadIfExists(projectRoot, project.base_branch);
@@ -2019,22 +2104,81 @@ function doctorProject(options: IControlRoomOptions, taskId?: string): import(".
         }
         for (const delivery of getPendingActivations(options)) {
             if (!taskId || delivery.executionBrief.taskId === taskId) {
+                if (delivery.rejectionReceipt && !delivery.priorDeliveryUncertain) {
+                    checks.push({ code: "DELIVERY_REJECTED", level: "warning", taskId: delivery.executionBrief.taskId, activationKey: delivery.activationKey, message: "The claimed delivery was explicitly rejected before reaching the destination.", nextAction: "Retry only with new direct user authorization, or reopen its completed predecessor if the successor workspace is unchanged." });
+                    continue;
+                }
                 checks.push({ code: delivery.state === "PENDING" ? "ACTIVATION_PENDING" : "DELIVERY_UNCONFIRMED", level: "warning", taskId: delivery.executionBrief.taskId, activationKey: delivery.activationKey, message: delivery.state === "PENDING" ? "The activation brief has not been claimed for delivery." : "Delivery was claimed but has no receipt; it may already have reached the destination.", nextAction: delivery.state === "PENDING" ? "Verify the original start authorization, then claim and deliver this exact activation." : "Inspect the destination history and confirm a verified receipt. Retry only with new direct user authorization." });
             }
         }
-        return { healthy: checks.every((check) => check.level === "ok"), projectRoot, checks };
+        return { healthy: checks.every((check) => check.level === "ok"), projectRoot, ...settings, checks };
     } catch (error) {
         checks.push({ code: "DIAGNOSTIC_FAILED", level: "error", message: error instanceof Error ? error.message : String(error), nextAction: "Resolve this diagnostic error before attempting state changes." });
-        return { healthy: false, projectRoot, checks };
+        return { healthy: false, projectRoot, ...settings, checks };
     } finally {
         store?.database.close();
     }
 }
 
+/**
+ * Adopt an explicitly authorized current branch after a rename without changing Git history.
+ * @param options Project and optional state-root settings.
+ * @param taskId Active shared task identity.
+ * @param branchName Existing checked-out branch selected by the user.
+ * @param eventKey Stable command retry identity.
+ * @param userRequestId Direct user request authorizing the alignment.
+ */
+function adoptCurrentBranch(options: IControlRoomOptions, taskId: string, branchName: string, eventKey: string, userRequestId: string): Record<string, unknown> {
+    const validTaskId = validateTaskId(taskId);
+    const validBranch = validateBranchName(branchName);
+    const validEventKey = validateEventKey(eventKey);
+    const validRequestId = validateCompactText(userRequestId, "Direct user request ID", 200, true)!;
+    const payload = validateDecisionPayload({ decision: `Adopt current branch ${validBranch} for ${validTaskId}.`, rationale: "Preserve the user-selected branch and its existing history after an explicit branch alignment.", confidence: "high", impact: "medium", evidence: `Direct user request: ${validRequestId}`, status: "active" });
+    const payloadJson = JSON.stringify(payload);
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        const project = requireProject(store);
+        const task = requireTask(store, validTaskId);
+        const existing = store.database.prepare("SELECT * FROM events WHERE event_key = ?").get(validEventKey) as (IEventRow & { processed_at: string | null; result_json: string | null }) | undefined;
+        if (existing) {
+            assertCondition(existing.task_id === validTaskId && existing.kind === "DECISION_RECORDED" && existing.payload_json === payloadJson && existing.processed_at && JSON.parse(existing.result_json || "{}").branchAdoption === true, "Branch adoption event key already exists with different content.");
+            commitTransaction(store.database);
+            return { adopted: false, alreadyApplied: true, task: serializeTask(task) };
+        }
+        assertCondition(project.integration_mode === "commit" && task.workspace_mode === "shared", "Branch adoption requires shared commit mode.");
+        assertCondition(task.state === "RUNNING" || task.state === "REVIEW", `Cannot adopt a branch for ${task.task_id} from ${task.state}.`);
+        assertCondition(!project.integration_task_id && !task.approval_event_key && !task.cleanup_pending, "Resolve pending approval or recovery before adopting a branch.");
+        assertCondition(!store.database.prepare("SELECT 1 FROM events WHERE task_id = ? AND processed_at IS NULL").get(task.task_id), "Process pending task events before adopting a branch.");
+        assertCondition(!store.database.prepare("SELECT 1 FROM activation_deliveries WHERE task_id = ? AND state IN ('PENDING', 'CLAIMED')").get(task.task_id), "Confirm the existing activation delivery before adopting a branch.");
+        assertCondition(validBranch !== "main" && requireGit(store.projectRoot, ["branch", "--show-current"], "Verify current branch") === validBranch, "Adopt only the current non-main branch; no checkout is performed.");
+        const head = resolveCurrentHeadIfExists(store.projectRoot);
+        const recordedHead = task.branch_name ? resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name) : null;
+        assertCondition(head && task.base_commit && runGit(store.projectRoot, ["merge-base", "--is-ancestor", task.base_commit, head]).status === 0, "The current branch must retain the task baseline.");
+        assertCondition(!recordedHead || runGit(store.projectRoot, ["merge-base", "--is-ancestor", recordedHead, head]).status === 0, "The current branch must contain all commits on the recorded branch.");
+        const previousBranch = task.branch_name;
+        const decisionNumber = readReviewPacketFromStore(store, task.task_id).decisionCount + 1;
+        assertCondition(decisionNumber <= 999, "The task decision ID space D001-D999 is exhausted.");
+        const timestamp = currentTimestamp();
+        store.database.prepare("UPDATE tasks SET branch_name = ?, branch_owned = 0, updated_at = ? WHERE task_id = ?").run(validBranch, timestamp, task.task_id);
+        const result = { action: "DECISION_RECORDED", branchAdoption: true, decisionId: `D${String(decisionNumber).padStart(3, "0")}`, previousBranch, task: serializeTask(requireTask(store, task.task_id)) };
+        store.database.prepare("INSERT INTO events (event_key, task_id, kind, payload_json, created_at, processed_at, result_json) VALUES (?, ?, 'DECISION_RECORDED', ?, ?, ?, ?)").run(validEventKey, task.task_id, payloadJson, timestamp, timestamp, JSON.stringify(result));
+        commitTransaction(store.database);
+        return { adopted: true, ...result };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
 const api = {
+    adoptCurrentBranch,
     doctorProject,
     claimActivation,
     confirmActivation,
+    rejectActivation,
     getPendingActivations,
     activateIsolatedTask,
     activateNextTask,
@@ -2052,7 +2196,7 @@ const api = {
     registerTask,
     resumeTask,
     settleProject,
-    setAutopilot,
+    setOrchestration,
     setIntegrationMode,
     submitEvent,
     titleForControlRoom,

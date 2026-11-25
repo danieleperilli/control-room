@@ -115,6 +115,7 @@ Commands:
   orchestration --project-root ROOT --mode (auto-next|approve-next|manual-next|status) [--event-key KEY --user-request-id ID --thread-id ID] [--state-root PATH]
   init --project-root ROOT --control-room-thread ID --base-branch BRANCH [--state-root PATH]
   install-routing --project-root ROOT [--state-root PATH]
+  relocate-project --project-root ROOT --previous-root OLD_ROOT --control-room-thread ID
   exclude --project-root ROOT --thread-id ID --reason TEXT [--state-root PATH]
   register --project-root ROOT --thread-id ID --name NAME [--adopt-excluded true] [--state-root PATH]
   request-planning --project-root ROOT --task T0001 --event-key KEY [--stopped-activation-key KEY --user-request-id ID] [--state-root PATH]
@@ -164,6 +165,10 @@ function executeCommand(parsed: IParsedArguments): unknown {
         return null;
     }
     const core: import("./control-room-core.ts").IControlRoomApi = require("./control-room-core.ts");
+    if (parsed.command === "relocate-project") {
+        validateOptions(values, ["project-root", "previous-root", "control-room-thread"]);
+        return core.relocateProject(buildOptions(values), requireOption(values, "previous-root"), requireOption(values, "control-room-thread"));
+    }
     if (parsed.command === "adopt-branch") {
         validateOptions(values, ["project-root", "task", "branch", "event-key", "user-request-id", "state-root"]);
         return core.adoptCurrentBranch(buildOptions(values), requireOption(values, "task"), requireOption(values, "branch"), requireOption(values, "event-key"), requireOption(values, "user-request-id"));

@@ -35,7 +35,10 @@ node <skill-dir>/scripts/control-room.ts status --project-root <canonical-root> 
 
 ## Preserve the execution boundaries
 
+If an existing project-local database still records a previous repository root, do not initialize a second project. Follow [repository relocation](references/recovery.md#repository-relocation) before registration.
+
 - Planning, queued and paused workers do not modify project files. Start only through a direct `Enqueue`, `Run`/`Run now` or `Run isolated now`, followed by settlement. A direct enqueue authorizes later automatic activation in `auto-next` and `approve-next`. In `manual-next`, it only queues the task; an explicit `Run` (alias `Run now`) is required for that task's activation. Each activation permits one handoff within the recorded implementation scope.
+- To requeue a blocked activation that never reached its worker, use the narrowly verified `Enqueue after <active-task>` recovery in [execution.md](references/execution.md); do not resume it merely to change its queue position.
 - Normal execution is serial in the shared checkout. Commit mode uses this checkout and retains its branch between tasks; isolated execution requires merge or PR mode. Concurrent isolated execution requires an explicit request for each task and uses `.control-room/worktrees/<T_ID>`; every file operation uses the returned `workspacePath`.
 - An activated worker may modify project files immediately inside its assigned workspace. Read [review.md](references/review.md) before recording material decisions, requesting review or processing approval.
 - When the user explicitly stops an unchanged worker to resume another task in the shared checkout, follow the stopped-worker return-to-planning procedure in [execution.md](references/execution.md). It records no approval and never restarts the stopped task automatically.

@@ -5,7 +5,7 @@ import type { OrchestrationMode, IntegrationMode, IApprovalResult, IEventPayload
 const { currentTimestamp, validateThreadId, validateSemanticName, validateTaskId, validateBranchName, workerBranchForTask, validateEventKey, validateCompactText, validateDecisionId, validateDecisionPayload, validateApprovalCommitMessage, validateQueuePosition, validateEventPayload }: import("./control-room-validation.ts").IValidationApi = require("./control-room-validation.ts");
 const assertCondition: (condition: unknown, message: string) => asserts condition = require("./control-room-validation.ts").assertCondition;
 const { canonicalizeProjectRoot, runGit, requireGit, requireBranchCheckout, requireBaseCheckout, readWorkingTreeStatus, resolveCurrentHeadIfExists, resolveLocalBranchHeadIfExists }: import("./control-room-git.ts").IGitApi = require("./control-room-git.ts");
-const { openReadStore, pathIsSymbolicLink, openStore, beginTransaction, commitTransaction, rollbackTransaction }: import("./control-room-storage.ts").IStorageApi = require("./control-room-storage.ts");
+const { openReadStore, resolveStoreLocation, pathIsSymbolicLink, openStore, beginTransaction, commitTransaction, rollbackTransaction }: import("./control-room-storage.ts").IStorageApi = require("./control-room-storage.ts");
 const nodeCrypto: typeof import("node:crypto") = require("node:crypto");
 const fs: typeof import("node:fs") = require("node:fs");
 const path: typeof import("node:path") = require("node:path");
@@ -406,7 +406,7 @@ function submitEvent<Kind extends EventKind>(options: IControlRoomOptions, event
         } else if (kind === "ENQUEUE_REQUESTED") {
             assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "BLOCKED", `Cannot request enqueue for ${task.task_id} from ${task.state}.`);
             if (task.state === "BLOCKED") {
-                assertCondition(task.blocked_from_state === "QUEUED", `Cannot enqueue ${task.task_id} after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+                if (task.blocked_from_state !== "QUEUED") { validateUnstartedRequeue(store, task, validPayload); }
             }
             if (validPayload.afterTaskId) {
                 assertCondition(validPayload.afterTaskId !== task.task_id, "A task cannot be queued after itself.");
@@ -717,6 +717,27 @@ function applyPlanningEvent(store: IStore, task: ITaskRow, payload: IEventPayloa
 }
 
 /**
+ * Verify that an undelivered blocked worker can wait behind the current shared task.
+ * @param store Open project store.
+ * @param task Blocked worker whose activation never reached its chat.
+ * @param payload Explicit enqueue authorization and active predecessor.
+ */
+function validateUnstartedRequeue(store: IStore, task: ITaskRow, payload: IEventPayload): void {
+    const project = requireProject(store);
+    assertCondition(task.blocked_from_state === "RUNNING" && payload.userRequestId && payload.afterTaskId && payload.afterTaskId !== task.task_id, `Cannot enqueue ${task.task_id} after ${String(task.blocked_from_state)} without a direct request and an active predecessor.`);
+    assertCondition(!project.integration_task_id && !task.approval_event_key && !task.approved_commit && !task.reviewed_commit && !task.cleanup_pending && !task.handoff_sender_task_id, "Resolve approval, recovery or handoff before requeueing work.");
+    assertCondition(task.workspace_mode === "shared" && !task.worktree_path && task.branch_owned && task.branch_name === workerBranchForTask(task.task_id) && task.base_commit, "Only an unchanged owned shared worker can be requeued.");
+    const delivery = store.database.prepare("SELECT * FROM activation_deliveries WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(task.task_id) as IDeliveryRow | undefined;
+    assertCondition(delivery && delivery.state === "CANCELED" && !delivery.claim_token && !delivery.receipt && !delivery.retry_request_id && !delivery.prior_delivery_uncertain, "The blocked activation was delivered or may have been delivered; preserve its work.");
+    const predecessor = requireTask(store, payload.afterTaskId);
+    const currentBranch = requireGit(store.projectRoot, ["branch", "--show-current"], "Read active predecessor checkout");
+    assertCondition(predecessor.workspace_mode === "shared" && ["RUNNING", "REVIEW"].includes(predecessor.state) && predecessor.branch_name === currentBranch && currentBranch !== task.branch_name, "The requested predecessor must own the active shared checkout.");
+    const workerHead = resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name);
+    assertCondition(!workerHead || workerHead === task.base_commit, "Blocked worker branch changed; preserve its work.");
+    assertCondition(runGit(store.projectRoot, ["merge-base", "--is-ancestor", task.base_commit, "HEAD"]).status === 0, "The blocked activation base must remain reachable from the active checkout.");
+}
+
+/**
  * Place a task at the requested queue location without changing dependencies.
  * @param store Open project store.
  * @param task Current task row.
@@ -726,7 +747,7 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
     assertCondition(task.state === "PLANNING" || task.state === "QUEUED" || task.state === "BLOCKED", `Cannot enqueue ${task.task_id} from ${task.state}.`);
     const reviewPacket = readReviewPacketFromStore(store, task.task_id);
     if (task.state === "BLOCKED") {
-        assertCondition(task.blocked_from_state === "QUEUED", `Cannot enqueue ${task.task_id} after ${String(task.blocked_from_state)}; resume it to its prior state to preserve its worker branch and changes.`);
+        if (task.blocked_from_state !== "QUEUED") { validateUnstartedRequeue(store, task, payload); }
     }
     const wasAlreadyQueued = task.state === "QUEUED";
     let afterTaskId: string | undefined;
@@ -754,6 +775,9 @@ function applyEnqueueEvent(store: IStore, task: ITaskRow, payload: IEventPayload
         }
     } else {
         orderedTaskIds.push(task.task_id);
+    }
+    if (task.state === "BLOCKED" && task.blocked_from_state === "RUNNING" && task.branch_name && resolveLocalBranchHeadIfExists(store.projectRoot, task.branch_name)) {
+        requireGit(store.projectRoot, ["branch", "-d", task.branch_name], "Release unchanged undelivered worker branch");
     }
     store.database.prepare(`
         UPDATE tasks
@@ -2173,7 +2197,53 @@ function adoptCurrentBranch(options: IControlRoomOptions, taskId: string, branch
     }
 }
 
+/** Rebind the existing project-local database after an explicitly authorized repository move.
+ * @param options New primary checkout; state-root overrides are not supported for this operation.
+ * @param previousRoot Exact previously registered absolute root.
+ * @param controlRoomThreadId Existing console identity verified by the caller.
+ */
+function relocateProject(options: IControlRoomOptions, previousRoot: string, controlRoomThreadId: string): Record<string, unknown> {
+    assertCondition(!options.stateRoot, "Project relocation requires the existing project-local database.");
+    assertCondition(path.isAbsolute(previousRoot) && path.normalize(previousRoot) === previousRoot, "Supply the exact previous absolute project root.");
+    const consoleId = validateThreadId(controlRoomThreadId);
+    const location = resolveStoreLocation(options);
+    assertCondition(previousRoot !== location.projectRoot, "The previous and current project roots must differ.");
+    assertCondition(fs.existsSync(location.databasePath), "Move the existing project-local database with the repository before relocating its registration.");
+    assertCondition(!fs.existsSync(path.join(previousRoot, ".git")) && !fs.existsSync(path.join(previousRoot, ".control-room", "state.sqlite")), "The previous checkout or state still exists; resolve the copied-project ambiguity first.");
+    const store = openStore(options);
+    try {
+        beginTransaction(store.database);
+        const projects = store.database.prepare("SELECT * FROM projects").all() as unknown as IProjectRow[];
+        assertCondition(projects.length === 1, "Relocation requires exactly one stored project; preserve ambiguous registrations.");
+        const project = projects[0];
+        assertCondition(project.coordinator_thread_id === consoleId, "The existing Control Room console does not match.");
+        if (project.project_key === store.projectKey && project.project_root === store.projectRoot) {
+            commitTransaction(store.database);
+            return { relocated: false, alreadyApplied: true, projectRoot: store.projectRoot, controlRoomThreadId: consoleId };
+        }
+        const previousKey = nodeCrypto.createHash("sha256").update(previousRoot).digest("hex").slice(0, 24);
+        assertCondition(project.project_root === previousRoot && project.project_key === previousKey, "The stored project does not match the supplied previous root.");
+        assertCondition(!project.integration_task_id && !project.integration_started_at, "Resolve the active integration lease before moving the registration.");
+        assertCondition(!store.database.prepare("SELECT 1 FROM tasks WHERE state IN ('RUNNING', 'REVIEW', 'APPROVED', 'PR_OPEN', 'BLOCKED') OR cleanup_pending = 1").get(), "Resolve active workers and cleanup before moving the registration.");
+        assertCondition(!store.database.prepare("SELECT 1 FROM events WHERE processed_at IS NULL").get(), "Resolve pending events before moving the registration.");
+        assertCondition(!store.database.prepare("SELECT 1 FROM activation_deliveries WHERE state IN ('PENDING', 'CLAIMED')").get(), "Resolve pending activation deliveries before moving the registration.");
+        const anchor = store.database.prepare("SELECT integrated_commit FROM tasks WHERE integrated_commit IS NOT NULL ORDER BY task_number DESC LIMIT 1").get();
+        if (anchor) {
+            assertCondition(runGit(store.projectRoot, ["merge-base", "--is-ancestor", String(anchor.integrated_commit), project.base_branch]).status === 0, "The new checkout does not retain the last integrated project commit.");
+        }
+        store.database.prepare("UPDATE projects SET project_key = ?, project_root = ?, updated_at = ? WHERE project_key = ?").run(store.projectKey, store.projectRoot, currentTimestamp(), previousKey);
+        commitTransaction(store.database);
+        return { relocated: true, previousRoot, projectRoot: store.projectRoot, controlRoomThreadId: consoleId, databasePath: store.databasePath };
+    } catch (error) {
+        rollbackTransaction(store.database);
+        throw error;
+    } finally {
+        store.database.close();
+    }
+}
+
 const api = {
+    relocateProject,
     adoptCurrentBranch,
     doctorProject,
     claimActivation,

@@ -107,7 +107,7 @@ PLANNING, QUEUED, RUNNING, REVIEW, PR_OPEN, PAUSED, BLOCKED -> CANCELED
 - Merge-mode finalization inside settlement moves `APPROVED -> DONE` for ordinary approval or `APPROVED -> PAUSED` for an approved checkpoint. Commit mode reaches the same target after its local commit without integration or checkout cleanup. PR mode first enters `PR_OPEN` (🔵), retains its published branch/worktree and holds new activation until verified remote integration before reaching that same target.
 - Dependencies are satisfied only by `DONE`.
 - `PAUSED` owns no active workspace, remains outside the queue, preserves its task history and dependencies, and resets only execution and approval anchors when resumed to `PLANNING`.
-- `BLOCKED` remembers and can restore its prior state. Only a task blocked from `QUEUED` may instead return to `PLANNING` or be enqueued again.
+- `BLOCKED` remembers and can restore its prior state. Only a task blocked from `QUEUED` may instead return to `PLANNING`. Requeueing a worker blocked from `RUNNING` additionally requires the verified unstarted-worker recovery described in [execution.md](execution.md).
 - Shared `RUNNING`, `REVIEW`, and `APPROVED` tasks are exclusive in the primary checkout. Explicitly isolated tasks may occupy those states concurrently in distinct worktrees; approval integration remains globally serial.
 
 ## Project-specific loading rule

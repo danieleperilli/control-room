@@ -58,6 +58,12 @@ Doctor does not repair, migrate, deliver messages or change titles. State reads 
 
 For `ACTIVATION_PENDING`, `DELIVERY_UNCONFIRMED` or `DELIVERY_REJECTED`, follow [execution.md](execution.md). A claimed brief may already be delivered; first inspect the destination history. Existing enqueue authorization still covers the initial handoff, but an uncertain retry requires a new direct user authorization. Doctor itself grants no permission to send or recover a still-running process.
 
+## Repository relocation
+
+When a primary checkout and its `.control-room` directory have moved together, `status` can report `NOT_INITIALIZED` because the database retains the old root. Inspect the stored project identity read-only and obtain explicit authorization to migrate that registration. Do not initialize another project or edit SQLite directly.
+
+Run `relocate-project --project-root <new-root> --previous-root <exact-stored-root> --control-room-thread <existing-console-id>`, then read status again. The command requires a single stored project, the matching console, no previous checkout/state remaining, and no active workers, pending events, deliveries or integration cleanup. It verifies the last integrated commit when available. The transaction updates only the project key/root; task IDs, queue order, settings, exclusions, historical events and delivered briefs remain unchanged. Dirty application files are preserved. Retrying after success is a no-op. This command does not move files, repair linked Git worktrees, settle events, activate tasks or grant any new approval.
+
 ## Storage relocation
 
 The default database is `<project-root>/.control-room/state.sqlite`. Reads continue to recognize an existing database in the historical Codex-home location. The first mutating command moves it automatically and keeps the same console, tasks, queue, approvals and delivery history. `--state-root` is an explicit override and is not relocated.
